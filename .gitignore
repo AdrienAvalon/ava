@@ -103,3 +103,18 @@ MagicMock/
 
 # Second Repos
 Inline/
+
+# Ava customizations — appended to upstream .gitignore
+.env
+.env.local
+*.key
+*.pem
+ava_extensions/identity/voice_samples/*
+!ava_extensions/identity/voice_samples/.gitkeep
+ava_extensions/memory/data/
+ava_extensions/backends/tts_models/*
+!ava_extensions/backends/tts_models/.gitkeep
+*.db
+*.sqlite
+.tmp-exec/
+logs/
