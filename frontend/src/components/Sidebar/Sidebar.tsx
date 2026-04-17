@@ -45,20 +45,19 @@ export function Sidebar() {
   const handleNewChat = () => {
     // Don't create a new chat if the current one is empty
     if (messages.length === 0) {
-      navigate('/');
+      navigate('/chat');
       return;
     }
     createConversation(selectedModel);
-    navigate('/');
+    navigate('/chat');
   };
 
   const navItems = [
-    { path: '/', icon: MessageSquare, label: 'Chat' },
+    { path: '/chat', icon: MessageSquare, label: 'Chat' },
     { path: '/dashboard', icon: BarChart3, label: 'Dashboard' },
     { path: '/data-sources', icon: Database, label: 'Data Sources' },
     { path: '/agents', icon: Bot, label: 'Agents' },
     { path: '/logs', icon: ScrollText, label: 'Logs' },
-    { path: '/immersive', icon: Sparkles, label: 'Immersive' },
     { path: '/settings', icon: Settings, label: 'Settings' },
     { path: '/get-started', icon: Rocket, label: 'Get Started' },
   ];

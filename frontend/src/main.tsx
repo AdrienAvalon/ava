@@ -1,6 +1,8 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { BrowserRouter } from 'react-router';
+import { AuthProvider } from 'react-oidc-context';
+import { oidcConfig } from './components/auth/oidcConfig';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import App from './App';
 import { initApiBase } from './lib/api';
@@ -31,7 +33,9 @@ initApiBase().finally(() => {
     <StrictMode>
       <ErrorBoundary>
         <BrowserRouter>
-          <App />
+          <AuthProvider {...oidcConfig}>
+            <App />
+          </AuthProvider>
         </BrowserRouter>
       </ErrorBoundary>
     </StrictMode>,

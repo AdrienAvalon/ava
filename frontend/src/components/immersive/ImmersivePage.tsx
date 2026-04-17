@@ -44,7 +44,7 @@ export function ImmersivePage() {
           return;
         }
         e.preventDefault();
-        navigate('/');
+        navigate('/chat');
       }
     };
     window.addEventListener('keydown', onKey);
@@ -95,7 +95,7 @@ export function ImmersivePage() {
 
       {/* Back to chat */}
       <button
-        onClick={() => navigate('/')}
+        onClick={() => navigate('/chat')}
         title="Retour au chat (Esc)"
         style={{
           position: 'fixed',

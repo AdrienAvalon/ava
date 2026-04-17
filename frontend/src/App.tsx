@@ -9,6 +9,7 @@ import { AgentsPage } from './pages/AgentsPage';
 import { DataSourcesPage } from './pages/DataSourcesPage';
 import { LogsPage } from './pages/LogsPage';
 import { ImmersivePage } from "./components/immersive/ImmersivePage";
+import { LoginGate } from "./components/auth/LoginGate";
 import { CommandPalette } from './components/CommandPalette';
 import { SetupScreen } from './components/SetupScreen';
 import { Toaster } from './components/ui/sonner';
@@ -171,8 +172,9 @@ export default function App() {
   return (
     <>
       <Routes>
+        <Route path="/" element={<LoginGate><ImmersivePage /></LoginGate>} />
         <Route element={<Layout />}>
-          <Route index element={<ChatPage />} />
+          <Route path="chat" element={<ChatPage />} />
           <Route path="dashboard" element={<DashboardPage />} />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="get-started" element={<GetStartedPage />} />
@@ -180,7 +182,7 @@ export default function App() {
           <Route path="agents" element={<AgentsPage />} />
           <Route path="logs" element={<LogsPage />} />
         </Route>
-        <Route path="immersive" element={<ImmersivePage />} />
+        <Route path="immersive" element={<LoginGate><ImmersivePage /></LoginGate>} />
       </Routes>
       <Toaster position="bottom-right" />
       {commandPaletteOpen && <CommandPalette />}
