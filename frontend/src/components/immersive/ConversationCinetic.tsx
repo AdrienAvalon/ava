@@ -1,19 +1,23 @@
 import { useEffect, useState } from 'react';
 import { useImmersiveStore } from './immersiveStore';
 import { STATES } from './immersiveStates';
+import { useViewportScale } from './useViewportScale';
 
 export function ConversationCinetic() {
   const userMsg = useImmersiveStore((s) => s.userMsg);
   const avaMsg = useImmersiveStore((s) => s.avaMsg);
   const state = useImmersiveStore((s) => s.state);
   const cfg = STATES[state];
+  const vp = useViewportScale();
 
-  // Blinking cursor shown only when avaMsg is non-empty
   const [blink, setBlink] = useState(true);
   useEffect(() => {
     const id = setInterval(() => setBlink((b) => !b), 450);
     return () => clearInterval(id);
   }, []);
+
+  const fontSize = 34 * vp.fontScale;
+  const userFontSize = 12 * Math.max(0.8, vp.fontScale);
 
   return (
     <div
@@ -22,7 +26,7 @@ export function ConversationCinetic() {
         top: '50%',
         left: '50%',
         transform: 'translate(-50%, -50%)',
-        width: 'min(900px, 72vw)',
+        width: 'min(900px, 84vw)',
         maxHeight: '60vh',
         zIndex: 90,
         pointerEvents: 'none',
@@ -32,11 +36,11 @@ export function ConversationCinetic() {
       {userMsg && (
         <div
           style={{
-            fontSize: 12,
+            fontSize: userFontSize,
             color: '#5a7a95',
             letterSpacing: '0.3em',
             textTransform: 'uppercase',
-            marginBottom: '1.4rem',
+            marginBottom: vp.isMobile ? '0.8rem' : '1.4rem',
             fontFamily: "'JetBrains Mono', 'Space Mono', 'Courier New', monospace",
           }}
         >
@@ -47,7 +51,7 @@ export function ConversationCinetic() {
       <div
         style={{
           fontFamily: "'Courier New', 'Space Mono', monospace",
-          fontSize: 34,
+          fontSize,
           fontWeight: 300,
           letterSpacing: '0.02em',
           lineHeight: 1.4,

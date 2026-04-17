@@ -55,16 +55,16 @@ function buildKNN(positions: Float32Array, count: number, k = 3): [number, numbe
 
 interface OrbGroupProps {
   state: ImmersiveState;
+  groupScale: number;
 }
 
-function OrbGroup({ state }: OrbGroupProps) {
+function OrbGroup({ state, groupScale }: OrbGroupProps) {
   const groupRef = useRef<THREE.Group>(null!);
   const orbRef = useRef<THREE.Points>(null!);
   const linesRef = useRef<THREE.LineSegments>(null!);
   const innerWireRef = useRef<THREE.Mesh>(null!);
   const outerWireRef = useRef<THREE.Mesh>(null!);
 
-  // Geometries computed once
   const { orbGeo, lineGeo } = useMemo(() => {
     const sph = makeFibonacciSphere(PARTICLES);
     const orbGeo = new THREE.BufferGeometry();
@@ -91,7 +91,6 @@ function OrbGroup({ state }: OrbGroupProps) {
     return { orbGeo, lineGeo };
   }, []);
 
-  // Shared uniforms
   const uniforms = useMemo(() => {
     const init = STATES.idle;
     return {
@@ -120,7 +119,6 @@ function OrbGroup({ state }: OrbGroupProps) {
     };
   }, [uniforms]);
 
-  // Lerp per frame
   const targetColA = useRef(new THREE.Color(STATES.idle.colorA));
   const targetColB = useRef(new THREE.Color(STATES.idle.colorB));
 
@@ -140,7 +138,6 @@ function OrbGroup({ state }: OrbGroupProps) {
     uniforms.colorB.value.lerp(targetColB.current, lerp);
     lineUniforms.color.value.lerp(targetColA.current, lerp);
 
-    // Wireframes
     if (innerWireRef.current && outerWireRef.current) {
       const innerMat = innerWireRef.current.material as THREE.MeshBasicMaterial;
       const outerMat = outerWireRef.current.material as THREE.MeshBasicMaterial;
@@ -150,11 +147,15 @@ function OrbGroup({ state }: OrbGroupProps) {
       innerMat.color.lerp(targetColB.current, lerp);
     }
 
-    // Time advance (drives noise)
     uniforms.time.value += dt * target.speed * 2.4;
 
-    // Rotations
-    if (groupRef.current) groupRef.current.rotation.y += dt * 0.08;
+    if (groupRef.current) {
+      groupRef.current.rotation.y += dt * 0.08;
+      // smooth group scale update (avoids pop when viewport resize)
+      const currentScale = groupRef.current.scale.x;
+      const newScale = currentScale + (groupScale - currentScale) * lerp;
+      groupRef.current.scale.setScalar(newScale);
+    }
     if (orbRef.current) orbRef.current.rotation.y += dt * 0.10;
     if (linesRef.current && orbRef.current) linesRef.current.rotation.copy(orbRef.current.rotation);
     if (outerWireRef.current) {
@@ -168,7 +169,7 @@ function OrbGroup({ state }: OrbGroupProps) {
   });
 
   return (
-    <group ref={groupRef} position={[0, 0, -1.0]} scale={1.3}>
+    <group ref={groupRef} position={[0, 0, -1.0]} scale={groupScale}>
       <points ref={orbRef} geometry={orbGeo}>
         <shaderMaterial
           attach="material"
@@ -208,9 +209,10 @@ function OrbGroup({ state }: OrbGroupProps) {
 
 interface OrbAuraProps {
   state: ImmersiveState;
+  groupScale?: number;
 }
 
-export function OrbAura({ state }: OrbAuraProps) {
+export function OrbAura({ state, groupScale = 1.3 }: OrbAuraProps) {
   return (
     <Canvas
       style={{ position: 'fixed', inset: 0, pointerEvents: 'none' }}
@@ -218,7 +220,7 @@ export function OrbAura({ state }: OrbAuraProps) {
       dpr={[1, 2]}
       gl={{ antialias: true, alpha: true }}
     >
-      <OrbGroup state={state} />
+      <OrbGroup state={state} groupScale={groupScale} />
     </Canvas>
   );
 }

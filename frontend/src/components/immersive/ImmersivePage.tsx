@@ -1,3 +1,6 @@
+import { useEffect } from 'react';
+import { useNavigate } from 'react-router';
+import { ArrowLeft } from 'lucide-react';
 import { useImmersiveStore } from './immersiveStore';
 import { OrbAura } from './OrbAura';
 import { ConversationCinetic } from './ConversationCinetic';
@@ -6,6 +9,7 @@ import { Waveform } from './Waveform';
 import { HudLayers } from './HudLayers';
 import { StateRings } from './StateRings';
 import { useScenarioPlayer } from './useScenarioPlayer';
+import { useViewportScale } from './useViewportScale';
 import type { ImmersiveState } from './immersiveStates';
 
 const STATE_ORDER: ImmersiveState[] = ['idle', 'listening', 'thinking', 'speaking'];
@@ -13,7 +17,24 @@ const STATE_ORDER: ImmersiveState[] = ['idle', 'listening', 'thinking', 'speakin
 export function ImmersivePage() {
   const state = useImmersiveStore((s) => s.state);
   const setState = useImmersiveStore((s) => s.setState);
+  const navigate = useNavigate();
+  const vp = useViewportScale();
   useScenarioPlayer(true);
+
+  // Esc → back to chat
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        navigate('/');
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [navigate]);
+
+  const btnSize = vp.isMobile ? 8 : vp.isTablet ? 9 : 11;
+  const btnPad = vp.isMobile ? '6px 10px' : '9px 18px';
 
   return (
     <div
@@ -39,23 +60,60 @@ export function ImmersivePage() {
         pointerEvents: 'none', zIndex: 999,
       }} />
 
-      <OrbAura state={state} />
+      <OrbAura state={state} groupScale={vp.orbScale} />
       <StateRings />
       <HudLayers />
-      <CognitivePanel />
+      {!vp.hideCognitive && <CognitivePanel />}
       <ConversationCinetic />
       <Waveform />
+
+      {/* Back to chat (top-left under brand) */}
+      <button
+        onClick={() => navigate('/')}
+        title="Retour au chat (Esc)"
+        style={{
+          position: 'fixed',
+          top: vp.smallHud ? 16 : 100,
+          left: vp.smallHud ? 'auto' : 32,
+          right: vp.smallHud ? 16 : 'auto',
+          zIndex: 210,
+          background: 'rgba(81,164,222,0.08)',
+          border: '1px solid rgba(81,164,222,0.3)',
+          color: '#51a4de',
+          fontFamily: 'inherit',
+          fontSize: vp.isMobile ? 9 : 10,
+          letterSpacing: '0.25em',
+          padding: '6px 12px',
+          cursor: 'pointer',
+          textTransform: 'uppercase',
+          display: 'flex', alignItems: 'center', gap: 6,
+          transition: 'all 0.15s',
+        }}
+        onMouseEnter={(e) => {
+          e.currentTarget.style.background = 'rgba(81,164,222,0.2)';
+          e.currentTarget.style.borderColor = '#51a4de';
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.background = 'rgba(81,164,222,0.08)';
+          e.currentTarget.style.borderColor = 'rgba(81,164,222,0.3)';
+        }}
+      >
+        <ArrowLeft size={12} /> CHAT
+      </button>
 
       {/* Manual state controls (bottom-center) */}
       <div
         style={{
           position: 'fixed',
-          bottom: 28,
+          bottom: vp.isMobile ? 16 : 28,
           left: '50%',
           transform: 'translateX(-50%)',
           display: 'flex',
-          gap: 6,
+          gap: vp.isMobile ? 3 : 6,
           zIndex: 200,
+          flexWrap: 'wrap',
+          justifyContent: 'center',
+          maxWidth: '90vw',
         }}
       >
         {STATE_ORDER.map((s) => (
@@ -67,9 +125,9 @@ export function ImmersivePage() {
               border: `1px solid ${state === s ? '#7fb9e8' : 'rgba(81,164,222,0.3)'}`,
               color: state === s ? '#fff' : '#51a4de',
               fontFamily: 'inherit',
-              fontSize: 11,
+              fontSize: btnSize,
               letterSpacing: '0.25em',
-              padding: '9px 18px',
+              padding: btnPad,
               cursor: 'pointer',
               textTransform: 'uppercase',
               boxShadow: state === s ? '0 0 16px rgba(81,164,222,0.5)' : 'none',
