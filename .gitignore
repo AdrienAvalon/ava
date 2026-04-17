@@ -118,3 +118,4 @@ ava_extensions/backends/tts_models/*
 *.sqlite
 .tmp-exec/
 logs/
+frontend/tsconfig.tsbuildinfo

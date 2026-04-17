@@ -219,7 +219,7 @@ export const useAppStore = create<AppState>((set, get) => {
 
     models: [],
     modelsLoading: true,
-    selectedModel: '',
+    selectedModel: 'claude-sonnet-4-6',
     serverInfo: null,
     savings: null,
 
@@ -264,7 +264,7 @@ export const useAppStore = create<AppState>((set, get) => {
           title: overlay.title || 'Overlay chat',
           createdAt: overlay.createdAt || Date.now(),
           updatedAt: overlay.updatedAt || Date.now(),
-          model: overlay.model || 'default',
+          model: overlay.model || 'claude-sonnet-4-6',
           messages: overlay.messages,
         };
         saveConversations(store);
@@ -285,7 +285,7 @@ export const useAppStore = create<AppState>((set, get) => {
         title: 'New chat',
         createdAt: Date.now(),
         updatedAt: Date.now(),
-        model: model || get().selectedModel || 'default',
+        model: model || get().selectedModel || 'claude-sonnet-4-6',
         messages: [],
       };
       store.conversations[conv.id] = conv;
