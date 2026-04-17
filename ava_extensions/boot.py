@@ -11,3 +11,6 @@ from ava_extensions.patches import anthropic_enhancements, system_prompt_loader 
 
 # Backends TTS français
 from ava_extensions.backends import kokoro_fr_tts  # noqa: F401
+
+# Skills personnalisées Avalon
+from ava_extensions.skills import avalon_status  # noqa: F401
