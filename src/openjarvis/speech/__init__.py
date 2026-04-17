@@ -15,3 +15,9 @@ for _mod in ("cartesia_tts", "kokoro_tts", "openai_tts"):
         importlib.import_module(f".{_mod}", __name__)
     except ImportError:
         pass
+
+# --- Ava extensions hook (fork-local, optionnel) ---
+try:
+    import ava_extensions.boot  # noqa: F401
+except ImportError:
+    pass
