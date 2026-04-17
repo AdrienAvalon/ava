@@ -33,9 +33,19 @@ def _enhance_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     # --- Extended thinking (adaptive) ---
     if model in _ADAPTIVE_THINKING_MODELS and "thinking" not in kwargs:
         kwargs["thinking"] = {"type": "adaptive"}
+        # API constraint (2026-04): temperature must be 1.0 (default) quand
+        # thinking adaptive est actif. top_p et top_k doivent aussi être au
+        # defaults. On supprime les overrides pour laisser l API prendre ses
+        # valeurs par défaut.
         if model in _NO_SAMPLING_WITH_THINKING:
-            for p in ("temperature", "top_p", "top_k"):
-                kwargs.pop(p, None)
+            for k in ("temperature", "top_p", "top_k"):
+                kwargs.pop(k, None)
+        else:
+            # Sonnet 4.6, Opus 4.6 : temperature DOIT être 1.0 avec thinking
+            kwargs["temperature"] = 1.0
+            # top_p et top_k: API les accepte mais doivent rester aux defaults
+            kwargs.pop("top_p", None)
+            kwargs.pop("top_k", None)
 
     # --- Prompt caching : cache_control ephemeral sur le dernier bloc system ---
     # Anthropic SDK 0.79 supporte cache_control sur blocs text, pas au top level.

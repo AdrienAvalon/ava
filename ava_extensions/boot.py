@@ -7,7 +7,7 @@ ava_extensions).
 from __future__ import annotations
 
 # Patches SDK Anthropic (thinking adaptatif + prompt caching)
-from ava_extensions.patches import anthropic_enhancements  # noqa: F401
+from ava_extensions.patches import anthropic_enhancements, system_prompt_loader  # noqa: F401
 
 # Backends TTS français
 from ava_extensions.backends import kokoro_fr_tts  # noqa: F401
