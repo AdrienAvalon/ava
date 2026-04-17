@@ -1,30 +1,16 @@
-import { useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import { useImmersiveStore } from './immersiveStore';
 import { demoScenarios, type Scenario } from './scenarios';
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-/**
- * Auto-play the demo scenarios in a loop.
- * Returns a { running, toggle } API to pause/resume.
- */
 export function useScenarioPlayer(autoStart = true) {
-  const store = useImmersiveStore;
   const stopFlag = useRef(false);
   const runningRef = useRef(false);
 
-  async function typeInto(text: string, speed: number) {
-    for (let i = 0; i <= text.length; i++) {
-      if (stopFlag.current) return;
-      store.getState().setAvaMsg(text.slice(0, i));
-      await sleep(speed);
-    }
-  }
+  const playOnce = useCallback(async (s: Scenario) => {
+    const st = useImmersiveStore.getState();
 
-  async function playOnce(s: Scenario) {
-    const st = store.getState();
-
-    // Listening
     st.setState('listening');
     st.setUserMsg(s.user);
     st.clearCognitive();
@@ -32,27 +18,28 @@ export function useScenarioPlayer(autoStart = true) {
     await sleep(s.listenMs);
     if (stopFlag.current) return;
 
-    // Thinking
     st.setState('thinking');
     st.setCognitive(s.cognitive);
     await sleep(s.thinkMs);
     if (stopFlag.current) return;
 
-    // Speaking (typewriter)
     st.setState('speaking');
     st.setUserMsg('');
-    await typeInto(s.ava, s.speakSpeed);
-    if (stopFlag.current) return;
+    for (let i = 0; i <= s.ava.length; i++) {
+      if (stopFlag.current) return;
+      st.setAvaMsg(s.ava.slice(0, i));
+      await sleep(s.speakSpeed);
+    }
 
-    // Settle idle
     await sleep(s.settleMs ?? 2800);
+    if (stopFlag.current) return;
     st.setState('idle');
     st.clearCognitive();
     await sleep(2200);
     st.setAvaMsg('');
-  }
+  }, []);
 
-  async function run() {
+  const run = useCallback(async () => {
     if (runningRef.current) return;
     runningRef.current = true;
     stopFlag.current = false;
@@ -62,19 +49,21 @@ export function useScenarioPlayer(autoStart = true) {
       i++;
     }
     runningRef.current = false;
-  }
+  }, [playOnce]);
 
-  function stop() {
+  const stop = useCallback(() => {
     stopFlag.current = true;
-  }
+  }, []);
+
+  const isRunning = useCallback(() => runningRef.current, []);
 
   useEffect(() => {
     if (autoStart) {
       const t = setTimeout(() => { run(); }, 600);
       return () => { clearTimeout(t); stop(); };
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoStart]);
+    return undefined;
+  }, [autoStart, run, stop]);
 
-  return { run, stop, isRunning: () => runningRef.current };
+  return { run, stop, isRunning };
 }

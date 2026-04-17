@@ -1,6 +1,6 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router';
-import { ArrowLeft } from 'lucide-react';
+import { ArrowLeft, Play, Square } from 'lucide-react';
 import { useImmersiveStore } from './immersiveStore';
 import { OrbAura } from './OrbAura';
 import { ConversationCinetic } from './ConversationCinetic';
@@ -8,7 +8,9 @@ import { CognitivePanel } from './CognitivePanel';
 import { Waveform } from './Waveform';
 import { HudLayers } from './HudLayers';
 import { StateRings } from './StateRings';
+import { AvaInput } from './AvaInput';
 import { useScenarioPlayer } from './useScenarioPlayer';
+import { useDaemonChat } from './useDaemonChat';
 import { useViewportScale } from './useViewportScale';
 import type { ImmersiveState } from './immersiveStates';
 
@@ -19,12 +21,28 @@ export function ImmersivePage() {
   const setState = useImmersiveStore((s) => s.setState);
   const navigate = useNavigate();
   const vp = useViewportScale();
-  useScenarioPlayer(true);
+  const [demoMode, setDemoMode] = useState(false);
+  const scenario = useScenarioPlayer(false); // don't autostart — wait for user toggle or input
+  const daemon = useDaemonChat();
+
+  // Toggle demo (PLAY / STOP)
+  useEffect(() => {
+    if (demoMode) {
+      scenario.run();
+    } else {
+      scenario.stop();
+    }
+  }, [demoMode, scenario]);
 
   // Esc → back to chat
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
+        // If typing in input, let default blur behavior first
+        const active = document.activeElement;
+        if (active instanceof HTMLInputElement && active.value) {
+          return;
+        }
         e.preventDefault();
         navigate('/');
       }
@@ -32,6 +50,12 @@ export function ImmersivePage() {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [navigate]);
+
+  function handleAsk(text: string) {
+    // If demo is running, stop it so we don't clash
+    if (demoMode) setDemoMode(false);
+    daemon.ask(text);
+  }
 
   const btnSize = vp.isMobile ? 8 : vp.isTablet ? 9 : 11;
   const btnPad = vp.isMobile ? '6px 10px' : '9px 18px';
@@ -67,7 +91,9 @@ export function ImmersivePage() {
       <ConversationCinetic />
       <Waveform />
 
-      {/* Back to chat (top-left under brand) */}
+      <AvaInput onAsk={handleAsk} disabled={demoMode} />
+
+      {/* Back to chat */}
       <button
         onClick={() => navigate('/')}
         title="Retour au chat (Esc)"
@@ -101,43 +127,74 @@ export function ImmersivePage() {
         <ArrowLeft size={12} /> CHAT
       </button>
 
-      {/* Manual state controls (bottom-center) */}
-      <div
-        style={{
-          position: 'fixed',
-          bottom: vp.isMobile ? 16 : 28,
-          left: '50%',
-          transform: 'translateX(-50%)',
-          display: 'flex',
-          gap: vp.isMobile ? 3 : 6,
-          zIndex: 200,
-          flexWrap: 'wrap',
-          justifyContent: 'center',
-          maxWidth: '90vw',
-        }}
-      >
-        {STATE_ORDER.map((s) => (
-          <button
-            key={s}
-            onClick={() => setState(s)}
-            style={{
-              background: state === s ? 'rgba(81,164,222,0.3)' : 'rgba(81,164,222,0.08)',
-              border: `1px solid ${state === s ? '#7fb9e8' : 'rgba(81,164,222,0.3)'}`,
-              color: state === s ? '#fff' : '#51a4de',
-              fontFamily: 'inherit',
-              fontSize: btnSize,
-              letterSpacing: '0.25em',
-              padding: btnPad,
-              cursor: 'pointer',
-              textTransform: 'uppercase',
-              boxShadow: state === s ? '0 0 16px rgba(81,164,222,0.5)' : 'none',
-              transition: 'all 0.15s',
-            }}
-          >
-            {s}
-          </button>
-        ))}
-      </div>
+      {/* Play / Stop demo */}
+      {!vp.isMobile && (
+        <button
+          onClick={() => setDemoMode(!demoMode)}
+          title={demoMode ? 'Arrêter la démo scenario' : 'Lancer la démo scenario'}
+          style={{
+            position: 'fixed',
+            top: 28,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            zIndex: 210,
+            background: demoMode ? 'rgba(232,106,137,0.15)' : 'rgba(81,164,222,0.08)',
+            border: `1px solid ${demoMode ? 'rgba(232,106,137,0.5)' : 'rgba(81,164,222,0.3)'}`,
+            color: demoMode ? '#e86a89' : '#51a4de',
+            fontFamily: 'inherit',
+            fontSize: 10,
+            letterSpacing: '0.3em',
+            padding: '6px 14px',
+            cursor: 'pointer',
+            textTransform: 'uppercase',
+            display: 'flex', alignItems: 'center', gap: 8,
+            transition: 'all 0.15s',
+          }}
+        >
+          {demoMode ? <><Square size={10} /> STOP DEMO</> : <><Play size={10} /> PLAY DEMO</>}
+        </button>
+      )}
+
+      {/* Manual state controls (bottom-center, hidden during demo to avoid confusion) */}
+      {!demoMode && (
+        <div
+          style={{
+            position: 'fixed',
+            bottom: vp.isMobile ? 16 : 28,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            display: 'flex',
+            gap: vp.isMobile ? 3 : 6,
+            zIndex: 200,
+            flexWrap: 'wrap',
+            justifyContent: 'center',
+            maxWidth: '90vw',
+            opacity: 0.6,
+          }}
+        >
+          {STATE_ORDER.map((s) => (
+            <button
+              key={s}
+              onClick={() => setState(s)}
+              style={{
+                background: state === s ? 'rgba(81,164,222,0.3)' : 'rgba(81,164,222,0.08)',
+                border: `1px solid ${state === s ? '#7fb9e8' : 'rgba(81,164,222,0.3)'}`,
+                color: state === s ? '#fff' : '#51a4de',
+                fontFamily: 'inherit',
+                fontSize: btnSize,
+                letterSpacing: '0.25em',
+                padding: btnPad,
+                cursor: 'pointer',
+                textTransform: 'uppercase',
+                boxShadow: state === s ? '0 0 16px rgba(81,164,222,0.5)' : 'none',
+                transition: 'all 0.15s',
+              }}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
