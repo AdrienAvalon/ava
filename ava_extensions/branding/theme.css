@@ -1,0 +1,15 @@
+/*
+ * Ava — theme placeholder (M1)
+ *
+ * Ce fichier accueillera la palette couleur + typo Ava.
+ * À définir en M1.5 après validation visuelle du rebranding.
+ *
+ * Convention : override des custom properties déjà exposées par le frontend
+ * (--color-accent, --color-bg, --color-text, --color-text-secondary, etc.)
+ * définies dans frontend/src/index.css.
+ */
+
+:root[data-branding="ava"] {
+  /* Placeholder — ne redéfinit rien pour l'instant, hérite du theme OpenJarvis. */
+  /* À compléter : palette féminine complice (violet doux + crème ?) */
+}

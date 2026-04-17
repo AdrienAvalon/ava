@@ -1,0 +1,28 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Ava",
+  "identifier": "com.avalon.ava",
+  "app": {
+    "windows": [
+      {
+        "title": "Ava",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600
+      }
+    ]
+  },
+  "bundle": {
+    "shortDescription": "Ava — assistant IA personnel vocal FR",
+    "longDescription": "Ava est un assistant IA personnel self-hosted (fork OpenJarvis), voix française naturelle (Kokoro TTS), cerveau Claude Sonnet, orienté single-user.",
+    "category": "Utility"
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["ava"]
+      }
+    }
+  }
+}
