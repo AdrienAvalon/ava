@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router';
-import { ArrowLeft, Play, Square } from 'lucide-react';
+import { ArrowLeft, Play, Square, Volume2, VolumeX } from 'lucide-react';
 import { useImmersiveStore } from './immersiveStore';
 import { OrbAura } from './OrbAura';
 import { ConversationCinetic } from './ConversationCinetic';
@@ -22,8 +22,15 @@ export function ImmersivePage() {
   const navigate = useNavigate();
   const vp = useViewportScale();
   const [demoMode, setDemoMode] = useState(false);
+  const [muted, setMutedState] = useState(false);
   const scenario = useScenarioPlayer(false); // don't autostart — wait for user toggle or input
   const daemon = useDaemonChat();
+
+  function toggleMute() {
+    const next = !muted;
+    setMutedState(next);
+    daemon.setMuted(next);
+  }
 
   // Toggle demo (PLAY / STOP)
   useEffect(() => {
@@ -44,7 +51,7 @@ export function ImmersivePage() {
           return;
         }
         e.preventDefault();
-        navigate('/chat');
+        navigate('/');
       }
     };
     window.addEventListener('keydown', onKey);
@@ -95,7 +102,7 @@ export function ImmersivePage() {
 
       {/* Back to chat */}
       <button
-        onClick={() => navigate('/chat')}
+        onClick={() => navigate('/')}
         title="Retour au chat (Esc)"
         style={{
           position: 'fixed',
@@ -125,6 +132,31 @@ export function ImmersivePage() {
         }}
       >
         <ArrowLeft size={12} /> CHAT
+      </button>
+
+      {/* Mute toggle (top-right under status) */}
+      <button
+        onClick={toggleMute}
+        title={muted ? 'Activer la voix' : 'Couper la voix'}
+        style={{
+          position: 'fixed',
+          top: vp.smallHud ? 56 : 100,
+          right: 32,
+          zIndex: 210,
+          background: muted ? 'rgba(232,106,137,0.12)' : 'rgba(81,164,222,0.08)',
+          border: `1px solid ${muted ? 'rgba(232,106,137,0.4)' : 'rgba(81,164,222,0.3)'}`,
+          color: muted ? '#e86a89' : '#51a4de',
+          fontFamily: 'inherit',
+          fontSize: vp.isMobile ? 9 : 10,
+          letterSpacing: '0.25em',
+          padding: '6px 12px',
+          cursor: 'pointer',
+          textTransform: 'uppercase',
+          display: 'flex', alignItems: 'center', gap: 6,
+          transition: 'all 0.15s',
+        }}
+      >
+        {muted ? <><VolumeX size={12} /> MUTE</> : <><Volume2 size={12} /> VOIX</>}
       </button>
 
       {/* Play / Stop demo */}

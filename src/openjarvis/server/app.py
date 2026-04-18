@@ -229,6 +229,14 @@ def create_app(
     app.include_router(create_connectors_router())
     app.include_router(create_digest_router())
     app.include_router(upload_router)
+    # --- Ava extension routes (tts_route.router) ---
+    try:
+        from ava_extensions.server.tts_route import router as _ava_tts_router
+        app.include_router(_ava_tts_router)
+    except Exception as _ava_exc:  # pragma: no cover - optional
+        import logging
+        logging.getLogger(__name__).warning('Ava TTS route not registered: %s', _ava_exc)
+    # --- end Ava extension ---
     include_all_routes(app)
 
     # Restore SendBlue channel bindings from database on startup
