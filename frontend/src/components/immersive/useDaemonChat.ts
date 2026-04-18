@@ -2,7 +2,7 @@ import { useRef } from 'react';
 import { useImmersiveStore } from './immersiveStore';
 
 interface Message {
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'system';
   content: string;
 }
 
@@ -148,6 +148,28 @@ export function useDaemonChat() {
   const inFlight = useRef(false);
   const currentSource = useRef<AudioBufferSourceNode | null>(null);
   const mutedRef = useRef(false);
+  // Persona loaded once from /v1/ava/persona — injected as a system message
+  // because OpenJarvis's streaming /v1/chat/completions path does not apply
+  // the agent's configured system prompt.
+  const personaRef = useRef<string | null>(null);
+  const personaPromise = useRef<Promise<string> | null>(null);
+
+  function loadPersona(): Promise<string> {
+    if (personaRef.current !== null) return Promise.resolve(personaRef.current);
+    if (personaPromise.current) return personaPromise.current;
+    personaPromise.current = fetch('/v1/ava/persona')
+      .then((r) => (r.ok ? r.json() : { system_prompt: '' }))
+      .then((d) => {
+        const text = (d?.system_prompt as string) || '';
+        personaRef.current = text;
+        return text;
+      })
+      .catch(() => {
+        personaRef.current = '';
+        return '';
+      });
+    return personaPromise.current;
+  }
 
   function setMuted(muted: boolean) {
     mutedRef.current = muted;
@@ -182,6 +204,13 @@ export function useDaemonChat() {
     });
 
     history.current.push({ role: 'user', content: userText });
+
+    // Build the messages array sent to the daemon. Prepend the persona as a
+    // system message if available (streaming path does not auto-inject it).
+    const persona = await loadPersona();
+    const messages = persona
+      ? [{ role: 'system' as const, content: persona }, ...history.current]
+      : [...history.current];
 
     // Sentence speech pipeline
     // Kokoro is CPU-bound — parallel synthesis saturates the backend and makes
@@ -233,7 +262,7 @@ export function useDaemonChat() {
         signal,
         body: JSON.stringify({
           model: MODEL,
-          messages: history.current,
+          messages,
           stream: true,
           max_tokens: MAX_TOKENS,
         }),

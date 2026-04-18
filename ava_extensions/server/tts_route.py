@@ -77,6 +77,50 @@ def speak_health() -> dict:
     }
 
 
+# === Persona ===
+# Exposes the current Ava system prompt so the frontend can inject it as a
+# system message. The OpenAI-compat /v1/chat/completions streaming path does
+# not apply the agent's configured system prompt; sending it explicitly from
+# the client is the simplest reliable fix.
+import os
+from pathlib import Path
+
+
+_PERSONA_CACHE: dict[str, object] = {"mtime": 0.0, "text": ""}
+
+
+def _load_persona() -> str:
+    """Load the Ava persona system prompt, respecting config.agent.system_prompt_path."""
+    # Try config first
+    try:
+        from openjarvis.core.config import load_config  # local import to avoid early load
+        cfg = load_config()
+        path = getattr(getattr(cfg, "agent", None), "system_prompt_path", None)
+    except Exception:
+        path = None
+    if not path:
+        path = os.path.expanduser("~/ava/ava_extensions/identity/system_prompts/ava.md")
+    p = Path(path)
+    if not p.exists():
+        return ""
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    if mtime == _PERSONA_CACHE["mtime"]:
+        return str(_PERSONA_CACHE["text"])
+    text = p.read_text(encoding="utf-8").strip()
+    _PERSONA_CACHE["mtime"] = mtime
+    _PERSONA_CACHE["text"] = text
+    return text
+
+
+@router.get("/persona")
+def persona() -> dict:
+    text = _load_persona()
+    return {"system_prompt": text, "length": len(text)}
+
+
 # === Pre-warm ===
 # Kokoro has a cold-start cost (model load + first espeak-ng call).
 # Synthesize a trivial phrase at import time so the first real request
