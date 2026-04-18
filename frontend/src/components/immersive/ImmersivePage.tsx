@@ -9,6 +9,7 @@ import { Waveform } from './Waveform';
 import { HudLayers } from './HudLayers';
 import { StateRings } from './StateRings';
 import { AvaInput } from './AvaInput';
+import { MicButton } from './MicButton';
 import { useScenarioPlayer } from './useScenarioPlayer';
 import { useDaemonChat } from './useDaemonChat';
 import { useViewportScale } from './useViewportScale';
@@ -99,6 +100,7 @@ export function ImmersivePage() {
       <Waveform />
 
       <AvaInput onAsk={handleAsk} disabled={demoMode} />
+      <MicButton onTranscript={handleAsk} disabled={demoMode} />
 
       {/* Back to chat */}
       <button
