@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
-import { Mic, MicOff, Loader2 } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Mic, MicOff, Loader2, MicVocal } from 'lucide-react';
 import { useVoiceCapture } from './useVoiceCapture';
 import { useViewportScale } from './useViewportScale';
 
@@ -18,22 +18,54 @@ interface MicButtonProps {
 export function MicButton({ onTranscript, disabled }: MicButtonProps) {
   const capture = useVoiceCapture();
   const [state, setState] = useState<'idle' | 'recording' | 'transcribing'>('idle');
+  const [permission, setPermission] = useState<'unknown' | 'granted' | 'denied' | 'prompt'>('unknown');
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const vp = useViewportScale();
-  const errorRef = useRef<string | null>(null);
+
+  // Check mic permission at mount and keep it in sync
+  useEffect(() => {
+    let cancelled = false;
+    let handle: PermissionStatus | null = null;
+    (async () => {
+      if (!('permissions' in navigator)) return;
+      try {
+        const p = await (navigator.permissions as unknown as {
+          query: (d: { name: string }) => Promise<PermissionStatus>;
+        }).query({ name: 'microphone' });
+        if (cancelled) return;
+        handle = p;
+        setPermission(p.state as 'granted' | 'denied' | 'prompt');
+        p.onchange = () => {
+          if (!cancelled) setPermission(p.state as 'granted' | 'denied' | 'prompt');
+        };
+      } catch {
+        /* browser without permissions.query → fall back to live attempts */
+      }
+    })();
+    return () => { cancelled = true; if (handle) handle.onchange = null; };
+  }, []);
 
   const isBusy = state !== 'idle';
 
   async function startRec() {
     if (disabled || isBusy) return;
-    errorRef.current = null;
+    setErrorMsg(null);
     try {
       await capture.start();
       setState('recording');
     } catch (e) {
-      errorRef.current = (e as Error).message || 'mic error';
+      const err = e as Error;
       setState('idle');
+      if (err.name === 'NotAllowedError' || err.name === 'SecurityError') {
+        setPermission('denied');
+        setErrorMsg('Micro refusé. Autorise ava.avalon-network.com dans les paramètres du navigateur.');
+      } else if (err.name === 'NotFoundError' || err.name === 'OverconstrainedError') {
+        setErrorMsg('Aucun micro détecté.');
+      } else {
+        setErrorMsg(err.message || 'Erreur micro');
+      }
       // eslint-disable-next-line no-console
-      console.warn('Mic start failed:', e);
+      console.warn('Mic start failed:', err);
     }
   }
 
@@ -44,7 +76,7 @@ export function MicButton({ onTranscript, disabled }: MicButtonProps) {
       const text = await capture.stopAndTranscribe();
       if (text) onTranscript(text);
     } catch (e) {
-      errorRef.current = (e as Error).message || 'transcribe error';
+      setErrorMsg((e as Error).message || 'transcribe error');
       // eslint-disable-next-line no-console
       console.warn('Transcribe failed:', e);
     } finally {
@@ -87,12 +119,15 @@ export function MicButton({ onTranscript, disabled }: MicButtonProps) {
   }, [state, disabled]);
 
   const size = vp.isMobile ? 52 : 60;
+  const denied = permission === 'denied';
   const color =
+    denied ? '#ff6b8a' :
     state === 'recording' ? '#ff6b8a' :
     state === 'transcribing' ? '#d4c4ff' :
     '#51a4de';
 
   const label =
+    denied ? 'MIC REFUSÉ' :
     state === 'recording' ? 'STOP' :
     state === 'transcribing' ? '...' :
     'PARLER';
@@ -115,7 +150,7 @@ export function MicButton({ onTranscript, disabled }: MicButtonProps) {
       <button
         onClick={onClick}
         disabled={disabled || state === 'transcribing'}
-        title="Parler à Ava (ou maintenir la barre espace)"
+        title={denied ? 'Micro refusé — clique sur le cadenas dans la barre URL pour autoriser' : 'Parler à Ava (ou maintenir la barre espace)'}
         style={{
           width: size,
           height: size,
@@ -136,8 +171,30 @@ export function MicButton({ onTranscript, disabled }: MicButtonProps) {
           ? <Loader2 size={24} style={{ animation: 'avaSpin 0.9s linear infinite' }} />
           : state === 'recording'
           ? <MicOff size={24} />
+          : denied
+          ? <MicOff size={24} />
           : <Mic size={24} />}
       </button>
+      {errorMsg && (
+        <div
+          style={{
+            position: 'absolute',
+            bottom: -38,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            fontFamily: "'JetBrains Mono', monospace",
+            fontSize: 9,
+            color: '#ff6b8a',
+            letterSpacing: '0.12em',
+            whiteSpace: 'nowrap',
+            maxWidth: 360,
+            textAlign: 'center',
+            pointerEvents: 'none',
+          }}
+        >
+          {errorMsg}
+        </div>
+      )}
       <div
         style={{
           fontFamily: "'JetBrains Mono', 'Space Mono', monospace",
