@@ -95,6 +95,18 @@ export function MicButton({ onTranscript, disabled }: MicButtonProps) {
     else if (state === 'recording') stopAndSend();
   }
 
+  // Safety net: stop recording after 15s if user forgets to release/click again
+  useEffect(() => {
+    if (state !== 'recording') return;
+    const t = setTimeout(() => {
+      // eslint-disable-next-line no-console
+      console.log('[AvaMic] auto-stop after 15s');
+      stopAndSend();
+    }, 15000);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state]);
+
   // Hold-spacebar push-to-talk (ignored when typing in an input)
   useEffect(() => {
     const isTyping = () => {
@@ -139,6 +151,35 @@ export function MicButton({ onTranscript, disabled }: MicButtonProps) {
     'PARLER';
 
   return (
+    <>
+      {/* Big visible status banner top-center while active — so the user
+          knows the click actually did something. */}
+      {(state === 'recording' || state === 'transcribing') && (
+        <div
+          style={{
+            position: 'fixed',
+            top: vp.smallHud ? 120 : 150,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            zIndex: 220,
+            fontFamily: "'JetBrains Mono', monospace",
+            fontSize: 13,
+            letterSpacing: '0.4em',
+            textTransform: 'uppercase',
+            padding: '10px 22px',
+            background: state === 'recording' ? 'rgba(232,106,137,0.14)' : 'rgba(212,196,255,0.14)',
+            border: `1px solid ${state === 'recording' ? '#ff6b8a' : '#d4c4ff'}`,
+            color: state === 'recording' ? '#ff6b8a' : '#d4c4ff',
+            boxShadow: state === 'recording' ? '0 0 24px rgba(232,106,137,0.35)' : '0 0 18px rgba(212,196,255,0.25)',
+            pointerEvents: 'none',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {state === 'recording'
+            ? '🎙 ENREGISTREMENT... parle maintenant'
+            : '💭 TRANSCRIPTION...'}
+        </div>
+      )}
     <div
       style={{
         position: 'fixed',
@@ -224,5 +265,6 @@ export function MicButton({ onTranscript, disabled }: MicButtonProps) {
         }
       `}</style>
     </div>
+    </>
   );
 }
