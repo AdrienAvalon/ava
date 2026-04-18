@@ -103,7 +103,7 @@ export function MicButton({ onTranscript, disabled }: MicButtonProps) {
         position: 'fixed',
         bottom: vp.isMobile ? 150 : 210,
         left: '50%',
-        transform: 'translateX(-50%)',
+        transform: 'translateX(calc(-50% - 55px))',
         zIndex: 150,
         display: 'flex',
         flexDirection: 'column',
