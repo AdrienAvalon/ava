@@ -74,7 +74,13 @@ export function MicButton({ onTranscript, disabled }: MicButtonProps) {
     setState('transcribing');
     try {
       const text = await capture.stopAndTranscribe();
-      if (text) onTranscript(text);
+      if (text) {
+        setErrorMsg(null);
+        onTranscript(text);
+      } else {
+        setErrorMsg("Je n'ai rien compris — réessaye un peu plus fort, ou plus proche du micro.");
+        setTimeout(() => setErrorMsg(null), 4000);
+      }
     } catch (e) {
       setErrorMsg((e as Error).message || 'transcribe error');
       // eslint-disable-next-line no-console

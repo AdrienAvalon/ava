@@ -34,6 +34,14 @@ export function useVoiceVAD(opts: VADOptions) {
     try {
       // Dynamic import so we only pay the cost when the user enables VAD
       const mod = await import('@ricky0123/vad-web');
+      // Point onnxruntime-web to the jsDelivr CDN for its wasm binaries.
+      // Vite does not copy @ricky0123/vad-web's auxiliary wasm files next to
+      // the JS chunk by default, so the default relative paths return 404.
+      try {
+        const ort = await import('onnxruntime-web');
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (ort as any).env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.1/dist/';
+      } catch { /* fallback to default paths (will 404) */ }
       const vad = (await mod.MicVAD.new({
         onSpeechStart: () => {
           setSpeaking(true);
