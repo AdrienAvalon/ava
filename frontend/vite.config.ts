@@ -16,9 +16,9 @@ export default defineConfig({
     VitePWA({
       registerType: 'autoUpdate',
       manifest: {
-        name: 'OpenJarvis',
-        short_name: 'Jarvis',
-        description: 'On-device AI assistant',
+        name: 'Ava',
+        short_name: 'Ava',
+        description: 'Ava - assistant IA personnel vocal FR',
         theme_color: '#161618',
         background_color: '#161618',
         display: 'standalone',
@@ -28,9 +28,19 @@ export default defineConfig({
         ],
       },
       workbox: {
-        globPatterns: ['**/*.{js,css,html,ico,png,svg}'],
+        globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}'],
         navigateFallbackDenylist: [/^\/v1\//, /^\/health/, /^\/dashboard/],
-        mode: 'development',
+        skipWaiting: true,
+        clientsClaim: true,
+        cleanupOutdatedCaches: true,
+        // NetworkFirst for HTML so a new deploy is picked up immediately
+        runtimeCaching: [
+          {
+            urlPattern: ({ request }) => request.destination === 'document',
+            handler: 'NetworkFirst',
+            options: { cacheName: 'ava-html', networkTimeoutSeconds: 3 },
+          },
+        ],
       },
     }),
   ],
