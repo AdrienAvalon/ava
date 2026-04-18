@@ -186,7 +186,7 @@ export default function App() {
       </Routes>
       <Toaster position="bottom-right" />
       {commandPaletteOpen && <CommandPalette />}
-      {optInModalOpen && !window.location.pathname.startsWith("/immersive") && (
+      {optInModalOpen && false && (
         <OptInModal onClose={() => setOptInModalOpen(false)} />
       )}
     </>
