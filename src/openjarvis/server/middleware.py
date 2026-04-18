@@ -48,7 +48,7 @@ def create_security_middleware() -> Any:
             response.headers["Permissions-Policy"] = (
                 "camera=(), microphone=(), geolocation=()"
             )
-            response.headers["Content-Security-Policy"] = "default-src 'self'; connect-src 'self' https://auth.avalon-network.com; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; frame-src 'self' https://auth.avalon-network.com; worker-src 'self' blob:; object-src 'none'; base-uri 'self'"
+            response.headers["Content-Security-Policy"] = "default-src 'self'; connect-src 'self' https://auth.avalon-network.com; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: data:; font-src 'self' data:; frame-src 'self' https://auth.avalon-network.com; worker-src 'self' blob:; object-src 'none'; base-uri 'self'"
             return response
 
     return SecurityHeadersMiddleware
@@ -62,5 +62,5 @@ SECURITY_HEADERS = {
     "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
     "Referrer-Policy": "strict-origin-when-cross-origin",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
-    "Content-Security-Policy": "default-src 'self'; connect-src 'self' https://auth.avalon-network.com; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; frame-src 'self' https://auth.avalon-network.com; worker-src 'self' blob:; object-src 'none'; base-uri 'self'",
+    "Content-Security-Policy": "default-src 'self'; connect-src 'self' https://auth.avalon-network.com; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: data:; font-src 'self' data:; frame-src 'self' https://auth.avalon-network.com; worker-src 'self' blob:; object-src 'none'; base-uri 'self'",
 }

@@ -15,7 +15,19 @@ const TTS_BACKEND = 'kokoro-fr';
 const TTS_VOICE = 'ff_siwis';
 const TTS_MIN_CHARS = 4; // don't synthesize dust
 
-async function synthesize(text: string, signal: AbortSignal): Promise<HTMLAudioElement | null> {
+// Shared AudioContext — instantiated lazily on the first user gesture so the
+// browser's autoplay policy does not block playback later.
+let sharedAudioCtx: AudioContext | null = null;
+function getAudioCtx(): AudioContext {
+  if (!sharedAudioCtx) {
+    const AC = (window as unknown as { AudioContext: typeof AudioContext; webkitAudioContext?: typeof AudioContext }).AudioContext
+      || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    sharedAudioCtx = new AC();
+  }
+  return sharedAudioCtx;
+}
+
+async function synthesize(text: string, signal: AbortSignal): Promise<AudioBuffer | null> {
   const clean = text.trim();
   if (!clean || clean.length < TTS_MIN_CHARS) return null;
   const resp = await fetch('/v1/ava/speak', {
@@ -31,13 +43,31 @@ async function synthesize(text: string, signal: AbortSignal): Promise<HTMLAudioE
     }),
   });
   if (!resp.ok) throw new Error(`TTS HTTP ${resp.status}`);
-  const blob = await resp.blob();
-  const url = URL.createObjectURL(blob);
-  const audio = new Audio(url);
-  audio.preload = 'auto';
-  audio.addEventListener('ended', () => URL.revokeObjectURL(url), { once: true });
-  audio.addEventListener('error', () => URL.revokeObjectURL(url), { once: true });
-  return audio;
+  const buf = await resp.arrayBuffer();
+  const ctx = getAudioCtx();
+  if (ctx.state === 'suspended') {
+    try { await ctx.resume(); } catch { /* no gesture yet — caller should retry after click */ }
+  }
+  // decodeAudioData is more permissive than <audio> for odd WAV rates (24kHz mono)
+  return await ctx.decodeAudioData(buf);
+}
+
+function playBuffer(
+  buffer: AudioBuffer,
+  onEnded: () => void,
+): AudioBufferSourceNode {
+  const ctx = getAudioCtx();
+  const src = ctx.createBufferSource();
+  src.buffer = buffer;
+  src.connect(ctx.destination);
+  src.onended = onEnded;
+  try {
+    src.start();
+  } catch {
+    // best-effort: invoke ended to release the playback chain
+    queueMicrotask(onEnded);
+  }
+  return src;
 }
 
 /**
@@ -84,14 +114,14 @@ export function useDaemonChat() {
   const history = useRef<Message[]>([]);
   const abortCtrl = useRef<AbortController | null>(null);
   const inFlight = useRef(false);
-  const currentAudio = useRef<HTMLAudioElement | null>(null);
+  const currentSource = useRef<AudioBufferSourceNode | null>(null);
   const mutedRef = useRef(false);
 
   function setMuted(muted: boolean) {
     mutedRef.current = muted;
-    if (muted && currentAudio.current) {
-      currentAudio.current.pause();
-      currentAudio.current = null;
+    if (muted && currentSource.current) {
+      try { currentSource.current.stop(); } catch { /* ignore */ }
+      currentSource.current = null;
     }
   }
 
@@ -126,7 +156,7 @@ export function useDaemonChat() {
     // each request slower, so we chain synthesis serially. Playback is a
     // separate chain that waits for its synth Promise, so audio N+1 can be
     // ready while audio N is still playing (pipelined).
-    let synthChain: Promise<HTMLAudioElement | null> = Promise.resolve(null);
+    let synthChain: Promise<AudioBuffer | null> = Promise.resolve(null);
     let playbackChain: Promise<void> = Promise.resolve();
     const playbackErrors: string[] = [];
 
@@ -148,15 +178,15 @@ export function useDaemonChat() {
       // Playback chain waits for its synth and for the previous playback to end.
       playbackChain = playbackChain.then(async () => {
         if (mutedRef.current || signal.aborted) return;
-        const audio = await thisSynth;
-        if (!audio) return;
-        currentAudio.current = audio;
+        const buffer = await thisSynth;
+        if (!buffer) return;
         await new Promise<void>((resolve) => {
-          audio.addEventListener('ended', () => resolve(), { once: true });
-          audio.addEventListener('error', () => resolve(), { once: true });
-          audio.play().catch(() => resolve());
+          const src = playBuffer(buffer, () => {
+            currentSource.current = null;
+            resolve();
+          });
+          currentSource.current = src;
         });
-        currentAudio.current = null;
       });
     }
 
@@ -269,9 +299,9 @@ export function useDaemonChat() {
 
   function reset() {
     abortCtrl.current?.abort();
-    if (currentAudio.current) {
-      currentAudio.current.pause();
-      currentAudio.current = null;
+    if (currentSource.current) {
+      try { currentSource.current.stop(); } catch { /* ignore */ }
+      currentSource.current = null;
     }
     history.current = [];
     inFlight.current = false;
