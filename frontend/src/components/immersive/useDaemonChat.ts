@@ -15,6 +15,38 @@ const TTS_BACKEND = 'kokoro-fr';
 const TTS_VOICE = 'ff_siwis';
 const TTS_MIN_CHARS = 4; // don't synthesize dust
 
+/**
+ * Clean a text segment for TTS: strip emojis and markdown noise that would
+ * otherwise be read aloud ("emoji cerveau", "étoile étoile", backticks...).
+ * The visible conversation keeps the original (emojis make the chat alive);
+ * only what Ava *pronounces* goes through this filter.
+ */
+function cleanForTTS(text: string): string {
+  return text
+    // Emojis + pictographs (Unicode Extended_Pictographic incl. joiners)
+    .replace(/[\p{Extended_Pictographic}\u200D\uFE0F]/gu, '')
+    // Variation selectors, zero-width, symbols that trip up phonemizers
+    .replace(/[\u2000-\u206F\u2070-\u209F\u20A0-\u20CF]/g, ' ')
+    // Markdown emphasis markers: **bold**, *italic*, __bold__, _italic_
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/__([^_]+)__/g, '$1')
+    .replace(/(^|[\s(])[*_]([^*_\n]+)[*_](?=[\s).,!?:;]|$)/g, '$1$2')
+    // Inline/code block backticks
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`]+)`/g, '$1')
+    // Markdown headings # / ## / ### at line start
+    .replace(/^#{1,6}\s+/gm, '')
+    // List markers at line start (-, *, +, 1.)
+    .replace(/^\s*[-*+]\s+/gm, '')
+    .replace(/^\s*\d+\.\s+/gm, '')
+    // URLs → read only the label if [text](url), else drop the URL
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/https?:\/\/\S+/g, '')
+    // Collapse whitespace
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 // Shared AudioContext — instantiated lazily on the first user gesture so the
 // browser's autoplay policy does not block playback later.
 let sharedAudioCtx: AudioContext | null = null;
@@ -28,14 +60,14 @@ function getAudioCtx(): AudioContext {
 }
 
 async function synthesize(text: string, signal: AbortSignal): Promise<AudioBuffer | null> {
-  const clean = text.trim();
-  if (!clean || clean.length < TTS_MIN_CHARS) return null;
+  const spoken = cleanForTTS(text);
+  if (!spoken || spoken.length < TTS_MIN_CHARS) return null;
   const resp = await fetch('/v1/ava/speak', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     signal,
     body: JSON.stringify({
-      text: clean,
+      text: spoken,
       voice_id: TTS_VOICE,
       backend: TTS_BACKEND,
       speed: 1.0,
