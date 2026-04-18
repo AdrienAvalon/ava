@@ -75,3 +75,23 @@ def speak_health() -> dict:
         "default_backend": "kokoro",
         "default_voice": "ff_siwis",
     }
+
+
+# === Pre-warm ===
+# Kokoro has a cold-start cost (model load + first espeak-ng call).
+# Synthesize a trivial phrase at import time so the first real request
+# from the browser hits a warm pipeline (~2s saved on the first voice turn).
+def _prewarm() -> None:
+    import threading
+    def _worker() -> None:
+        try:
+            if not TTSRegistry.contains("kokoro-fr"):
+                return
+            backend = TTSRegistry.get("kokoro-fr")()
+            backend.synthesize("bonjour", voice_id="ff_siwis", speed=1.0)
+        except Exception:
+            pass
+    threading.Thread(target=_worker, daemon=True, name="kokoro-prewarm").start()
+
+
+_prewarm()
