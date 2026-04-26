@@ -231,11 +231,20 @@ def create_app(
     app.include_router(upload_router)
     # --- Ava extension routes (tts_route.router) ---
     try:
+        from ava_extensions.server.tts_route import (
+            prewarm_kokoro as _ava_prewarm_kokoro,
+        )
         from ava_extensions.server.tts_route import router as _ava_tts_router
         app.include_router(_ava_tts_router)
-    except Exception as _ava_exc:  # pragma: no cover - optional
+
+        @app.on_event("startup")
+        async def _ava_kokoro_startup() -> None:
+            _ava_prewarm_kokoro()
+    except ImportError as _ava_exc:  # pragma: no cover - optional
         import logging
-        logging.getLogger(__name__).warning('Ava TTS route not registered: %s', _ava_exc)
+        logging.getLogger(__name__).warning(
+            'Ava TTS route not registered: %s', _ava_exc
+        )
     # --- end Ava extension ---
     include_all_routes(app)
 

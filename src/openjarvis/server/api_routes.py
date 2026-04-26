@@ -756,6 +756,8 @@ async def transcribe_speech(request: Request):
         raise HTTPException(status_code=400, detail="Missing 'file' field")
 
     audio_bytes = await audio_file.read()
+    if len(audio_bytes) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Audio too large (max 5 MB)")
     language = form.get("language")
 
     # Detect format from filename

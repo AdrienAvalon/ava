@@ -8,6 +8,35 @@ import App from './App';
 import { initApiBase } from './lib/api';
 import './index.css';
 
+// Same-origin API auth: prepend Authorization: Bearer <key> to /v1/* and /api/*
+// fetches when a build-time key is provided (VITE_OJ_API_KEY). The OpenJarvis
+// daemon middleware refuses unauthenticated /v1/* and /api/* calls when
+// OPENJARVIS_API_KEY is set server-side.
+const _OJ_API_KEY = import.meta.env.VITE_OJ_API_KEY ?? '';
+if (_OJ_API_KEY) {
+  const _origFetch = window.fetch.bind(window);
+  window.fetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const url =
+      typeof input === 'string'
+        ? input
+        : input instanceof URL
+        ? input.href
+        : input.url;
+    const isApiPath =
+      url.startsWith('/v1/') ||
+      url.startsWith('/api/') ||
+      /^https?:\/\/[^/]+\/(v1|api)\//.test(url);
+    if (!isApiPath) return _origFetch(input, init);
+    const baseHeaders =
+      init?.headers ?? (input instanceof Request ? input.headers : undefined);
+    const headers = new Headers(baseHeaders);
+    if (!headers.has('Authorization')) {
+      headers.set('Authorization', `Bearer ${_OJ_API_KEY}`);
+    }
+    return _origFetch(input, { ...init, headers });
+  };
+}
+
 function applyTheme() {
   try {
     const raw = localStorage.getItem('openjarvis-settings');

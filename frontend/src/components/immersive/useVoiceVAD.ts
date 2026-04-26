@@ -6,6 +6,7 @@ type MicVADType = {
   start: () => void;
   pause: () => void;
   destroy: () => void;
+  stream?: MediaStream;
 };
 
 interface VADOptions {
@@ -34,13 +35,13 @@ export function useVoiceVAD(opts: VADOptions) {
     try {
       // Dynamic import so we only pay the cost when the user enables VAD
       const mod = await import('@ricky0123/vad-web');
-      // Point onnxruntime-web to the jsDelivr CDN for its wasm binaries.
-      // Vite does not copy @ricky0123/vad-web's auxiliary wasm files next to
-      // the JS chunk by default, so the default relative paths return 404.
+      // onnxruntime-web wasm files are self-hosted under /onnx/ (copied at
+      // build time from node_modules/onnxruntime-web/dist/). Avoids depending
+      // on jsDelivr from the CSP.
       try {
         const ort = await import('onnxruntime-web');
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (ort as any).env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.1/dist/';
+        (ort as any).env.wasm.wasmPaths = '/onnx/';
       } catch { /* fallback to default paths (will 404) */ }
       const vad = (await mod.MicVAD.new({
         onSpeechStart: () => {
@@ -67,8 +68,12 @@ export function useVoiceVAD(opts: VADOptions) {
 
   const stop = useCallback(() => {
     try {
-      vadRef.current?.pause();
-      vadRef.current?.destroy();
+      const vad = vadRef.current;
+      vad?.pause();
+      vad?.destroy();
+      // @ricky0123/vad-web does not always release the underlying MediaStream
+      // on destroy() — kill tracks ourselves to clear the browser mic LED.
+      vad?.stream?.getTracks().forEach((t) => t.stop());
     } catch {
       /* ignore */
     }

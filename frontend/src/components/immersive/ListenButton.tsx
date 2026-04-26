@@ -24,7 +24,11 @@ export function ListenButton({ onTranscript, disabled }: ListenButtonProps) {
     onSpeechEnd: async (audio) => {
       if (audio.length < 16000 * 0.3) return; // < 300ms → ignore noise
       const blob = float32ToWavBlob(audio, 16000);
-      const p = (async () => {
+      // Serialize transcriptions: chain on the previous promise so order
+      // matches speech order. Whisper latency varies and parallel POSTs would
+      // race -> onTranscript can fire out-of-order, scrambling the convo.
+      const previous = latestTranscribePromise.current ?? Promise.resolve();
+      const p = previous.then(async () => {
         setTranscribing(true);
         try {
           const fd = new FormData();
@@ -41,7 +45,7 @@ export function ListenButton({ onTranscript, disabled }: ListenButtonProps) {
         } finally {
           setTranscribing(false);
         }
-      })();
+      });
       latestTranscribePromise.current = p;
     },
   });

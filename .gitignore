@@ -119,3 +119,6 @@ ava_extensions/backends/tts_models/*
 .tmp-exec/
 logs/
 frontend/tsconfig.tsbuildinfo
+
+# Auto-copied from node_modules at build time (see frontend/scripts/prepare-onnx-wasm.sh)
+frontend/public/onnx/

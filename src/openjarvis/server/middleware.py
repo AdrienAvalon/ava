@@ -4,7 +4,24 @@ from __future__ import annotations
 
 from typing import Any
 
-__all__ = ["SECURITY_HEADERS", "create_security_middleware"]
+__all__ = ["CSP_POLICY", "SECURITY_HEADERS", "create_security_middleware"]
+
+
+CSP_POLICY = "; ".join(
+    [
+        "default-src 'self'",
+        "connect-src 'self' https://auth.avalon-network.com",
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' data: blob:",
+        "media-src 'self' blob: data:",
+        "font-src 'self' data:",
+        "frame-src 'self' https://auth.avalon-network.com",
+        "worker-src 'self' blob:",
+        "object-src 'none'",
+        "base-uri 'self'",
+    ]
+)
 
 
 def create_security_middleware() -> Any:
@@ -48,7 +65,7 @@ def create_security_middleware() -> Any:
             response.headers["Permissions-Policy"] = (
                 "camera=(), microphone=(), geolocation=()"
             )
-            response.headers["Content-Security-Policy"] = "default-src 'self'; connect-src 'self' https://auth.avalon-network.com https://cdn.jsdelivr.net; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: data:; font-src 'self' data:; frame-src 'self' https://auth.avalon-network.com; worker-src 'self' blob: https://cdn.jsdelivr.net; object-src 'none'; base-uri 'self'"
+            response.headers["Content-Security-Policy"] = CSP_POLICY
             return response
 
     return SecurityHeadersMiddleware
@@ -62,5 +79,5 @@ SECURITY_HEADERS = {
     "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
     "Referrer-Policy": "strict-origin-when-cross-origin",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
-    "Content-Security-Policy": "default-src 'self'; connect-src 'self' https://auth.avalon-network.com https://cdn.jsdelivr.net; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: data:; font-src 'self' data:; frame-src 'self' https://auth.avalon-network.com; worker-src 'self' blob: https://cdn.jsdelivr.net; object-src 'none'; base-uri 'self'",
+    "Content-Security-Policy": CSP_POLICY,
 }

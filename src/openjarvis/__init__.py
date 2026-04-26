@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-
 # --- Ava extensions hook (fork-local, optionnel) ---
 # Importé au tout début pour que les patches soient appliqués avant tout
 # import de openjarvis.core.config, openjarvis.sdk, etc.

@@ -5,6 +5,11 @@ from the browser as an `<audio>` source or `new Audio(blob)`.
 """
 from __future__ import annotations
 
+import logging
+import os
+import threading
+from pathlib import Path
+
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
@@ -14,13 +19,14 @@ import openjarvis.speech  # noqa: F401
 from openjarvis.core.registry import TTSRegistry
 
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/ava", tags=["ava"])
 
 
 class SpeakRequest(BaseModel):
-    text: str = Field(..., min_length=1, max_length=4000)
+    text: str = Field(..., min_length=1, max_length=500)
     voice_id: str = Field("ff_siwis", description="Voice identifier for the backend")
-    backend: str = Field("kokoro", description="TTS backend key (kokoro, cartesia, openai_tts)")
+    backend: str = Field("kokoro-fr", description="TTS backend key (kokoro-fr, kokoro, cartesia, openai_tts)")
     speed: float = Field(1.0, ge=0.5, le=2.0, description="Playback speed multiplier")
     output_format: str = Field("wav", description="Preferred audio format (wav, mp3)")
 
@@ -72,7 +78,7 @@ def speak_health() -> dict:
     backends = list(TTSRegistry.keys())
     return {
         "available_backends": backends,
-        "default_backend": "kokoro",
+        "default_backend": "kokoro-fr",
         "default_voice": "ff_siwis",
     }
 
@@ -82,18 +88,14 @@ def speak_health() -> dict:
 # system message. The OpenAI-compat /v1/chat/completions streaming path does
 # not apply the agent's configured system prompt; sending it explicitly from
 # the client is the simplest reliable fix.
-import os
-from pathlib import Path
-
-
+_PERSONA_LOCK = threading.Lock()
 _PERSONA_CACHE: dict[str, object] = {"mtime": 0.0, "text": ""}
 
 
 def _load_persona() -> str:
     """Load the Ava persona system prompt, respecting config.agent.system_prompt_path."""
-    # Try config first
     try:
-        from openjarvis.core.config import load_config  # local import to avoid early load
+        from openjarvis.core.config import load_config
         cfg = load_config()
         path = getattr(getattr(cfg, "agent", None), "system_prompt_path", None)
     except Exception:
@@ -107,12 +109,13 @@ def _load_persona() -> str:
         mtime = p.stat().st_mtime
     except OSError:
         mtime = 0.0
-    if mtime == _PERSONA_CACHE["mtime"]:
-        return str(_PERSONA_CACHE["text"])
-    text = p.read_text(encoding="utf-8").strip()
-    _PERSONA_CACHE["mtime"] = mtime
-    _PERSONA_CACHE["text"] = text
-    return text
+    with _PERSONA_LOCK:
+        if mtime == _PERSONA_CACHE["mtime"]:
+            return str(_PERSONA_CACHE["text"])
+        text = p.read_text(encoding="utf-8").strip()
+        _PERSONA_CACHE["mtime"] = mtime
+        _PERSONA_CACHE["text"] = text
+        return text
 
 
 @router.get("/persona")
@@ -121,21 +124,20 @@ def persona() -> dict:
     return {"system_prompt": text, "length": len(text)}
 
 
-# === Pre-warm ===
-# Kokoro has a cold-start cost (model load + first espeak-ng call).
-# Synthesize a trivial phrase at import time so the first real request
-# from the browser hits a warm pipeline (~2s saved on the first voice turn).
-def _prewarm() -> None:
-    import threading
+def prewarm_kokoro() -> None:
+    """Background prewarm of the Kokoro FR backend to hide cold-start cost.
+
+    Called from FastAPI startup hook (see openjarvis.server.app). Logged on
+    failure rather than swallowed silently.
+    """
     def _worker() -> None:
         try:
             if not TTSRegistry.contains("kokoro-fr"):
+                logger.info("prewarm skipped: kokoro-fr backend not registered")
                 return
             backend = TTSRegistry.get("kokoro-fr")()
             backend.synthesize("bonjour", voice_id="ff_siwis", speed=1.0)
-        except Exception:
-            pass
+            logger.info("kokoro-fr prewarm completed")
+        except Exception as exc:
+            logger.warning("kokoro-fr prewarm failed: %s", exc)
     threading.Thread(target=_worker, daemon=True, name="kokoro-prewarm").start()
-
-
-_prewarm()
