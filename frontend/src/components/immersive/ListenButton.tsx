@@ -30,11 +30,19 @@ export function ListenButton({ onTranscript, disabled }: ListenButtonProps) {
       const previous = latestTranscribePromise.current ?? Promise.resolve();
       const p = previous.then(async () => {
         setTranscribing(true);
+        // 30s ceiling: if Whisper hangs (backend stall, tunnel blip), abort
+        // so the chain does not grow without bound.
+        const ctrl = new AbortController();
+        const timeoutId = setTimeout(() => ctrl.abort(), 30000);
         try {
           const fd = new FormData();
           fd.append('file', blob, 'speech.wav');
           fd.append('language', 'fr');
-          const resp = await fetch('/v1/speech/transcribe', { method: 'POST', body: fd });
+          const resp = await fetch('/v1/speech/transcribe', {
+            method: 'POST',
+            body: fd,
+            signal: ctrl.signal,
+          });
           if (!resp.ok) throw new Error(`transcribe HTTP ${resp.status}`);
           const data = await resp.json();
           const text = String(data?.text ?? '').trim();
@@ -43,6 +51,7 @@ export function ListenButton({ onTranscript, disabled }: ListenButtonProps) {
           // eslint-disable-next-line no-console
           console.warn('VAD transcribe failed:', (e as Error).message);
         } finally {
+          clearTimeout(timeoutId);
           setTranscribing(false);
         }
       });

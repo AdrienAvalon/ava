@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import pathlib
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
@@ -173,10 +174,26 @@ def create_app(
     config:
         Optional JarvisConfig for other settings.
     """
+    # Optional Ava extension hook (prewarm Kokoro TTS at startup). Imported
+    # before FastAPI() so it can be wired into the lifespan context manager.
+    try:
+        from ava_extensions.server.tts_route import (
+            prewarm_kokoro as _ava_prewarm_kokoro,
+        )
+    except ImportError:
+        _ava_prewarm_kokoro = None  # type: ignore[assignment]
+
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI):
+        if _ava_prewarm_kokoro is not None:
+            _ava_prewarm_kokoro()
+        yield
+
     app = FastAPI(
         title="OpenJarvis API",
         description="OpenAI-compatible API server for OpenJarvis",
         version="0.1.0",
+        lifespan=_lifespan,
     )
 
     from fastapi.middleware.cors import CORSMiddleware
@@ -230,21 +247,13 @@ def create_app(
     app.include_router(create_digest_router())
     app.include_router(upload_router)
     # --- Ava extension routes (tts_route.router) ---
+    # Prewarm hook for Kokoro is wired earlier via the lifespan context manager
+    # passed to FastAPI() — see top of create_app().
     try:
-        from ava_extensions.server.tts_route import (
-            prewarm_kokoro as _ava_prewarm_kokoro,
-        )
         from ava_extensions.server.tts_route import router as _ava_tts_router
         app.include_router(_ava_tts_router)
-
-        @app.on_event("startup")
-        async def _ava_kokoro_startup() -> None:
-            _ava_prewarm_kokoro()
     except ImportError as _ava_exc:  # pragma: no cover - optional
-        import logging
-        logging.getLogger(__name__).warning(
-            'Ava TTS route not registered: %s', _ava_exc
-        )
+        logger.warning('Ava TTS route not registered: %s', _ava_exc)
     # --- end Ava extension ---
     include_all_routes(app)
 

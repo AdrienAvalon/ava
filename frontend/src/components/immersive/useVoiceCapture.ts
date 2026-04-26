@@ -89,7 +89,19 @@ export function useVoiceCapture() {
     fd.append('file', blob, `audio.${ext}`);
     fd.append('language', 'fr');
     debug('[AvaMic] POST /v1/speech/transcribe', blob.size, 'bytes');
-    const resp = await fetch('/v1/speech/transcribe', { method: 'POST', body: fd });
+    // 30s ceiling: avoid wedging the UI if Whisper or the relay hangs.
+    const ctrl = new AbortController();
+    const timeoutId = setTimeout(() => ctrl.abort(), 30000);
+    let resp: Response;
+    try {
+      resp = await fetch('/v1/speech/transcribe', {
+        method: 'POST',
+        body: fd,
+        signal: ctrl.signal,
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
     if (!resp.ok) {
       debugWarn('[AvaMic] transcribe HTTP', resp.status);
       throw new Error(`transcribe HTTP ${resp.status}`);
