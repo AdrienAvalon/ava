@@ -91,7 +91,7 @@ class OpenAIWhisperAvaBackend(SpeechBackend):
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "gpt-4o-mini-transcribe",
+        model: str = "whisper-1",
     ) -> None:
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         self._model = model
