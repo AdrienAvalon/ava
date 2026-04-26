@@ -10,7 +10,7 @@ from __future__ import annotations
 from ava_extensions.patches import anthropic_enhancements, system_prompt_loader  # noqa: F401
 
 # Backends TTS français
-from ava_extensions.backends import kokoro_fr_tts  # noqa: F401
+from ava_extensions.backends import kokoro_fr_tts, openai_whisper_ava_stt  # noqa: F401
 
 # Skills personnalisées Avalon
 from ava_extensions.skills import avalon_status  # noqa: F401
