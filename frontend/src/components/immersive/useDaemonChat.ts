@@ -11,8 +11,8 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const MODEL = 'claude-sonnet-4-6';
 const MAX_TOKENS = 800;
 
-const TTS_BACKEND = 'kokoro-fr';
-const TTS_VOICE = 'ff_siwis';
+const TTS_BACKEND = "openai_tts";
+const TTS_VOICE = "nova";
 const TTS_MIN_CHARS = 4; // don't synthesize dust
 
 /**
