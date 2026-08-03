@@ -136,7 +136,13 @@ export function MicButton({ onTranscript, disabled }: MicButtonProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state, disabled]);
 
-  const size = vp.isMobile ? 52 : 60;
+  // ⚠ 44px en mode conversation contre 52 : le micro devient une ICÔNE DE LA BARRE de
+  //   saisie, pas un bouton qui trône au centre de l'écran. Il cesse d'annoncer « le
+  //   vocal est le mode principal », ce qu'il faisait à tort.
+  //   ⚠ 44 et pas moins : c'est la cible tactile minimale recommandée (Apple HIG, 44pt).
+  //   Descendre à 40 « pour faire discret » rendrait le bouton pénible à atteindre au
+  //   pouce — la discrétion se joue sur la POSITION et le libellé, pas sur la taille.
+  const size = vp.chatFirst ? 44 : vp.isMobile ? 52 : 60;
   const denied = permission === 'denied';
   const color =
     denied ? '#ff6b8a' :
@@ -183,9 +189,12 @@ export function MicButton({ onTranscript, disabled }: MicButtonProps) {
     <div
       style={{
         position: 'fixed',
-        bottom: vp.isMobile ? 150 : 210,
-        left: '50%',
-        transform: 'translateX(calc(-50% - 55px))',
+        // ⚠ En mode conversation : ancré à DROITE de la barre de saisie (qui s'arrête à
+        //   `right: 64`), donc dans le prolongement du geste d'écriture. Ailleurs :
+        //   centré sous l'orbe, où le vocal EST le sujet.
+        ...(vp.chatFirst
+          ? { right: 10, bottom: 12 }
+          : { bottom: 210, left: '50%', transform: 'translateX(calc(-50% - 55px))' }),
         zIndex: 150,
         display: 'flex',
         flexDirection: 'column',
@@ -242,18 +251,31 @@ export function MicButton({ onTranscript, disabled }: MicButtonProps) {
           {errorMsg}
         </div>
       )}
-      <div
-        style={{
-          fontFamily: "'JetBrains Mono', 'Space Mono', monospace",
-          fontSize: 9,
-          letterSpacing: '0.28em',
-          color,
-          opacity: 0.9,
-          textTransform: 'uppercase',
-        }}
-      >
-        {label}
-      </div>
+      {/* ⚠ Le libellé disparaît en mode conversation TANT QUE RIEN NE SE PASSE. « PARLER »
+          écrit sous un bouton, dans une barre de saisie, est du bruit — l'icône du micro
+          se comprend seule. Mais dès que l'état devient actif (enregistrement,
+          transcription, micro refusé), le libellé revient : c'est précisément là qu'il
+          faut dire ce qu'il se passe, et un bouton qui change de couleur sans un mot
+          laisse dans le doute. */}
+      {(!vp.chatFirst || state === 'recording' || state === 'transcribing' || denied) && (
+        <div
+          style={{
+            fontFamily: "'JetBrains Mono', 'Space Mono', monospace",
+            fontSize: 9,
+            letterSpacing: '0.28em',
+            color,
+            opacity: 0.9,
+            textTransform: 'uppercase',
+            // En mode conversation le libellé se place AU-DESSUS du bouton : sous lui, il
+            // sortirait de l'écran (le bouton est déjà à 12px du bas).
+            ...(vp.chatFirst
+              ? { position: 'absolute' as const, bottom: size + 8, right: 0, whiteSpace: 'nowrap' as const }
+              : {}),
+          }}
+        >
+          {label}
+        </div>
+      )}
       <style>{`
         @keyframes avaMicPulse {
           0%, 100% { transform: scale(1); box-shadow: 0 0 24px ${color}aa; }

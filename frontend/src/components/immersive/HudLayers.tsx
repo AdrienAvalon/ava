@@ -25,33 +25,60 @@ export function HudLayers() {
 
   return (
     <>
-      {/* Top-left: identity */}
-      <div style={{ position: 'fixed', top: vp.isMobile ? 14 : 28, left: edge, zIndex: 100, pointerEvents: 'none', fontFamily: mono }}>
+      {/* ⚠ EN MODE CONVERSATION, IDENTITÉ ET STATUT SONT SUR LA MÊME LIGNE, À GAUCHE.
+          C'est la correction STRUCTURELLE d'un défaut qu'on a tenté deux fois de régler
+          en déplaçant des pixels : « ONLINE » était ancré en haut à DROITE, exactement là
+          où se trouvent les boutons CHAT et VOIX, et les deux se chevauchaient jusqu'à
+          devenir illisibles. Déplacer les boutons vers le bas ne faisait que décaler la
+          collision d'un cran (constaté sur photo).
+          Ici la droite est RÉSERVÉE aux boutons, la gauche à l'identité — plus aucune
+          géométrie ne peut les faire se rencontrer. « COGNITIVE INTERFACE » et l'horloge
+          sont retirés du téléphone : sur 390 px de large, ce sont des décorations qui
+          coûtent la place dont les commandes ont besoin. */}
+      {vp.chatFirst ? (
         <div style={{
-          fontSize: brandSize, fontWeight: 700, letterSpacing: '0.3em',
-          color: '#51a4de', textShadow: '0 0 16px rgba(81,164,222,0.6)',
-        }}>AVA</div>
-        <div style={{ fontSize: sub, letterSpacing: '0.35em', color: '#5a7a95', marginTop: 4 }}>COGNITIVE INTERFACE</div>
-        {!vp.isMobile && (
-          <div style={{ fontSize: 9, letterSpacing: '0.3em', color: '#2a5a7a', marginTop: 12, opacity: 0.7 }}>
-            v2.0 // NEURAL-SYNC 0x7A3F
+          position: 'fixed', top: 12, left: edge, zIndex: 100, pointerEvents: 'none',
+          fontFamily: mono, display: 'flex', alignItems: 'baseline', gap: 10,
+        }}>
+          <span style={{
+            fontSize: 15, fontWeight: 700, letterSpacing: '0.3em',
+            color: '#51a4de', textShadow: '0 0 16px rgba(81,164,222,0.6)',
+          }}>AVA</span>
+          <span style={{
+            fontSize: 9, fontWeight: 700, letterSpacing: '0.25em', color: '#3a8fc8',
+          }}>{statusText}</span>
+        </div>
+      ) : (
+        <>
+          {/* Top-left: identity */}
+          <div style={{ position: 'fixed', top: 28, left: edge, zIndex: 100, pointerEvents: 'none', fontFamily: mono }}>
+            <div style={{
+              fontSize: brandSize, fontWeight: 700, letterSpacing: '0.3em',
+              color: '#51a4de', textShadow: '0 0 16px rgba(81,164,222,0.6)',
+            }}>AVA</div>
+            <div style={{ fontSize: sub, letterSpacing: '0.35em', color: '#5a7a95', marginTop: 4 }}>COGNITIVE INTERFACE</div>
+            {!vp.isMobile && (
+              <div style={{ fontSize: 9, letterSpacing: '0.3em', color: '#2a5a7a', marginTop: 12, opacity: 0.7 }}>
+                v2.0 // NEURAL-SYNC 0x7A3F
+              </div>
+            )}
           </div>
-        )}
-      </div>
 
-      {/* Top-right: status + session + clock */}
-      <div style={{ position: 'fixed', top: vp.isMobile ? 14 : 28, right: edge, zIndex: 100, pointerEvents: 'none', textAlign: 'right', fontFamily: mono }}>
-        <div style={{
-          fontSize: statusSize, fontWeight: 700, letterSpacing: '0.25em',
-          color: '#51a4de', textShadow: '0 0 12px rgba(81,164,222,0.5)',
-        }}>{statusText}</div>
-        {!vp.isMobile && (
-          <>
-            <div style={{ fontSize: 10, letterSpacing: '0.2em', color: '#5a7a95', marginTop: 4 }}>SESSION 2E57F8D3</div>
-            <div style={{ fontSize: 10, letterSpacing: '0.2em', color: '#5a7a95', marginTop: 2 }}>{clock} UTC</div>
-          </>
-        )}
-      </div>
+          {/* Top-right: status + session + clock */}
+          <div style={{ position: 'fixed', top: 28, right: edge, zIndex: 100, pointerEvents: 'none', textAlign: 'right', fontFamily: mono }}>
+            <div style={{
+              fontSize: statusSize, fontWeight: 700, letterSpacing: '0.25em',
+              color: '#51a4de', textShadow: '0 0 12px rgba(81,164,222,0.5)',
+            }}>{statusText}</div>
+            {!vp.isMobile && (
+              <>
+                <div style={{ fontSize: 10, letterSpacing: '0.2em', color: '#5a7a95', marginTop: 4 }}>SESSION 2E57F8D3</div>
+                <div style={{ fontSize: 10, letterSpacing: '0.2em', color: '#5a7a95', marginTop: 2 }}>{clock} UTC</div>
+              </>
+            )}
+          </div>
+        </>
+      )}
 
       {/* Bottom-left: stack tech (hidden on mobile, narrow) */}
       {!vp.isMobile && (

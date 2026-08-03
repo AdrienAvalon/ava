@@ -75,7 +75,13 @@ export function ImmersivePage() {
       <StateRings />
       <HudLayers />
       {!vp.hideCognitive && <CognitivePanel />}
-      <ConversationCinetic />
+      {/* ⚠ PAS LES DEUX EN MODE CONVERSATION. `ConversationCinetic` affiche le dernier
+          échange en très grand au centre de l'écran ; le terminal affiche le même
+          échange, en bas de sa liste. Sur un téléphone où le terminal occupe désormais
+          toute la hauteur utile, les deux se superposent et disent la même chose deux
+          fois — le texte géant passant PAR-DESSUS l'historique. Sur grand écran ils
+          cohabitent sans se gêner, et le focal garde tout son sens. */}
+      {!vp.chatFirst && <ConversationCinetic />}
       <TranscriptTerminal />
       <Waveform />
 
@@ -89,11 +95,13 @@ export function ImmersivePage() {
         title="Retour au chat classique (Esc)"
         style={{
           position: 'fixed',
-          // ⚠ 52px sur mobile : SOUS le statut « ONLINE » du HUD (top 14, ~24px de haut).
-          //   À 16px, les deux se superposaient et devenaient illisibles.
-          top: vp.smallHud ? 52 : 100,
-          left: vp.smallHud ? 'auto' : 32,
-          right: vp.smallHud ? 96 : 'auto',
+          // ⚠ La droite du bandeau est désormais RÉSERVÉE aux boutons : `HudLayers` place
+          //   identité et statut à GAUCHE en mode conversation. C'est ce qui rend la
+          //   superposition impossible — deux tentatives précédentes ont échoué en
+          //   déplaçant ce bouton de quelques pixels sans toucher à ce qu'il heurtait.
+          top: vp.chatFirst ? 8 : vp.smallHud ? 52 : 100,
+          left: vp.chatFirst || vp.smallHud ? 'auto' : 32,
+          right: vp.chatFirst ? 88 : vp.smallHud ? 96 : 'auto',
           zIndex: 210,
           background: 'rgba(81,164,222,0.08)',
           border: '1px solid rgba(81,164,222,0.3)',
@@ -125,9 +133,10 @@ export function ImmersivePage() {
         title={muted ? 'Activer la voix d\'Ava' : 'Couper la voix d\'Ava'}
         style={{
           position: 'fixed',
-          // Même rangée que CHAT sur mobile (côte à côte, pas empilés).
-          top: vp.smallHud ? 52 : 100,
-          right: vp.smallHud ? 16 : 32,
+          // Même rangée que CHAT (côte à côte, pas empilés — empilés, ils mangeraient la
+          // hauteur que la conversation vient de récupérer).
+          top: vp.chatFirst ? 8 : vp.smallHud ? 52 : 100,
+          right: vp.chatFirst ? 10 : vp.smallHud ? 16 : 32,
           zIndex: 210,
           background: muted ? 'rgba(232,106,137,0.12)' : 'rgba(81,164,222,0.08)',
           border: `1px solid ${muted ? 'rgba(232,106,137,0.4)' : 'rgba(81,164,222,0.3)'}`,

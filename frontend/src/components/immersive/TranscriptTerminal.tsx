@@ -27,8 +27,15 @@ export function TranscriptTerminal() {
   const clear = useImmersiveStore((s) => s.clearTranscript);
   const vp = useViewportScale();
 
-  // Fermé par défaut sur mobile : l'écran y est déjà occupé par l'orbe et l'input.
-  const [ouvert, setOuvert] = useState(() => !vp.isMobile);
+  // ⚠ OUVERT PAR DÉFAUT PARTOUT, Y COMPRIS SUR TÉLÉPHONE — l'inverse de ce que faisait
+  //   la première version, et c'est le cœur du retour de l'admin (2026-08-03) : « on ne
+  //   voit pas le terminal de chat ». Il était replié derrière un bouton « ⌗ HISTORIQUE »
+  //   posé dans un coin, par-dessus le champ de saisie : la conversation existait mais
+  //   ne se voyait pas, donc pour l'utilisateur elle n'existait pas.
+  //   Le raisonnement d'origine — « l'écran y est déjà occupé par l'orbe et l'input » —
+  //   partait du principe que l'orbe devait garder sa place. C'est ce principe qui était
+  //   faux : sur un téléphone, c'est la conversation qui doit l'avoir.
+  const [ouvert, setOuvert] = useState(true);
   const [colleEnBas, setColleEnBas] = useState(true);
   const zone = useRef<HTMLDivElement>(null);
 
@@ -50,15 +57,13 @@ export function TranscriptTerminal() {
     setColleEnBas(el.scrollHeight - el.scrollTop - el.clientHeight < 24);
   }
 
-  const largeur = vp.isMobile ? '92vw' : 'min(560px, 34vw)';
-
   if (!ouvert) {
     return (
       <button
         onClick={() => setOuvert(true)}
         title="Afficher l'historique de la conversation"
         style={{
-          position: 'fixed', right: 16, bottom: vp.isMobile ? 88 : 24, zIndex: 220,
+          position: 'fixed', right: 16, bottom: vp.chatFirst ? vp.bottomBar + 12 : 24, zIndex: 220,
           background: 'rgba(81,164,222,0.08)', border: '1px solid rgba(81,164,222,0.3)',
           color: '#51a4de', fontFamily: 'inherit', fontSize: 10,
           letterSpacing: '0.25em', padding: '6px 12px', cursor: 'pointer',
@@ -70,18 +75,36 @@ export function TranscriptTerminal() {
     );
   }
 
+  // ⚠ DEUX GÉOMÉTRIES, PAS DEUX COMPOSANTS. Sur téléphone le terminal occupe toute la
+  //   bande utile entre le bandeau et la saisie — c'est le contenu de la page. Sur grand
+  //   écran il reste une carte flottante à droite, parce que le sujet y est l'orbe et
+  //   que la conversation s'y consulte du coin de l'œil.
+  const cadre: React.CSSProperties = vp.chatFirst
+    ? {
+        left: 8, right: 8,
+        top: vp.topBar + 4,
+        bottom: vp.bottomBar + 8,
+        // ⚠ Pas de `maxHeight` ici : `top` ET `bottom` fixent la hauteur. En ajouter une
+        //   3ᵉ contrainte ferait décoller le bas du cadre de la barre de saisie sur les
+        //   écrans hauts, et rouvrirait le trou visuel qu'on vient de fermer.
+      }
+    : {
+        right: 24, bottom: 24,
+        width: 'min(560px, 34vw)',
+        maxHeight: '62vh',
+      };
+
   return (
     <div
       style={{
         position: 'fixed',
-        right: vp.isMobile ? '4vw' : 24,
-        bottom: vp.isMobile ? 80 : 24,
-        width: largeur,
-        maxHeight: vp.isMobile ? '46vh' : '62vh',
+        ...cadre,
         zIndex: 220,
         display: 'flex',
         flexDirection: 'column',
-        background: 'rgba(0,0,0,0.72)',
+        // Fond plus opaque en mode conversation : le texte passe devant l'orbe, et une
+        // transparence à 0,72 laissait les particules brouiller la lecture.
+        background: vp.chatFirst ? 'rgba(0,0,0,0.88)' : 'rgba(0,0,0,0.72)',
         border: '1px solid rgba(81,164,222,0.22)',
         backdropFilter: 'blur(2px)',
         fontFamily: "'JetBrains Mono', 'Space Mono', 'Courier New', monospace",
@@ -109,6 +132,9 @@ export function TranscriptTerminal() {
               vider
             </button>
           )}
+          {/* ⚠ Repliable AUSSI en mode conversation : c'est le seul moyen de voir l'orbe
+              en entier sur un téléphone. Le masquer priverait d'un geste sans rien
+              simplifier. */}
           <button onClick={() => setOuvert(false)} title="Replier" style={btnDiscret}>
             ✕
           </button>
@@ -120,8 +146,13 @@ export function TranscriptTerminal() {
         ref={zone}
         onScroll={onScroll}
         style={{
+          // ⚠ `flex: 1` + `minHeight: 0` : sans le second, un enfant flex refuse de
+          //   rétrécir sous la taille de son contenu et la zone déborde du cadre au lieu
+          //   de défiler — le défaut classique du flex, et il ne se voit qu'une fois la
+          //   conversation assez longue, donc jamais pendant les essais.
+          flex: 1, minHeight: 0,
           overflowY: 'auto', padding: '10px 12px', display: 'flex',
-          flexDirection: 'column', gap: 10, fontSize: vp.isMobile ? 11 : 12,
+          flexDirection: 'column', gap: 10, fontSize: vp.isMobile ? 12 : 12,
           lineHeight: 1.55,
         }}
       >

@@ -65,7 +65,10 @@ export function ListenButton({ onTranscript, disabled }: ListenButtonProps) {
     else vad.start();
   }
 
-  const size = vp.isMobile ? 44 : 50;
+  // 40px en mode conversation : plus petit que le micro (44) parce que l'écoute continue
+  // est le geste le plus rare des trois — on écrit, parfois on dicte, très rarement on
+  // laisse le micro ouvert. La taille dit le rang.
+  const size = vp.chatFirst ? 40 : vp.isMobile ? 44 : 50;
 
   // Color: accent rose when hearing you speak, violet during transcribe, cyan otherwise
   const color =
@@ -86,9 +89,11 @@ export function ListenButton({ onTranscript, disabled }: ListenButtonProps) {
     <div
       style={{
         position: 'fixed',
-        bottom: vp.isMobile ? 152 : 212,
-        left: '50%',
-        transform: 'translateX(calc(-50% + 55px))',
+        // En mode conversation : dans la barre du bas, à gauche du micro (qui est à
+        // right:10, largeur 44 → cette icône commence à 60).
+        ...(vp.chatFirst
+          ? { right: 60, bottom: 14 }
+          : { bottom: 212, left: '50%', transform: 'translateX(calc(-50% + 55px))' }),
         zIndex: 150,
         display: 'flex',
         flexDirection: 'column',
@@ -124,19 +129,28 @@ export function ListenButton({ onTranscript, disabled }: ListenButtonProps) {
           ? <Ear size={18} />
           : <EarOff size={18} />}
       </button>
-      <div
-        style={{
-          fontFamily: "'JetBrains Mono', monospace",
-          fontSize: 8,
-          letterSpacing: '0.25em',
-          color,
-          opacity: 0.75,
-          textTransform: 'uppercase',
-          whiteSpace: 'nowrap',
-        }}
-      >
-        {label}
-      </div>
+      {/* ⚠ « ÉCOUTE CONTINUE OFF » écrit en toutes lettres dans la barre du bas était le
+          texte le plus visible de l'écran de téléphone — pour annoncer une fonction
+          DÉSACTIVÉE, la plus secondaire des trois. On ne l'affiche donc qu'une fois
+          l'écoute ACTIVE, où il porte une vraie information : le micro est ouvert. */}
+      {(!vp.chatFirst || vad.active || transcribing) && (
+        <div
+          style={{
+            fontFamily: "'JetBrains Mono', monospace",
+            fontSize: 8,
+            letterSpacing: '0.25em',
+            color,
+            opacity: 0.75,
+            textTransform: 'uppercase',
+            whiteSpace: 'nowrap',
+            ...(vp.chatFirst
+              ? { position: 'absolute' as const, bottom: size + 8, right: 0 }
+              : {}),
+          }}
+        >
+          {label}
+        </div>
+      )}
       <style>{`
         @keyframes avaListenPulse {
           0%, 100% { transform: scale(1); }

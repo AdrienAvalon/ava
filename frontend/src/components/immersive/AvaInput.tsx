@@ -33,14 +33,21 @@ export function AvaInput({ onAsk, disabled }: AvaInputProps) {
 
   const fontSize = vp.isMobile ? 12 : 14;
 
+  // ⚠ EN MODE CONVERSATION, LA SAISIE EST ANCRÉE EN BAS ET LAISSE LA PLACE DU MICRO.
+  //   Elle était centrée, à 92px du bas, au-dessus des deux gros boutons vocaux — donc
+  //   perçue comme l'option secondaire alors que c'est le mode d'usage principal.
+  //   `right: 112` réserve la colonne des DEUX icônes vocales (écoute continue + micro),
+  //   qui deviennent des boutons de la barre plutôt que des cibles de 52px trônant au
+  //   centre. ⚠ Rien n'est retiré du mobile : le vocal change de rang, pas de statut.
+  const cadre: React.CSSProperties = vp.chatFirst
+    ? { left: 12, right: 112, bottom: 14 }
+    : { bottom: 150, left: '50%', transform: 'translateX(-50%)', width: 'min(720px, 86vw)' };
+
   return (
     <div
       style={{
         position: 'fixed',
-        bottom: vp.isMobile ? 92 : 150,
-        left: '50%',
-        transform: 'translateX(-50%)',
-        width: 'min(720px, 86vw)',
+        ...cadre,
         zIndex: 150,
         pointerEvents: 'auto',
       }}
