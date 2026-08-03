@@ -89,9 +89,11 @@ export function ImmersivePage() {
         title="Retour au chat classique (Esc)"
         style={{
           position: 'fixed',
-          top: vp.smallHud ? 16 : 100,
+          // ⚠ 52px sur mobile : SOUS le statut « ONLINE » du HUD (top 14, ~24px de haut).
+          //   À 16px, les deux se superposaient et devenaient illisibles.
+          top: vp.smallHud ? 52 : 100,
           left: vp.smallHud ? 'auto' : 32,
-          right: vp.smallHud ? 16 : 'auto',
+          right: vp.smallHud ? 96 : 'auto',
           zIndex: 210,
           background: 'rgba(81,164,222,0.08)',
           border: '1px solid rgba(81,164,222,0.3)',
@@ -123,8 +125,9 @@ export function ImmersivePage() {
         title={muted ? 'Activer la voix d\'Ava' : 'Couper la voix d\'Ava'}
         style={{
           position: 'fixed',
-          top: vp.smallHud ? 56 : 100,
-          right: 32,
+          // Même rangée que CHAT sur mobile (côte à côte, pas empilés).
+          top: vp.smallHud ? 52 : 100,
+          right: vp.smallHud ? 16 : 32,
           zIndex: 210,
           background: muted ? 'rgba(232,106,137,0.12)' : 'rgba(81,164,222,0.08)',
           border: `1px solid ${muted ? 'rgba(232,106,137,0.4)' : 'rgba(81,164,222,0.3)'}`,

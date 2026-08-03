@@ -75,6 +75,14 @@ async function synthesize(text: string, signal: AbortSignal): Promise<AudioBuffe
     }),
   });
   if (!resp.ok) throw new Error(`TTS HTTP ${resp.status}`);
+  // ⚠ ON LIT CE QUE LE SERVEUR A RÉELLEMENT EMPLOYÉ, pas ce qu'on a demandé. Le client
+  //   envoie `backend` dans sa requête ; s'y fier reviendrait à afficher notre propre
+  //   intention. L'en-tête de réponse `X-Ava-TTS-Backend` est le seul contrôle qui fait
+  //   foi — c'est d'ailleurs ce qu'un audit a recommandé après avoir trouvé le HUD
+  //   affichant « kokoro » pendant que le client demandait OpenAI.
+  useImmersiveStore.getState().setRuntime({
+    tts: resp.headers.get('X-Ava-TTS-Backend') || TTS_BACKEND,
+  });
   const buf = await resp.arrayBuffer();
   const ctx = getAudioCtx();
   if (ctx.state === 'suspended') {
@@ -195,6 +203,10 @@ export function useDaemonChat() {
     //   `streamAva` nourrissent le terminal consultable. Les deux répondent à des
     //   besoins différents — la présence, et la mémoire.
     s.pushLine('user', userText);
+    // Le modèle et le moteur sont ceux que le client demande : le daemon ne les renvoie
+    // pas. C'est donc une intention, pas une observation — mais elle est au moins tirée
+    // d'une constante unique au lieu d'être recopiée dans le HUD.
+    s.setRuntime({ model: MODEL, engine: 'anthropic/cloud' });
     s.setState('listening');
     await sleep(250);
 

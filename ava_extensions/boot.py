@@ -14,3 +14,9 @@ from ava_extensions.backends import kokoro_fr_tts, openai_whisper_ava_stt  # noq
 
 # Skills personnalisées Avalon
 from ava_extensions.skills import avalon_status  # noqa: F401
+
+# ⚠ TOUT NOUVEL OUTIL DOIT ÊTRE IMPORTÉ ICI, sans quoi il n'existe pas. Le décorateur
+#   `@ToolRegistry.register` ne s'exécute qu'au chargement du module : un fichier déposé
+#   dans `skills/` mais jamais importé est du code mort que rien ne signale — le registre
+#   ne s'en plaint pas, l'outil est simplement absent de la liste proposée au modèle.
+from ava_extensions.skills import home_assistant  # noqa: F401

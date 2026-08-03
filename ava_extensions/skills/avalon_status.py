@@ -15,14 +15,45 @@ from openjarvis.core.registry import ToolRegistry
 from openjarvis.core.types import ToolResult
 from openjarvis.tools._stubs import BaseTool, ToolSpec
 
-CP_V2_URL = "http://192.168.100.31:8100/api/v1/dashboard"
+# ⚠ DEUX ENDPOINTS, ET C'EST STRUCTUREL. `/dashboard` porte le score et l'état des
+#   modules ; il ne porte NI les alertes NI les hôtes. La version précédente lisait
+#   `data.get("alerts")` et `data.get("hosts")` sur cette réponse : les deux clés
+#   n'existent pas, `.get()` rendait `None`, et l'outil annonçait « Alertes actives: 0 »
+#   et « Hosts: 0 » avec assurance — pendant qu'une alerte Grafana tirait réellement.
+#   C'est le piège central de cette infrastructure : une source qui ne porte pas la
+#   donnée répond « rien » SANS ERREUR. Un zéro faux est pire qu'une absence : Ava
+#   répondait « non, aucune alerte » à une question dont elle n'avait pas la réponse.
+#   Vérifié le 2026-08-03 — clés réelles de /dashboard : module_data, module_health,
+#   networks, score, version, widgets.
+CP_V2_BASE = "http://192.168.100.31:8100/api/v1"
 _TIMEOUT_S = 8.0
 
 
-def _fetch() -> dict[str, Any]:
-    req = urllib.request.Request(CP_V2_URL, headers={"Accept": "application/json"})
+def _get(chemin: str) -> Any:
+    req = urllib.request.Request(
+        f"{CP_V2_BASE}{chemin}", headers={"Accept": "application/json"}
+    )
     with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def _fetch() -> dict[str, Any]:
+    """Le tableau de bord seul — score et modules."""
+    return _get("/dashboard")
+
+
+def _fetch_hosts() -> list[dict[str, Any]]:
+    """Les hôtes, depuis leur PROPRE endpoint.
+
+    ⚠ Ne jamais faire échouer l'outil entier si cet appel échoue : le score reste utile
+    même sans le détail des hôtes. Une panne partielle ne doit pas produire un silence
+    total — sinon Ava dit « je ne peux pas savoir » alors qu'elle sait l'essentiel.
+    """
+    try:
+        d = _get("/hosts")
+    except Exception:
+        return []
+    return d if isinstance(d, list) else (d.get("hosts") or [])
 
 
 def _format_summary(data: dict[str, Any]) -> str:
@@ -57,14 +88,34 @@ def _format_summary(data: dict[str, Any]) -> str:
     else:
         lines.append("Tous les modules sont OK.")
 
-    # Stats utiles
-    alerts = data.get("alerts") or []
-    if isinstance(alerts, list):
-        lines.append(f"Alertes actives: {len(alerts)}")
-    hosts = data.get("hosts") or []
-    if isinstance(hosts, list):
-        down = [h for h in hosts if isinstance(h, dict) and h.get("status") not in ("up", "ok", None)]
-        lines.append(f"Hosts: {len(hosts)} ({len(down)} down/maintenance)")
+    # ⚠ Les « alertes » du control plane SONT les déductions des modules : il n'existe
+    #   pas de liste d'alertes séparée. Les compter à partir des déductions dit la vérité ;
+    #   lire une clé `alerts` inexistante disait « 0 » quoi qu'il arrive.
+    nb_deductions = sum(
+        len(info.get("deductions") or [])
+        for info in modules.values()
+        if isinstance(info, dict)
+    )
+    lines.append(f"Déductions actives: {nb_deductions}")
+
+    # Les hôtes viennent de leur propre endpoint (cf. commentaire en tête de fichier).
+    hosts = _fetch_hosts()
+    if hosts:
+        inactifs = [
+            h for h in hosts
+            if isinstance(h, dict) and (h.get("active") is False or h.get("maintenance"))
+        ]
+        detail = ""
+        if inactifs:
+            noms = ", ".join(
+                str(h.get("display_name") or h.get("id")) for h in inactifs[:4]
+            )
+            detail = f" — hors service ou en maintenance : {noms}"
+        lines.append(f"Hôtes: {len(hosts)} déclarés, {len(inactifs)} inactifs{detail}")
+    else:
+        # ⚠ On dit qu'on ne sait pas, plutôt que d'écrire « 0 hôte » — c'est exactement
+        #   l'erreur qu'on corrige ici.
+        lines.append("Hôtes: information indisponible (endpoint /hosts injoignable)")
 
     return "\n".join(lines)
 

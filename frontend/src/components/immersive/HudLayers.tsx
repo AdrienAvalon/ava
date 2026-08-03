@@ -17,6 +17,7 @@ export function HudLayers() {
   }, []);
 
   const statusText = state === 'idle' ? 'ONLINE' : state.toUpperCase();
+  const runtime = useImmersiveStore((s) => s.runtime);
   const brandSize = vp.smallHud ? 16 : 22;
   const sub = vp.smallHud ? 8 : 10;
   const statusSize = vp.smallHud ? 13 : 18;
@@ -59,10 +60,19 @@ export function HudLayers() {
           display: 'grid', gridTemplateColumns: 'auto auto', gap: '2px 18px',
           fontSize: 10, letterSpacing: '0.18em',
         }}>
-          <div style={{ color: '#5a7a95' }}>MODEL</div>   <div style={{ color: '#7fb9e8', textAlign: 'right' }}>claude-sonnet-4-6</div>
-          <div style={{ color: '#5a7a95' }}>ENGINE</div>  <div style={{ color: '#7fb9e8', textAlign: 'right' }}>anthropic/cloud</div>
-          <div style={{ color: '#5a7a95' }}>TTS</div>     <div style={{ color: '#7fb9e8', textAlign: 'right' }}>kokoro-ff_siwis</div>
-          <div style={{ color: '#5a7a95' }}>STT</div>     <div style={{ color: '#7fb9e8', textAlign: 'right' }}>whisper-large-v3</div>
+          {/* ⚠ CES VALEURS ÉTAIENT ÉCRITES EN DUR — ET DEUX SUR QUATRE ÉTAIENT FAUSSES.
+              Le HUD affichait « kokoro-ff_siwis » alors que le client demande OpenAI nova
+              (`useDaemonChat.ts`), et « whisper-large-v3 » alors que le backend STT
+              serveur est hors service. Un tableau de bord qui affirme une configuration
+              qu'il ne lit pas est pire qu'un tableau vide : on croit savoir.
+              Les valeurs viennent maintenant du store, alimenté par les réponses réelles
+              du daemon (en-tête `X-Ava-TTS-Backend`), et affichent « — » tant qu'aucun
+              échange n'a eu lieu — ce qui est honnête : avant le premier appel, on ne
+              SAIT pas ce que le serveur utilisera. */}
+          <div style={{ color: '#5a7a95' }}>MODEL</div>   <div style={{ color: '#7fb9e8', textAlign: 'right' }}>{runtime.model ?? '—'}</div>
+          <div style={{ color: '#5a7a95' }}>ENGINE</div>  <div style={{ color: '#7fb9e8', textAlign: 'right' }}>{runtime.engine ?? '—'}</div>
+          <div style={{ color: '#5a7a95' }}>TTS</div>     <div style={{ color: '#7fb9e8', textAlign: 'right' }}>{runtime.tts ?? '—'}</div>
+          <div style={{ color: '#5a7a95' }}>STT</div>     <div style={{ color: '#7fb9e8', textAlign: 'right' }}>{runtime.stt ?? '—'}</div>
         </div>
       )}
 

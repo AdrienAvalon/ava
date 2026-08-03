@@ -34,8 +34,26 @@ export interface TurnLine {
   streaming?: boolean;
 }
 
+/** Ce que le SERVEUR utilise réellement — jamais ce qu'on croit qu'il utilise.
+ *
+ * ⚠ Ces quatre valeurs étaient écrites EN DUR dans le HUD, et deux étaient fausses :
+ *   « kokoro-ff_siwis » alors que le client demande OpenAI, « whisper-large-v3 » alors
+ *   que le backend STT serveur est hors service. Un tableau de bord qui affirme une
+ *   configuration qu'il ne lit pas est pire qu'un tableau vide : il fait croire qu'on sait.
+ *   `null` signifie « pas encore observé » et s'affiche « — ». C'est honnête : avant le
+ *   premier échange, on ignore ce que le serveur emploiera.
+ */
+export interface RuntimeInfo {
+  model: string | null;
+  engine: string | null;
+  tts: string | null;
+  stt: string | null;
+}
+
 interface ImmersiveStore {
   state: ImmersiveState;
+  runtime: RuntimeInfo;
+  setRuntime: (r: Partial<RuntimeInfo>) => void;
   userMsg: string;
   avaMsg: string;
   /** Historique complet de la session, du plus ancien au plus récent. */
@@ -83,11 +101,13 @@ export const useImmersiveStore = create<ImmersiveStore>((set) => ({
   state: 'idle',
   userMsg: '',
   avaMsg: '',
+  runtime: { model: null, engine: null, tts: null, stt: null },
   transcript: [],
   cognitive: { ...emptyCognitive },
   rippleKey: 0,
 
   setState: (s) => set((prev) => ({ state: s, rippleKey: prev.rippleKey + 1 })),
+  setRuntime: (r) => set((prev) => ({ runtime: { ...prev.runtime, ...r } })),
   setUserMsg: (userMsg) => set({ userMsg }),
   setAvaMsg: (avaMsg) => set({ avaMsg }),
 
