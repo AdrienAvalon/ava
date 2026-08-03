@@ -5,6 +5,7 @@ import { useState } from 'react';
 import { useImmersiveStore } from './immersiveStore';
 import { OrbAura } from './OrbAura';
 import { ConversationCinetic } from './ConversationCinetic';
+import { TranscriptTerminal } from './TranscriptTerminal';
 import { CognitivePanel } from './CognitivePanel';
 import { Waveform } from './Waveform';
 import { HudLayers } from './HudLayers';
@@ -75,6 +76,7 @@ export function ImmersivePage() {
       <HudLayers />
       {!vp.hideCognitive && <CognitivePanel />}
       <ConversationCinetic />
+      <TranscriptTerminal />
       <Waveform />
 
       <AvaInput onAsk={handleAsk} />

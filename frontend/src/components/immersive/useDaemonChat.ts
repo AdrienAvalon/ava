@@ -190,6 +190,11 @@ export function useDaemonChat() {
     const s = useImmersiveStore.getState();
     s.setUserMsg(userText);
     s.setAvaMsg('');
+    // ⚠ L'historique est alimenté EN PLUS de la vue centrale, jamais à sa place :
+    //   `setUserMsg`/`setAvaMsg` pilotent le focal 34px de la spec v2, `pushLine` et
+    //   `streamAva` nourrissent le terminal consultable. Les deux répondent à des
+    //   besoins différents — la présence, et la mémoire.
+    s.pushLine('user', userText);
     s.setState('listening');
     await sleep(250);
 
@@ -297,6 +302,7 @@ export function useDaemonChat() {
               }
               assembled += delta;
               s.setAvaMsg(assembled);
+              s.streamAva(assembled);
 
               // Extract newly-finished sentences and dispatch them to TTS.
               const { sentences, newEnd } = extractNewSentences(assembled, lastSentenceEnd);
@@ -323,10 +329,12 @@ export function useDaemonChat() {
 
       if (assembled) {
         history.current.push({ role: 'assistant', content: assembled });
+        s.endAvaStream();
       } else if (firstToken) {
         s.setState('speaking');
         s.setUserMsg('');
         s.setAvaMsg('(réponse vide)');
+        s.pushLine('system', '(réponse vide)');
       }
     } catch (e: unknown) {
       const name = (e as Error)?.name;
@@ -335,6 +343,11 @@ export function useDaemonChat() {
         s.setState('speaking');
         s.setUserMsg('');
         s.setAvaMsg(`Erreur daemon : ${msg}`);
+        // ⚠ Une erreur DOIT figurer dans l'historique. Sans ça, le terminal montre une
+        //   question restée sans réponse et on cherche un défaut d'affichage — alors
+        //   que le serveur a répondu, par un échec. C'est exactement ce qui s'est passé
+        //   pendant trois mois avec le crédit API épuisé.
+        s.pushLine('system', `Erreur daemon : ${msg}`);
       }
     }
 
