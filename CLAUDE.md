@@ -141,25 +141,98 @@ Daemon HTTP sur `localhost:8000` par défaut. Tauri UI communique via IPC + WebS
 > pour le voir :
 > `cd /home/avalon/ava && ~/.local/bin/uv run jarvis serve --host 127.0.0.1 --port 8001`
 > C'est le premier geste à faire face à un crash-loop de ce service, avant toute hypothèse.
-> **Extras requis en production** : `--extra server --extra speech --extra dashboard`
-> (les nommer TOUS à chaque `uv sync`, y compris quand on ne veut qu'ajouter `dev`).
+> **Extras requis en production — LA LISTE COMPLÈTE, à nommer TOUS à chaque `uv sync`** :
+> ```
+> uv sync --extra server --extra speech --extra dashboard \
+>         --extra inference-cloud --extra framework-comparison --extra dev
+> ```
+> ⚠️ **`inference-cloud` porte `anthropic` ET `openai` — l'omettre COUPE LA PAROLE À AVA,
+> en silence.** Vécu le 2026-08-03 : le service refusait de démarrer sur « No inference
+> engine available » alors que `ANTHROPIC_API_KEY` était bien présente. La cause est dans
+> `engine/cloud.py` :
+> ```python
+> if os.environ.get("ANTHROPIC_API_KEY"):
+>     try:
+>         import anthropic
+>         self._anthropic_client = anthropic.Anthropic()
+>     except ImportError:
+>         pass          # ← avale l'erreur
+> ```
+> Clé présente + SDK absent → aucun client Claude → aucun moteur ne sert
+> `claude-sonnet-4-6` → `get_engine()` rend `None` → `sys.exit(1)`. **Rien dans le message
+> ne mentionne un paquet manquant** : on soupçonne la clé, la config, le merge — jamais un
+> `except ImportError: pass` trois couches plus bas.
+> ⚠️ **`framework-comparison` (polars) n'est pas optionnel non plus** : sans lui, la
+> COLLECTE pytest s'interrompt (`Interrupted: 1 error during collection`) et la suite
+> affiche **0 échec** — un zéro qui veut dire « rien n'a été mesuré », pas « tout va bien ».
+>
+> **Diagnostic réutilisable, 2 lignes au lieu d'une heure :**
+> ```bash
+> ./.venv/bin/python -c "from openjarvis.core.config import load_config; \
+>   from openjarvis.engine import get_engine; c=load_config(); \
+>   print(get_engine(c,None), get_engine(c,None,model='claude-sonnet-4-6'))"
+> ```
+> Un moteur rendu SANS modèle mais `None` AVEC : le moteur existe, il ne sait pas servir
+> ce modèle-là. C'est un **SDK ou une clé** qui manque, jamais le moteur.
+>
+> ⚠️ **Le merge amont du 2026-08-03 a rendu ce défaut FATAL sans l'avoir créé** : la
+> nouvelle version écarte un moteur incapable de servir le modèle demandé (« skipped
+> rather than chosen and failing per-request later »), l'ancienne le choisissait quand
+> même et échouait à chaque requête. Le durcissement est bon — mieux vaut refuser de
+> démarrer que répondre par une erreur à l'usage — mais il transforme une configuration
+> incomplète en panne au démarrage.
 > ⚠️ `uv` n'est pas dans le PATH d'un shell **non interactif** : en SSH scripté, utiliser
 > `~/.local/bin/uv`. Sans ça la commande échoue en « uv: fichier introuvable » et l'on
 > croit à tort que la synchronisation a eu lieu.
 
-> ⚠️ **L'EXTENSION NATIVE `openjarvis_rust` N'EST PAS COMPILÉE — ni en local, ni sur la VM**
-> (mesuré le 2026-08-03 : ni `cargo`, ni le module). Conséquence : **114 tests échouent**
-> (75 dans `tests/security`, 39 dans `tests/memory`), et `_rust_bridge.py` annonce
-> explicitement qu'il n'existe **aucun repli Python** — « The Rust backend is mandatory ».
-> **17 fichiers** l'importent, dont TOUT `security/` (scanner, SSRF, rate limiter,
-> capabilities, file policy, injection scanner) et une partie de `tools/` (shell_exec,
-> file_write, http_request, git_tool).
-> Le daemon démarre et répond quand même : les chemins empruntés au quotidien ne passent
-> pas par ces modules. Mais **ne pas conclure de « Ava fonctionne » que la couche de
-> sécurité est active** — elle ne l'est pas.
-> Réparation documentée par l'amont :
-> `uv run maturin develop -m rust/crates/openjarvis-python/Cargo.toml` (exige d'installer
-> une chaîne Rust sur la VM durcie → décision d'infrastructure, pas une montée de version).
+> ✅ **L'EXTENSION NATIVE `openjarvis_rust` EST COMPILÉE ET DÉPLOYÉE depuis le 2026-08-03**
+> — elle ne l'avait **jamais** été, ni en local ni sur la VM. Conséquence de son absence :
+> **137 tests en échec** (75 dans `tests/security`, 39 dans `tests/memory`, 23 ailleurs),
+> et `_rust_bridge.py` annonce explicitement qu'il n'existe **aucun repli Python** — « The
+> Rust backend is mandatory ». **17 fichiers** l'importent, dont TOUT `security/` (scanner,
+> SSRF, rate limiter, capabilities, file policy, injection scanner) et une partie de
+> `tools/` (shell_exec, file_write, http_request, git_tool).
+> ⚠️ **Le daemon démarrait et répondait quand même** — c'était tout le piège : « Ava
+> fonctionne » ne voulait pas dire « sa couche de sécurité est active ». Elle ne l'était pas.
+>
+> ### Recompiler après une modification du code Rust
+>
+> **En local** (chaîne Rust présente) :
+> ```bash
+> uv run maturin develop -m rust/crates/openjarvis-python/Cargo.toml --release
+> ```
+>
+> **Pour la VM — PAS depuis le laptop, et pas sur la VM non plus.** Deux obstacles,
+> chacun suffisant :
+> 1. **glibc** — le laptop est en 2.44 (Arch), la VM en 2.41 (Debian 13). Une wheel bâtie
+>    ici exigerait des symboles absents là-bas. Aucune version de Python ne change ça.
+> 2. **Le durcissement interdit le compilateur sur la VM** : le rôle Ansible `hardening`
+>    met `/usr/bin/{gcc,g++,cc,as}` en **0700 root** (Lynis HRDN-7222), et Rust a besoin
+>    du linker. Y installer une chaîne reviendrait à défaire une mesure en place.
+>
+> **La méthode retenue : compiler dans un conteneur Debian 13 sur AVA**, machine de build
+> légitime (elle sert déjà de runner CI), puis déployer la seule wheel. Aucun compilateur
+> n'atterrit sur la VM.
+> ```bash
+> # sur AVA — cloner via l'endpoint GitLab INTERNE (le public est derrière CF Access)
+> docker run --rm -v /tmp/ava-rust-build:/work -w /work python:3.12-slim bash -c '
+>   apt-get update -qq && apt-get install -y -qq build-essential curl
+>   curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
+>   export PATH=/work/.cargo/bin:$PATH CARGO_HOME=/work/.cargo RUSTUP_HOME=/work/.rustup
+>   pip install -q maturin && cd /work/src
+>   maturin build --release -m rust/crates/openjarvis-python/Cargo.toml -o /work/wheels'
+> # puis, SUR LA VM et dans cet ordre :
+> ~/.local/bin/uv sync --extra …          # d'abord
+> ~/.local/bin/uv pip install --no-deps <wheel>   # ensuite
+> ```
+> ⚠️ **`python:3.12-slim` et non 3.13** : le venv de la VM est épinglé par le fichier
+> `.python-version` du dépôt (valeur `3.12`), alors que la VM a Python 3.13.5 en système.
+> Une wheel `cp313` n'y serait pas chargée. Vérifier `.python-version` avant de compiler.
+> ⚠️ **L'ORDRE `uv sync` PUIS `uv pip install` EST NON NÉGOCIABLE** : la wheel n'est pas
+> dans le lock, donc un `uv sync` postérieur la **retire** — vécu, l'environnement
+> paraissait bon une minute plus tôt.
+> ⚠️ La wheel produite est `manylinux_2_39` : compatible avec toute glibc ≥ 2.39, donc
+> avec la VM (2.41). C'est ce tag qu'il faut vérifier, pas la version de Debian.
 
 ### Cerveau — Phase 1 (M0→M6)
 
