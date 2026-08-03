@@ -80,14 +80,33 @@ export default defineConfig({
   build: {
     outDir: '../src/openjarvis/server/static',
     emptyOutDir: true,
-    minify: 'esbuild',
+    // ⚠ `'esbuild'` N'EST PLUS VALIDE DEPUIS VITE 8 : esbuild a été remplacé par **oxc**
+    //   et n'est plus une dépendance de vite. Le laisser produit une erreur qui ne parle
+    //   PAS de minification — « Failed to load `transformWithEsbuild` […] Cannot find
+    //   package 'esbuild' » — et fait chercher un paquet manquant plutôt qu'un réglage
+    //   périmé.
+    minify: 'oxc',
     rollupOptions: {
       output: {
-        manualChunks: {
-          react: ['react', 'react-dom'],
-          markdown: ['react-markdown', 'rehype-highlight', 'remark-gfm'],
-          charts: ['recharts'],
-          router: ['react-router'],
+        // ⚠ FORME FONCTION OBLIGATOIRE DEPUIS VITE 8 (2026-08-03). Vite 8 remplace
+        //   Rollup par **Rolldown**, qui n'accepte plus la forme objet
+        //   `{ nom: [paquets] }` : le build échoue sur « manualChunks is not a
+        //   function ». Même découpage qu'avant, exprimé autrement.
+        //
+        // ⚠ LE PIÈGE N'EST PAS L'ERREUR, C'EST CE QU'ELLE LAISSE DERRIÈRE ELLE.
+        //   Le build échoue APRÈS avoir vidé `outDir` (`emptyOutDir: true`) et APRÈS
+        //   que vite-plugin-pwa a écrit un `sw.js` — mesuré : **7 entrées de precache
+        //   au lieu de 37**. Le répertoire servi se retrouve donc dans un état
+        //   intermédiaire cohérent en apparence : des fichiers existent, le serveur
+        //   répond 200. Ne jamais déduire d'un `static/` non vide qu'un build a
+        //   réussi ; lire le code de sortie.
+        manualChunks(id: string) {
+          if (!id.includes('node_modules')) return undefined;
+          if (/[\\/]node_modules[\\/](react|react-dom|scheduler)[\\/]/.test(id)) return 'react';
+          if (/[\\/]node_modules[\\/](react-markdown|rehype-highlight|remark-gfm)[\\/]/.test(id)) return 'markdown';
+          if (/[\\/]node_modules[\\/]recharts[\\/]/.test(id)) return 'charts';
+          if (/[\\/]node_modules[\\/]react-router[\\/]/.test(id)) return 'router';
+          return undefined;
         },
       },
     },
