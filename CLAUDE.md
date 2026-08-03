@@ -127,7 +127,39 @@ Daemon HTTP sur `localhost:8000` par défaut. Tauri UI communique via IPC + WebS
 - **Gestionnaire deps** : `uv` (convention OpenJarvis)
 - **Rust** stable récent (extension Python + Tauri)
 - **Node.js ≥ 20** (frontend Tauri)
-- **Frontend** : React 19 + Shadcn + Tailwind + Tauri 2
+- **Frontend** : React 19 + Shadcn + Tailwind + Tauri 2 — **Vite 8 / TypeScript 7 /
+  react-router 8** depuis le 2026-08-03
+
+> ⚠️ **`uv sync --extra X` RETIRE TOUS LES AUTRES EXTRAS — ça a mis Ava par terre le
+> 2026-08-03.** La commande ne fait pas *« ajoute X »* mais *« l'environnement doit être
+> EXACTEMENT le projet + X »*. Un `uv sync --extra dev` lancé pour installer pytest a donc
+> desinstallé **fastapi et uvicorn**, et le daemon est entré en boucle de redémarrage.
+> ⚠️ **Le journal systemd ne dit PAS pourquoi** : il n'affiche que
+> `status=1/FAILURE` en boucle, et `journalctl` filtré sur l'unité ne montre aucune trace
+> applicative. Le message existe pourtant, clair et actionnable — *« Server dependencies
+> not installed. Install the server extra »* — mais il faut **lancer le service à la main**
+> pour le voir :
+> `cd /home/avalon/ava && ~/.local/bin/uv run jarvis serve --host 127.0.0.1 --port 8001`
+> C'est le premier geste à faire face à un crash-loop de ce service, avant toute hypothèse.
+> **Extras requis en production** : `--extra server --extra speech --extra dashboard`
+> (les nommer TOUS à chaque `uv sync`, y compris quand on ne veut qu'ajouter `dev`).
+> ⚠️ `uv` n'est pas dans le PATH d'un shell **non interactif** : en SSH scripté, utiliser
+> `~/.local/bin/uv`. Sans ça la commande échoue en « uv: fichier introuvable » et l'on
+> croit à tort que la synchronisation a eu lieu.
+
+> ⚠️ **L'EXTENSION NATIVE `openjarvis_rust` N'EST PAS COMPILÉE — ni en local, ni sur la VM**
+> (mesuré le 2026-08-03 : ni `cargo`, ni le module). Conséquence : **114 tests échouent**
+> (75 dans `tests/security`, 39 dans `tests/memory`), et `_rust_bridge.py` annonce
+> explicitement qu'il n'existe **aucun repli Python** — « The Rust backend is mandatory ».
+> **17 fichiers** l'importent, dont TOUT `security/` (scanner, SSRF, rate limiter,
+> capabilities, file policy, injection scanner) et une partie de `tools/` (shell_exec,
+> file_write, http_request, git_tool).
+> Le daemon démarre et répond quand même : les chemins empruntés au quotidien ne passent
+> pas par ces modules. Mais **ne pas conclure de « Ava fonctionne » que la couche de
+> sécurité est active** — elle ne l'est pas.
+> Réparation documentée par l'amont :
+> `uv run maturin develop -m rust/crates/openjarvis-python/Cargo.toml` (exige d'installer
+> une chaîne Rust sur la VM durcie → décision d'infrastructure, pas une montée de version).
 
 ### Cerveau — Phase 1 (M0→M6)
 
