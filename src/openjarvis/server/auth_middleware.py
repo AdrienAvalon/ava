@@ -33,7 +33,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     status_code=401,
                 )
             scheme, _, token = auth.partition(" ")
-            if scheme.lower() != "bearer" or token != self._api_key:
+            # Constant-time comparison to avoid leaking the key via timing.
+            if scheme.lower() != "bearer" or not secrets.compare_digest(
+                token, self._api_key
+            ):
                 return JSONResponse(
                     {"detail": "Invalid API key"},
                     status_code=401,
@@ -42,9 +45,18 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
     @staticmethod
     def _requires_auth(path: str) -> bool:
-        """Only protect API routes, not the frontend UI or static assets."""
-        return path.startswith("/v1/") or path.startswith("/api/")
+        """Protect API routes and operational metrics; leave the UI/health open.
 
+        ``/metrics`` exposes request/token counters that should not be readable
+        by unauthenticated clients, so it is gated alongside ``/v1`` and
+        ``/api``. ``/health`` stays open for liveness probes.
+        """
+        return (
+            path.startswith("/v1/")
+            or path.startswith("/api/")
+            or path == "/metrics"
+            or path.startswith("/metrics/")
+        )
 
 
 def generate_api_key() -> str:
@@ -73,3 +85,29 @@ def check_bind_safety(host: str, *, api_key: str) -> None:
             host,
         )
         sys.exit(1)
+
+
+def websocket_authorized(websocket, expected_key: str) -> bool:  # noqa: ANN001
+    """Return ``True`` if a WebSocket connection presents the expected key.
+
+    ``AuthMiddleware`` is a ``BaseHTTPMiddleware`` and never sees WebSocket
+    upgrade requests, so streaming endpoints must check the token themselves
+    in the handshake before calling ``websocket.accept()``.
+
+    When *expected_key* is empty, authentication is disabled (the loopback /
+    local-only default, matching :class:`AuthMiddleware`) and all connections
+    are allowed. The token may be supplied either as a ``?token=`` query
+    parameter — browsers cannot set headers on a WebSocket handshake — or via
+    an ``Authorization: Bearer <key>`` header for programmatic clients.
+    """
+    if not expected_key:
+        return True
+    token = websocket.query_params.get("token", "")
+    if not token:
+        auth = websocket.headers.get("authorization", "")
+        scheme, _, value = auth.partition(" ")
+        if scheme.lower() == "bearer":
+            token = value
+    if not token:
+        return False
+    return secrets.compare_digest(token, expected_key)

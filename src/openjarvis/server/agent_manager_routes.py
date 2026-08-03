@@ -69,6 +69,27 @@ _BROWSER_SUB_TOOLS = {
 }
 
 
+def _resolve_memory_backend(config: Any) -> Any:
+    """Instantiate the configured memory backend, or None if unavailable.
+
+    Mirrors serve.py's setup so an agent tick that runs through the server
+    can actually use its memory_* tools. Returns None (so the tools degrade
+    gracefully) when memory context is disabled or the backend can't load.
+    """
+    if config is None or not getattr(config.agent, "context_from_memory", False):
+        return None
+    try:
+        import openjarvis.tools.storage  # noqa: F401
+        from openjarvis.core.registry import MemoryRegistry
+
+        key = config.memory.default_backend
+        if MemoryRegistry.contains(key):
+            return MemoryRegistry.create(key, db_path=config.memory.db_path)
+    except Exception:
+        logger.debug("Lightweight system: memory backend init failed", exc_info=True)
+    return None
+
+
 class _LightweightSystem:
     """Minimal system facade for the executor — avoids rebuilding the
     full JarvisSystem (which picks a random model from Ollama)."""
@@ -77,7 +98,12 @@ class _LightweightSystem:
         self.engine = engine
         self.model = model
         self.config = config
-        self.memory_backend = None
+        # Wire the configured memory backend so an agent's memory_store /
+        # memory_retrieve tools work when the tick runs through the server.
+        # The executor injects system.memory_backend into those tools; this
+        # facade previously left it None, so they reported "No memory backend
+        # configured" even though the backend was configured and active.
+        self.memory_backend = _resolve_memory_backend(config)
 
 
 def _make_lightweight_system(
@@ -85,24 +111,35 @@ def _make_lightweight_system(
     model: str,
     config: Any = None,
 ) -> _LightweightSystem:
-    """Build a minimal system with a plain OllamaEngine.
+    """Build a minimal system with a fresh inference engine.
 
     The server's ``app.state.engine`` is heavily wrapped
     (MultiEngine -> InstrumentedEngine -> GuardrailsEngine) and can
-    return empty content from background threads.  Create a fresh
-    OllamaEngine directly (no health checks or model discovery that
-    could interfere with in-flight Ollama requests).
+    return empty content from background threads. Create a fresh
+    engine directly (no health checks or model discovery that
+    could interfere with in-flight requests).
     """
     try:
-        from openjarvis.engine.ollama import OllamaEngine
+        from openjarvis.engine._discovery import get_engine
 
         cfg = config
         if cfg is None:
             from openjarvis.core.config import load_config
 
             cfg = load_config()
-        host = cfg.engine.ollama.host if cfg else ""
-        plain_engine = OllamaEngine(host=host) if host else OllamaEngine()
+
+        pref = cfg.intelligence.preferred_engine
+        key = pref or cfg.engine.default
+        resolved = get_engine(cfg, key)
+
+        if resolved is not None:
+            plain_engine = resolved[1]
+        else:
+            from openjarvis.engine.ollama import OllamaEngine
+
+            host = cfg.engine.ollama.host if cfg else ""
+            plain_engine = OllamaEngine(host=host) if host else OllamaEngine()
+
         # Wrap with InstrumentedEngine so agent ticks are recorded
         # in telemetry (FLOPs, energy, cost savings).
         try:
@@ -234,34 +271,36 @@ def build_tools_list() -> List[Dict[str, Any]]:
 
     items: List[Dict[str, Any]] = []
 
-    try:
-        for name, tool_cls in ToolRegistry.items():
-            if name in _BROWSER_SUB_TOOLS:
-                continue
-            spec = getattr(tool_cls, "spec", None)
-            if callable(spec):
-                try:
-                    spec = spec(tool_cls)
-                except Exception:
-                    spec = None
-            cred_keys = TOOL_CREDENTIALS.get(name, [])
-            items.append(
-                {
-                    "name": name,
-                    "description": spec.description if spec else "",
-                    "category": spec.category if spec else "",
-                    "source": "tool",
-                    "requires_credentials": len(cred_keys) > 0,
-                    "credential_keys": cred_keys,
-                    "configured": (
-                        all(bool(os.environ.get(k)) for k in cred_keys)
-                        if cred_keys
-                        else True
-                    ),
-                }
-            )
-    except Exception:
-        pass
+    for name, tool_cls in ToolRegistry.items():
+        if name in _BROWSER_SUB_TOOLS:
+            continue
+        # `spec` is an instance @property on BaseTool subclasses, so
+        # we have to instantiate the tool to read it. The earlier
+        # implementation used getattr(tool_cls, 'spec') which returns
+        # the property descriptor and crashed on spec.description,
+        # silently dropping every real tool from the picker.
+        try:
+            spec = tool_cls().spec
+        except Exception as exc:
+            logger.debug("Could not instantiate tool %s: %s", name, exc)
+            spec = None
+        cred_keys = TOOL_CREDENTIALS.get(name, [])
+        has_fallback = bool(spec and spec.metadata.get("fallback"))
+        items.append(
+            {
+                "name": name,
+                "description": spec.description if spec else "",
+                "category": spec.category if spec else "",
+                "source": "tool",
+                "requires_credentials": len(cred_keys) > 0 and not has_fallback,
+                "credential_keys": cred_keys,
+                "configured": (
+                    has_fallback or all(bool(os.environ.get(k)) for k in cred_keys)
+                    if cred_keys
+                    else True
+                ),
+            }
+        )
 
     try:
         if any(ToolRegistry.contains(n) for n in _BROWSER_SUB_TOOLS):
@@ -306,6 +345,248 @@ def build_tools_list() -> List[Dict[str, Any]]:
         pass
 
     return items
+
+
+def _resolve_tool_specs(
+    tool_config: Any,
+) -> List[Dict[str, Any]]:
+    """Convert a template's ``tools`` config into OpenAI-format function specs.
+
+    The template TOML stores tools as a list of string names (e.g.
+    ``["file_read", "shell_exec"]``). Engines expect OpenAI-shaped dicts:
+    ``{"type": "function", "function": {"name, description, parameters"}}``.
+
+    Special handling:
+      * Dict entries pass through as-is (allows advanced configs to
+        supply fully-formed specs).
+      * ``browser`` is a synthetic display-only meta-tool that expands
+        to the 6 real browser sub-tools (browser_navigate, click, …).
+      * Channel names (``slack``, ``gmail``, …) come from the
+        ``ChannelRegistry`` and are not directly callable by the LLM —
+        they're destinations for ``channel_send``. Silently skip them.
+      * Unknown tool names are dropped with a warning.
+    """
+    if not tool_config:
+        return []
+
+    from openjarvis.core.registry import ChannelRegistry, ToolRegistry
+
+    _ensure_registries_populated()
+
+    def _spec_dict_for(name: str) -> Optional[Dict[str, Any]]:
+        try:
+            spec = ToolRegistry.get(name)().spec
+        except Exception as exc:
+            logger.warning(
+                "Could not build spec for tool '%s' (%s) — dropping",
+                name,
+                exc,
+            )
+            return None
+        return {
+            "type": "function",
+            "function": {
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": spec.parameters,
+            },
+        }
+
+    resolved: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    for entry in tool_config:
+        if isinstance(entry, dict):
+            resolved.append(entry)
+            continue
+        if not isinstance(entry, str):
+            continue
+
+        # Expand the synthetic "browser" meta-tool into its sub-tools.
+        if entry == "browser":
+            for sub in _BROWSER_SUB_TOOLS:
+                if sub in seen or not ToolRegistry.contains(sub):
+                    continue
+                spec_dict = _spec_dict_for(sub)
+                if spec_dict:
+                    resolved.append(spec_dict)
+                    seen.add(sub)
+            continue
+
+        # Channels (slack, gmail, …) live in ChannelRegistry and aren't
+        # callable by the LLM. Skip silently — the agent talks to them
+        # through the `channel_send` tool with a `channel` argument.
+        if ChannelRegistry.contains(entry):
+            continue
+
+        if not ToolRegistry.contains(entry):
+            logger.warning(
+                "Tool '%s' referenced in agent config but not in ToolRegistry",
+                entry,
+            )
+            continue
+
+        if entry in seen:
+            continue
+        spec_dict = _spec_dict_for(entry)
+        if spec_dict:
+            resolved.append(spec_dict)
+            seen.add(entry)
+
+    return resolved
+
+
+# Per-agent sampler params forwarded to the engine when present in config.
+# The OpenAI-compat engine passes **kwargs straight through to the upstream
+# payload, so these reach local servers (vLLM / mlx_lm / etc.) that support
+# them. Only forwarded when explicitly set, so default agents send nothing
+# extra and engines that don't support a key never receive it. (#386)
+_SAMPLER_PARAM_KEYS = (
+    "top_p",
+    "top_k",
+    "min_p",
+    "repetition_penalty",
+    "frequency_penalty",
+    "presence_penalty",
+)
+
+
+def _build_managed_system_prompt(system_prompt: str, app_config: Any) -> str:
+    """Build the streaming managed-agent system prompt via SystemPromptBuilder.
+
+    Routes the agent's own ``system_prompt`` through the same builder the
+    CLI/ask path uses, so SOUL.md / MEMORY.md / USER.md persona files are
+    injected for streaming chat too (#431). Returns the assembled prompt
+    (caller decides whether to append a SYSTEM message); an agent with
+    neither persona nor template yields an empty string, preserving the
+    prior no-SYSTEM-message behavior.
+    """
+    from openjarvis.prompt.builder import SystemPromptBuilder
+
+    builder = SystemPromptBuilder(
+        agent_template=system_prompt or "",
+        memory_files_config=getattr(app_config, "memory_files", None),
+        system_prompt_config=getattr(app_config, "system_prompt", None),
+    )
+    return builder.build()
+
+
+def _sampler_kwargs(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract per-agent sampler params from a managed agent's config (#386)."""
+    out: Dict[str, Any] = {}
+    for key in _SAMPLER_PARAM_KEYS:
+        val = config.get(key)
+        if val is not None:
+            out[key] = val
+    return out
+
+
+def _replay_history_messages(
+    history: List[Dict[str, Any]],
+    exclude_id: str,
+) -> List[Any]:
+    """Rebuild prior-turn LLM messages from stored managed-agent history.
+
+    When a stored assistant turn recorded ``tool_calls``, replay them as an
+    assistant tool-use message followed by the corresponding tool-result
+    messages — so the model sees its own prior tool pattern instead of
+    regressing to fabricated tool output on later turns. Without this, only
+    the assistant's text is replayed and the tool-use signal is lost (#382).
+    """
+    from openjarvis.core.types import Message, Role, ToolCall
+
+    messages: List[Any] = []
+    for m in reversed(history):
+        if m.get("id") == exclude_id:
+            continue
+        direction = m.get("direction")
+        if direction == "user_to_agent":
+            messages.append(Message(role=Role.USER, content=m.get("content") or ""))
+        elif direction == "agent_to_user":
+            stored = m.get("tool_calls")
+            if stored:
+                calls = []
+                results = []
+                for i, tc in enumerate(stored):
+                    call_id = f"hist-{m.get('id', '')}-{i}"
+                    calls.append(
+                        ToolCall(
+                            id=call_id,
+                            name=tc.get("tool", ""),
+                            arguments=tc.get("arguments") or "",
+                        )
+                    )
+                    results.append(
+                        Message(
+                            role=Role.TOOL,
+                            content=str(tc.get("result", "")),
+                            tool_call_id=call_id,
+                            name=tc.get("tool", ""),
+                        )
+                    )
+                messages.append(
+                    Message(
+                        role=Role.ASSISTANT,
+                        content=m.get("content") or None,
+                        tool_calls=calls,
+                    )
+                )
+                messages.extend(results)
+            else:
+                messages.append(
+                    Message(role=Role.ASSISTANT, content=m.get("content") or "")
+                )
+    return messages
+
+
+def _instantiate_managed_tool(
+    tool_cls: Any,
+    name: str,
+    *,
+    engine: Any,
+    model: str,
+    app_state: Any,
+) -> Any:
+    """Instantiate a tool with the same dependency injection as the canonical
+    ``cli/ask.py`` path, so ``memory_*`` / ``channel_*`` / ``llm`` tools work
+    instead of silently failing with "No backend configured" (#395).
+    """
+    try:
+        from openjarvis.cli.ask import (
+            _CHANNEL_TOOLS,
+            _MEMORY_TOOLS,
+            _get_memory_backend,
+        )
+    except Exception:  # pragma: no cover - cli import should always succeed
+        _MEMORY_TOOLS = frozenset()
+        _CHANNEL_TOOLS = frozenset()
+        _get_memory_backend = None
+
+    if name in _MEMORY_TOOLS:
+        backend = getattr(app_state, "memory_backend", None) if app_state else None
+        if backend is None and app_state is not None and _get_memory_backend:
+            cfg = getattr(app_state, "config", None)
+            if cfg is not None:
+                backend = _get_memory_backend(cfg)
+        if backend is None:
+            logger.warning(
+                "Memory tool %r instantiated without a backend — calls will "
+                "return no results.",
+                name,
+            )
+        return tool_cls(backend=backend)
+    if name in _CHANNEL_TOOLS:
+        channel = getattr(app_state, "channel_bridge", None) if app_state else None
+        if channel is None:
+            logger.warning(
+                "Channel tool %r instantiated without a channel — calls will "
+                "fail with 'No channel backend configured'.",
+                name,
+            )
+        return tool_cls(channel=channel)
+    if name == "llm":
+        return tool_cls(engine=engine, model=model)
+    return tool_cls()
 
 
 def _build_deep_research_tools(
@@ -418,12 +699,14 @@ def _get_mcp_tools(app_state: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]
         cfg = _json.loads(server_cfg) if isinstance(server_cfg, str) else server_cfg
         name = cfg.get("name", "<unnamed>")
         url = cfg.get("url")
+        # Bearer token from config — mirrors the builder.py fix for #461.
+        token = cfg.get("token")
         command = cfg.get("command", "")
         args = cfg.get("args", [])
 
         try:
             if url:
-                transport = StreamableHTTPTransport(url=url)
+                transport = StreamableHTTPTransport(url=url, token=token)
             elif command:
                 transport = StdioTransport(command=[command] + args)
             else:
@@ -545,7 +828,16 @@ async def _stream_managed_agent(
 
     agent_id = agent_record["id"]
     config = agent_record.get("config", {})
-    model = config.get("model", getattr(engine, "_model", ""))
+    # Resolve the model: prefer the agent's own config, then the server's
+    # resolved model (app.state.model — what the engine was booted with),
+    # and only then the legacy engine._model attr. OllamaEngine takes the
+    # model per-call and exposes no _model attr, so without the app_state
+    # fallback this resolved to "" and Ollama 400'd on an empty model.
+    model = (
+        config.get("model")
+        or getattr(app_state, "model", None)
+        or getattr(engine, "_model", "")
+    )
     system_prompt = config.get("system_prompt")
     temperature = config.get("temperature", 0.7)
     max_tokens = config.get("max_tokens", 1024)
@@ -553,8 +845,21 @@ async def _stream_managed_agent(
 
     # Build conversation messages from history + current input
     llm_messages: List[Message] = []
-    if system_prompt:
-        llm_messages.append(Message(role=Role.SYSTEM, content=system_prompt))
+
+    # Wire the SystemPromptBuilder to inject SOUL.md / MEMORY.md / USER.md
+    # persona files (parity with the CLI/ask path) — see #431.
+    app_config = getattr(app_state, "config", None)
+    if app_config is None:
+        from openjarvis.core.config import load_config
+
+        app_config = load_config()
+
+    final_system_prompt = _build_managed_system_prompt(system_prompt or "", app_config)
+
+    if final_system_prompt and final_system_prompt.strip():
+        llm_messages.append(
+            Message(role=Role.SYSTEM, content=final_system_prompt.strip())
+        )
 
     # Resolve agent type and class for DeepResearch tool wiring
     agent_type = agent_record.get("agent_type", "")
@@ -567,15 +872,11 @@ async def _stream_managed_agent(
         if app_state is not None and dr_tools:
             app_state._dr_tools = dr_tools
 
-    # Load prior conversation context (DESC order, reverse for chronological)
+    # Load prior conversation context (DESC order, reverse for chronological).
+    # Replaying recorded tool_calls (assistant tool-use + tool results) keeps
+    # multi-turn tool behaviour from regressing to fabricated output (#382).
     history = manager.list_messages(agent_id, limit=50)
-    for m in reversed(history):
-        if m["id"] == message_id:
-            continue
-        if m["direction"] == "user_to_agent":
-            llm_messages.append(Message(role=Role.USER, content=m["content"]))
-        elif m["direction"] == "agent_to_user":
-            llm_messages.append(Message(role=Role.ASSISTANT, content=m["content"]))
+    llm_messages.extend(_replay_history_messages(history, message_id))
 
     # Append the current user message
     llm_messages.append(Message(role=Role.USER, content=user_content))
@@ -623,6 +924,8 @@ async def _stream_managed_agent(
                     tools=dr_tools,
                     max_turns=int(config.get("max_turns", 8)),
                     temperature=float(config.get("temperature", 0.3)),
+                    interactive=True,
+                    confirm_callback=lambda _prompt: True,
                 )
 
                 # Wrap the executor to capture tool calls
@@ -630,14 +933,15 @@ async def _stream_managed_agent(
 
                 def _tracked_execute(tc):
                     tool_name = tc.name
-                    args_str = tc.arguments[:80] if tc.arguments else ""
+                    full_args = tc.arguments or ""
+                    args_str = full_args[:80]
                     # Log tool call start
                     try:
                         manager.add_learning_log(
                             agent_id,
                             "tool_call",
                             f"Calling {tool_name}: {args_str}",
-                            {"tool": tool_name, "arguments": tc.arguments or ""},
+                            {"tool": tool_name, "arguments": full_args},
                         )
                     except Exception as _tc_exc:
                         logger.warning("Log tool_call failed: %s", _tc_exc)
@@ -647,9 +951,12 @@ async def _stream_managed_agent(
                             "type": "tool_start",
                             "tool": tool_name,
                             "args": args_str,
+                            "full_args": full_args,
                         }
                     )
+                    _tool_start = _dr_time.monotonic()
                     result = original_execute(tc)
+                    _tool_latency_ms = (_dr_time.monotonic() - _tool_start) * 1000
 
                     # Log tool result
                     try:
@@ -672,7 +979,10 @@ async def _stream_managed_agent(
                         {
                             "type": "tool_end",
                             "tool": tool_name,
+                            "arguments": full_args,
                             "success": result.success,
+                            "latency": _tool_latency_ms,
+                            "result": result.content or "",
                         }
                     )
                     return result
@@ -721,6 +1031,12 @@ async def _stream_managed_agent(
                 thread = threading.Thread(target=_run_agent, daemon=True)
                 thread.start()
 
+                # Collect tool calls from deep-research so we can persist them
+                # alongside the final response (and the UI can re-render them
+                # after a page reload).
+                dr_tool_calls: List[Dict[str, Any]] = []
+                _pending_dr_starts: Dict[str, str] = {}
+
                 # Stream progress events and final content
                 while True:
                     try:
@@ -733,6 +1049,16 @@ async def _stream_managed_agent(
                     if event["type"] == "tool_start":
                         tool = event["tool"]
                         args = event.get("args", "")
+                        full_args = event.get("full_args", "")
+                        _pending_dr_starts[tool] = full_args
+                        # Structured event so the UI can render a tool_call
+                        # message card (same shape as the non-DR path).
+                        _start_payload = json.dumps(
+                            {"tool": tool, "arguments": full_args}
+                        )
+                        yield f"event: tool_call_start\ndata: {_start_payload}\n\n"
+                        # Keep the human-readable progress label for the
+                        # thinking-bubble fallback.
                         label = _tool_progress_label(tool, args)
                         progress_data = {
                             "id": chunk_id,
@@ -750,7 +1076,28 @@ async def _stream_managed_agent(
                         yield f"data: {json.dumps(progress_data)}\n\n"
 
                     elif event["type"] == "tool_end":
-                        pass  # Could emit completion signal
+                        tool = event["tool"]
+                        dr_tool_calls.append(
+                            {
+                                "tool": tool,
+                                "arguments": event.get(
+                                    "arguments", _pending_dr_starts.get(tool, "")
+                                ),
+                                "result": event.get("result", ""),
+                                "success": bool(event.get("success", False)),
+                                "latency": float(event.get("latency", 0.0)),
+                            }
+                        )
+                        _pending_dr_starts.pop(tool, None)
+                        _end_payload = json.dumps(
+                            {
+                                "tool": tool,
+                                "success": bool(event.get("success", False)),
+                                "latency": float(event.get("latency", 0.0)),
+                                "result": event.get("result", ""),
+                            }
+                        )
+                        yield f"event: tool_call_end\ndata: {_end_payload}\n\n"
 
                     elif event["type"] in ("done", "error"):
                         content = event["content"]
@@ -798,10 +1145,12 @@ async def _stream_managed_agent(
                         yield f"data: {json.dumps(finish_data)}\n\n"
                         yield "data: [DONE]\n\n"
 
-                        # Persist
+                        # Persist (with the tool calls captured during
+                        # the deep-research turn so they survive reload).
                         manager.store_agent_response(
                             agent_id,
                             content,
+                            tool_calls=dr_tool_calls or None,
                         )
                         break
 
@@ -814,10 +1163,17 @@ async def _stream_managed_agent(
                 },
             )
 
-    # Build extra kwargs for stream_full (e.g. tools from config)
+    # Build extra kwargs for stream_full (e.g. tools from config).
+    # Template stores tool names as strings; convert to OpenAI function specs
+    # so the engine can actually bind them to the model.
     stream_kwargs: Dict[str, Any] = {}
-    if config.get("tools"):
-        stream_kwargs["tools"] = config["tools"]
+    resolved_tools = _resolve_tool_specs(config.get("tools"))
+    if resolved_tools:
+        stream_kwargs["tools"] = resolved_tools
+
+    # Forward any per-agent sampler params (repetition_penalty, top_p, …) so
+    # locally-hosted models can be tuned per agent (#386).
+    stream_kwargs.update(_sampler_kwargs(config))
 
     # Discover MCP tools and merge into stream_kwargs
     mcp_adapters: Dict[str, Any] = {}
@@ -836,12 +1192,68 @@ async def _stream_managed_agent(
                 "Failed to get MCP tools for streaming: %s", exc, exc_info=True
             )
 
+    # Shared state between the generator and the BackgroundTask that
+    # runs after the SSE response completes (or the client disconnects
+    # mid-stream). Starlette guarantees the BackgroundTask runs in both
+    # cases, so we use it as the single, reliable persistence point.
+    persist_state: Dict[str, Any] = {
+        "content": "",
+        "tool_calls": [],
+        "persisted": False,
+    }
+
+    def _persist_final() -> None:
+        if persist_state["persisted"]:
+            return
+        persist_state["persisted"] = True
+        if persist_state["content"]:
+            try:
+                manager.store_agent_response(
+                    agent_id,
+                    persist_state["content"],
+                    tool_calls=persist_state["tool_calls"] or None,
+                )
+            except Exception as store_exc:
+                logger.error(
+                    "Failed to store agent response: %s",
+                    store_exc,
+                    exc_info=True,
+                )
+        try:
+            content = persist_state["content"] or ""
+            manager.add_learning_log(
+                agent_id,
+                "query_complete",
+                f"Response: {len(content)} chars, "
+                f"{len(persist_state['tool_calls'])} tool calls",
+                {
+                    "response_length": len(content),
+                    "tool_calls": len(persist_state["tool_calls"]),
+                },
+            )
+        except Exception as _qc_exc:
+            logger.warning("Log query_complete failed: %s", _qc_exc)
+
     async def generate():
         """Async generator yielding SSE-formatted chunks with real token streaming."""
 
         collected_content = ""
+        collected_tool_calls: List[Dict[str, Any]] = []
         messages_for_llm = list(llm_messages)
         turns = 0
+
+        import time as _lgtime
+
+        _query_start_ts = _lgtime.time()
+        try:
+            manager.add_learning_log(
+                agent_id,
+                "query_start",
+                f"Query: {user_content[:100]}",
+                {"full_query": user_content},
+            )
+        except Exception as _qs_exc:
+            logger.warning("Log query_start failed: %s", _qs_exc)
 
         while turns < max_turns:
             turns += 1
@@ -860,6 +1272,9 @@ async def _stream_managed_agent(
                     # Stream content tokens immediately to the client
                     if chunk.content:
                         turn_content += chunk.content
+                        # Mirror partial content so a disconnect during
+                        # generation still saves what we've produced.
+                        persist_state["content"] = collected_content + turn_content
                         chunk_data = {
                             "id": chunk_id,
                             "object": "chat.completion.chunk",
@@ -909,19 +1324,6 @@ async def _stream_managed_agent(
                     tool_call_fragments[i] for i in sorted(tool_call_fragments.keys())
                 ]
 
-                # Emit tool_calls metadata as SSE event
-                tool_meta = []
-                for tc in sorted_tcs:
-                    tool_meta.append(
-                        {
-                            "tool_name": tc["function"]["name"],
-                            "arguments": tc["function"]["arguments"],
-                        }
-                    )
-                yield (
-                    f"event: tool_calls\ndata: {json.dumps({'calls': tool_meta})}\n\n"
-                )
-
                 # Add assistant message with tool_calls to conversation
                 from openjarvis.core.types import ToolCall as MsgToolCall
 
@@ -939,11 +1341,32 @@ async def _stream_managed_agent(
                 )
                 messages_for_llm.append(assistant_msg)
 
-                # Execute each tool call and append results
+                # Execute each tool call and append results. Emit
+                # tool_call_start/tool_call_end around each call so the UI
+                # can render them live (same event names as the main chat
+                # in stream_bridge.py).
+                import time as _time
+
                 for tc in sorted_tcs:
                     tool_name = tc["function"]["name"]
                     tool_args = tc["function"]["arguments"]
                     tool_result_content = f"Tool '{tool_name}' not available"
+                    tool_succeeded = False
+
+                    _start_payload = json.dumps(
+                        {"tool": tool_name, "arguments": tool_args}
+                    )
+                    yield f"event: tool_call_start\ndata: {_start_payload}\n\n"
+                    try:
+                        manager.add_learning_log(
+                            agent_id,
+                            "tool_call",
+                            f"Calling {tool_name}: {tool_args[:80]}",
+                            {"tool": tool_name, "arguments": tool_args or ""},
+                        )
+                    except Exception as _tc_exc:
+                        logger.warning("Log tool_call failed: %s", _tc_exc)
+                    tool_start_ms = _time.monotonic() * 1000
 
                     try:
                         # Try MCP adapter first (external tools)
@@ -967,8 +1390,31 @@ async def _stream_managed_agent(
 
                             tool_cls = ToolRegistry.get(tool_name)
                             if tool_cls is not None:
-                                tool_instance = tool_cls()
-                                executor = ToolExecutor(tools=[tool_instance], bus=bus)
+                                # Inject backend / channel / engine the same
+                                # way cli/ask.py does, else memory_* / channel_*
+                                # / llm tools fail with "No backend configured"
+                                # on every call (#395).
+                                tool_instance = _instantiate_managed_tool(
+                                    tool_cls,
+                                    tool_name,
+                                    engine=engine,
+                                    model=model,
+                                    app_state=app_state,
+                                )
+                                # Tools the user explicitly added to this
+                                # agent's toolkit are considered pre-approved —
+                                # selecting them in the wizard is the
+                                # confirmation. Without this, tools that have
+                                # `requires_confirmation=True` (shell_exec,
+                                # apply_patch) would fail with "requires
+                                # confirmation but no callback available" on
+                                # every call.
+                                executor = ToolExecutor(
+                                    tools=[tool_instance],
+                                    bus=bus,
+                                    interactive=True,
+                                    confirm_callback=lambda _prompt: True,
+                                )
                                 result = executor.execute(
                                     StubToolCall(
                                         id=tc["id"],
@@ -982,6 +1428,7 @@ async def _stream_managed_agent(
                                     "Tool '%s' not found in registry or MCP adapters",
                                     tool_name,
                                 )
+                        tool_succeeded = True
                     except Exception as tool_exc:
                         logger.error(
                             "Tool execution error for %s: %s",
@@ -991,11 +1438,43 @@ async def _stream_managed_agent(
                         )
                         tool_result_content = f"Error executing {tool_name}: {tool_exc}"
 
-                    # Emit tool result as SSE event
-                    tool_event_data = json.dumps(
-                        {"tool_name": tool_name, "output": tool_result_content}
+                    tool_latency_ms = (_time.monotonic() * 1000) - tool_start_ms
+                    collected_tool_calls.append(
+                        {
+                            "tool": tool_name,
+                            "arguments": tool_args,
+                            "result": tool_result_content,
+                            "success": tool_succeeded,
+                            "latency": tool_latency_ms,
+                        }
                     )
-                    yield (f"event: tool_result\ndata: {tool_event_data}\n\n")
+                    # Update the shared persist state so mid-stream
+                    # disconnects still capture already-executed tools.
+                    persist_state["tool_calls"] = list(collected_tool_calls)
+                    try:
+                        _ok = "succeeded" if tool_succeeded else "failed"
+                        _clen = len(tool_result_content) if tool_result_content else 0
+                        manager.add_learning_log(
+                            agent_id,
+                            "tool_result",
+                            f"{tool_name} {_ok} ({_clen} chars)",
+                            {
+                                "tool": tool_name,
+                                "success": tool_succeeded,
+                                "output_length": _clen,
+                            },
+                        )
+                    except Exception as _tr_exc:
+                        logger.warning("Log tool_result failed: %s", _tr_exc)
+                    _end_payload = json.dumps(
+                        {
+                            "tool": tool_name,
+                            "success": tool_succeeded,
+                            "latency": tool_latency_ms,
+                            "result": tool_result_content,
+                        }
+                    )
+                    yield f"event: tool_call_end\ndata: {_end_payload}\n\n"
 
                     # Add tool result message to conversation
                     messages_for_llm.append(
@@ -1009,10 +1488,16 @@ async def _stream_managed_agent(
 
                 # Continue to next turn (loop back to stream_full)
                 collected_content += turn_content
+                # Mirror to shared state so BackgroundTask can persist
+                # even if the client disconnects mid-stream.
+                persist_state["content"] = collected_content
+                persist_state["tool_calls"] = list(collected_tool_calls)
                 continue
 
             # No tool calls — this is the final response
             collected_content += turn_content
+            persist_state["content"] = collected_content
+            persist_state["tool_calls"] = list(collected_tool_calls)
             break
 
         # Final chunk with finish_reason
@@ -1031,30 +1516,23 @@ async def _stream_managed_agent(
         yield f"data: {json.dumps(final_data)}\n\n"
         yield "data: [DONE]\n\n"
 
-        # Persist agent response in DB after streaming completes
-        if collected_content:
-            try:
-                manager.store_agent_response(agent_id, collected_content)
-            except Exception as store_exc:
-                logger.error(
-                    "Failed to store agent response: %s",
-                    store_exc,
-                    exc_info=True,
-                )
+    from starlette.background import BackgroundTask
 
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        background=BackgroundTask(_persist_final),
     )
 
 
 def create_agent_manager_router(
     manager: AgentManager,
-) -> Tuple[APIRouter, APIRouter, APIRouter, APIRouter]:
+) -> Tuple[APIRouter, APIRouter, APIRouter, APIRouter, APIRouter]:
     """Create FastAPI routers with agent management endpoints.
 
-    Returns a 4-tuple: (agents_router, templates_router, global_router, tools_router).
+    Returns a 5-tuple:
+    ``(agents_router, templates_router, global_router, tools_router, sendblue_router)``.
     """
     agents_router = APIRouter(prefix="/v1/managed-agents", tags=["managed-agents"])
     templates_router = APIRouter(prefix="/v1/templates", tags=["templates"])
@@ -1168,7 +1646,11 @@ def create_agent_manager_router(
                     server_config,
                 )
                 executor.set_system(system)
-                executor.execute_tick(agent_id)
+                # The route handler above already called start_tick() to
+                # serialize concurrent POSTs; tell the executor not to
+                # re-acquire, otherwise it bails on its own guard and the
+                # tick never runs.
+                executor.execute_tick(agent_id, lock_already_held=True)
             except Exception as exc:
                 logger.error(
                     "Run-tick failed for agent %s: %s",
@@ -1285,6 +1767,8 @@ def create_agent_manager_router(
                                     engine=engine,
                                     model=getattr(engine, "_model", ""),
                                     tools=tools,
+                                    interactive=True,
+                                    confirm_callback=lambda _prompt: True,
                                 )
 
                                 def handler(text: str) -> str:
@@ -1360,6 +1844,8 @@ def create_agent_manager_router(
                                     engine=engine,
                                     model=model_name,
                                     tools=tools,
+                                    interactive=True,
+                                    confirm_callback=lambda _prompt: True,
                                 )
                         bus = getattr(request.app.state, "bus", None)
                         if bus is None:
@@ -1610,10 +2096,13 @@ def create_agent_manager_router(
             raise HTTPException(status_code=404, detail="Agent not found")
         try:
             from openjarvis.core.config import load_config
+            from openjarvis.core.paths import get_config_dir
             from openjarvis.traces.store import TraceStore
 
             config = load_config()
-            store = TraceStore(config.traces.db_path or "~/.openjarvis/traces.db")
+            store = TraceStore(
+                config.traces.db_path or str(get_config_dir() / "traces.db")
+            )
             traces = store.list_traces(agent=agent_id, limit=limit)
             return {
                 "traces": [
@@ -1635,10 +2124,13 @@ def create_agent_manager_router(
     def get_trace(agent_id: str, trace_id: str):
         try:
             from openjarvis.core.config import load_config
+            from openjarvis.core.paths import get_config_dir
             from openjarvis.traces.store import TraceStore
 
             config = load_config()
-            store = TraceStore(config.traces.db_path or "~/.openjarvis/traces.db")
+            store = TraceStore(
+                config.traces.db_path or str(get_config_dir() / "traces.db")
+            )
             trace = store.get(trace_id)
             if trace is None:
                 raise HTTPException(status_code=404, detail="Trace not found")
@@ -1747,6 +2239,13 @@ def create_agent_manager_router(
             saved.append(key)
         return {"saved": saved}
 
+    @tools_router.delete("/{tool_name}/credentials/{key}")
+    def remove_tool_credential(tool_name: str, key: str):
+        from openjarvis.core.credentials import delete_credential
+
+        delete_credential(tool_name, key)
+        return {"deleted": key}
+
     @tools_router.get("/{tool_name}/credentials/status")
     def credential_status(tool_name: str):
         from openjarvis.core.credentials import get_credential_status
@@ -1772,14 +2271,14 @@ def create_agent_manager_router(
         import httpx
 
         try:
-            resp = httpx.get(
-                "https://api.sendblue.co/api/lines",
-                headers={
-                    "sb-api-key-id": api_key_id,
-                    "sb-api-secret-key": api_secret_key,
-                },
-                timeout=15.0,
-            )
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    "https://api.sendblue.co/api/lines",
+                    headers={
+                        "sb-api-key-id": api_key_id,
+                        "sb-api-secret-key": api_secret_key,
+                    },
+                )
             if resp.status_code == 401:
                 raise HTTPException(
                     status_code=401,
@@ -1799,12 +2298,16 @@ def create_agent_manager_router(
             )
             numbers = []
             for line in lines:
-                num = (
-                    line.get("number")
-                    or line.get("phone_number")
-                    or line.get("from_number")
-                    or (line if isinstance(line, str) else "")
-                )
+                if isinstance(line, str):
+                    num = line
+                elif isinstance(line, dict):
+                    num = (
+                        line.get("number")
+                        or line.get("phone_number")
+                        or line.get("from_number")
+                    )
+                else:
+                    num = None
                 if num:
                     numbers.append(num)
             return {
@@ -1836,18 +2339,18 @@ def create_agent_manager_router(
         import httpx
 
         try:
-            resp = httpx.post(
-                "https://api.sendblue.co/api/account/webhooks",
-                headers={
-                    "sb-api-key-id": api_key_id,
-                    "sb-api-secret-key": api_secret_key,
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "receive": webhook_url,
-                },
-                timeout=15.0,
-            )
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    "https://api.sendblue.co/api/account/webhooks",
+                    headers={
+                        "sb-api-key-id": api_key_id,
+                        "sb-api-secret-key": api_secret_key,
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "receive": webhook_url,
+                    },
+                )
             return {
                 "registered": resp.status_code < 300,
                 "status": resp.status_code,
@@ -1887,16 +2390,16 @@ def create_agent_manager_router(
             if from_number:
                 payload["from_number"] = from_number
 
-            resp = httpx.post(
-                "https://api.sendblue.co/api/send-message",
-                headers={
-                    "sb-api-key-id": api_key_id,
-                    "sb-api-secret-key": api_secret_key,
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=15.0,
-            )
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    "https://api.sendblue.co/api/send-message",
+                    headers={
+                        "sb-api-key-id": api_key_id,
+                        "sb-api-secret-key": api_secret_key,
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
             return {
                 "sent": resp.status_code < 300,
                 "status": resp.status_code,

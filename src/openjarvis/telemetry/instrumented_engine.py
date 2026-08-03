@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator
 from typing import Any, Dict, List, Optional, Sequence
 
 from openjarvis.core.events import EventBus, EventType
-from openjarvis.core.types import Message, TelemetryRecord
+from openjarvis.core.types import TOKEN_COUNTING_VERSION, Message, TelemetryRecord
 from openjarvis.engine._stubs import InferenceEngine, StreamChunk
 from openjarvis.telemetry.gpu_monitor import GpuSample
 
@@ -233,6 +233,11 @@ class InstrumentedEngine(InferenceEngine):
             gpu_energy_joules=gpu_energy_joules,
             dram_energy_joules=dram_energy_joules,
             tokens_per_joule=tokens_per_joule,
+            # Stamp every new record with the current methodology version
+            # so the leaderboard aggregator can drop legacy rows (those
+            # left NULL by pre-fix builds) cleanly. Source of truth for
+            # the integer is `server/savings.py`.
+            token_counting_version=TOKEN_COUNTING_VERSION,
         )
 
         event_data = {
@@ -255,9 +260,11 @@ class InstrumentedEngine(InferenceEngine):
             "mean_itl_ms": mean_itl_ms,
             "energy_method": energy_method,
             "energy_vendor": energy_vendor,
-            # Rich trace data: model response content
+            # Rich trace data: model response content + structured blocks
             "content": result.get("content", ""),
             "tool_calls": result.get("tool_calls", []),
+            "tool_results": result.get("tool_results", []),
+            "content_blocks": result.get("content_blocks", []),
             "finish_reason": result.get("finish_reason", ""),
         }
 
@@ -452,6 +459,8 @@ class InstrumentedEngine(InferenceEngine):
             gpu_energy_joules=gpu_energy_joules,
             dram_energy_joules=dram_energy_joules,
             tokens_per_joule=tokens_per_joule,
+            # Stamp the methodology version on streaming records too.
+            token_counting_version=TOKEN_COUNTING_VERSION,
         )
 
         event_data = {

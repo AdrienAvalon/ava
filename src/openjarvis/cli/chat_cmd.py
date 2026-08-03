@@ -11,7 +11,9 @@ from rich.markdown import Markdown
 
 from openjarvis.cli._tool_names import resolve_tool_names
 from openjarvis.core.config import load_config
+from openjarvis.core.events import EventBus
 from openjarvis.core.types import Message, Role
+from openjarvis.memory import publish_completed_exchange
 
 
 def _read_input(prompt: str = "You> ") -> Optional[str]:
@@ -28,12 +30,22 @@ def _read_input(prompt: str = "You> ") -> Optional[str]:
 @click.option("-a", "--agent", "agent_name", default=None, help="Agent type.")
 @click.option("--tools", default=None, help="Comma-separated tool names.")
 @click.option("--system", "system_prompt", default=None, help="Custom system prompt.")
+@click.option(
+    "--persona",
+    "persona_name",
+    default=None,
+    help=(
+        "Named persona dir under ~/.openjarvis/personas/<name>/ "
+        "(overrides config). Pass 'none' to disable all persona files."
+    ),
+)
 def chat(
     engine_key: str | None,
     model_name: str | None,
     agent_name: str | None,
     tools: str | None,
     system_prompt: str | None,
+    persona_name: str | None,
 ) -> None:
     """Start an interactive multi-turn chat session.
 
@@ -47,6 +59,15 @@ def chat(
     console = Console(stderr=True)
 
     config = load_config()
+    bus = EventBus(record_history=False)
+
+    import dataclasses as _dc
+
+    effective_mf = (
+        _dc.replace(config.memory_files, persona_name=persona_name)
+        if persona_name is not None
+        else config.memory_files
+    )
 
     # Resolve engine
     from openjarvis.engine import get_engine
@@ -79,12 +100,11 @@ def chat(
     if agent_key and agent_key != "none":
         try:
             import openjarvis.agents  # noqa: F401 — trigger registration
-            from openjarvis.core.events import EventBus
             from openjarvis.core.registry import AgentRegistry
 
             if AgentRegistry.contains(agent_key):
                 agent_cls = AgentRegistry.get(agent_key)
-                kwargs: dict = {"bus": EventBus()}
+                kwargs: dict = {"bus": bus}
 
                 if getattr(agent_cls, "accepts_tools", False):
                     tool_names_list = resolve_tool_names(
@@ -121,6 +141,21 @@ def chat(
 
                     kwargs["interactive"] = True
                     kwargs["confirm_callback"] = _confirm
+
+                import inspect as _inspect
+
+                if (
+                    "prompt_builder"
+                    in _inspect.signature(agent_cls.__init__).parameters
+                ):
+                    from openjarvis.prompt.builder import SystemPromptBuilder
+
+                    kwargs["prompt_builder"] = SystemPromptBuilder(
+                        agent_template=config.agent.default_system_prompt or "",
+                        memory_files_config=effective_mf,
+                        system_prompt_config=config.system_prompt,
+                    )
+
                 agent = agent_cls(engine, model, **kwargs)
         except Exception as exc:
             console.print(f"[yellow]Agent '{agent_key}' failed: {exc}[/yellow]")
@@ -133,13 +168,52 @@ def chat(
         f"  Type /help for commands, /quit to exit.\n"
     )
 
+    # Background-work status banner (disappears after first user message)
+    from openjarvis.cli._bg_state import get_status
+    from openjarvis.cli._chat_banner import render_startup_banner
+
+    _banner = render_startup_banner(get_status())
+    if _banner:
+        console.print(f"[dim cyan]{_banner}[/dim cyan]")
+
+    # Completion-notification dispatcher (fires once per task per session)
+    from openjarvis.cli._chat_notifications import NotificationDispatcher
+
+    _notifications = NotificationDispatcher(get_status())
+
+    # Automatic long-term memory — extracts durable facts in the background.
+    memory_service = None
+    try:
+        from openjarvis.memory import build_memory_service
+
+        memory_service = build_memory_service(config, engine, model, event_bus=bus)
+        if memory_service is not None:
+            memory_service.start()
+            console.print("[dim]  Memory: active[/dim]")
+    except Exception as exc:
+        console.print(f"[yellow]Memory service unavailable: {exc}[/yellow]")
+        memory_service = None
+
     # Conversation state
+    if not system_prompt:
+        from openjarvis.prompt.builder import SystemPromptBuilder
+
+        builder = SystemPromptBuilder(
+            agent_template=config.agent.default_system_prompt or "",
+            memory_files_config=effective_mf,
+            system_prompt_config=config.system_prompt,
+        )
+        system_prompt = builder.build()
+
     history: List[Message] = []
     if system_prompt:
         history.append(Message(role=Role.SYSTEM, content=system_prompt))
 
     # REPL loop
     while True:
+        for note in _notifications.diff(get_status()):
+            console.print(f"[dim cyan]{note}[/dim cyan]")
+
         user_input = _read_input()
         if user_input is None:
             console.print("\n[dim]Goodbye![/dim]")
@@ -207,10 +281,20 @@ def chat(
             console.print()
             console.print(Markdown(content))
             console.print()
+
+            publish_completed_exchange(
+                bus,
+                user_input,
+                content,
+                source="cli.chat",
+            )
         except KeyboardInterrupt:
             console.print("\n[dim]Generation interrupted.[/dim]")
         except Exception as exc:
             console.print(f"\n[red]Error: {exc}[/red]\n")
+
+    if memory_service is not None:
+        memory_service.stop()
 
 
 __all__ = ["chat"]

@@ -6,6 +6,7 @@ import { oidcConfig } from './components/auth/oidcConfig';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import App from './App';
 import { initApiBase } from './lib/api';
+import { initAnalytics } from './lib/analytics';
 import './index.css';
 
 // Same-origin API auth: prepend Authorization: Bearer <key> to /v1/* and /api/*
@@ -58,6 +59,10 @@ applyTheme();
 // This ensures JARVIS_PORT is defined in one place (the Rust backend).
 // In non-Tauri environments this is a no-op.
 initApiBase().finally(() => {
+  // Kick off analytics init in the background — it's never awaited so
+  // a slow/failed identity fetch never delays UI render.
+  void initAnalytics();
+
   createRoot(document.getElementById('root')!).render(
     <StrictMode>
       <ErrorBoundary>
