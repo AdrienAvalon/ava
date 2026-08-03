@@ -122,3 +122,9 @@ frontend/tsconfig.tsbuildinfo
 
 # Auto-copied from node_modules at build time (see frontend/scripts/prepare-onnx-wasm.sh)
 frontend/public/onnx/
+
+# Binaires ONNX Runtime — 95 Mo, RECONSTRUITS a chaque build par `prepare:wasm`
+# (script `prebuild` de frontend/package.json). Les versionner gonfle le depot de
+# facon DEFINITIVE : git conserve les objets meme apres suppression du fichier.
+frontend/public/assets/ort*
+frontend/public/assets/*.wasm
