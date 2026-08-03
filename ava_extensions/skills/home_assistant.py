@@ -4,17 +4,32 @@ C'est la source qui distingue Ava d'un assistant générique : elle seule sait q
 maison, quelle température il fait dans quelle pièce, ce qui consomme, si le chauffage
 tourne. Les autres outils décrivent l'infrastructure ; celui-ci décrit le monde réel.
 
-⚠ LECTURE SEULE, DÉLIBÉRÉMENT. Le jeton dont Ava dispose autorise techniquement l'écriture
-  (allumer, chauffer, ouvrir). Cet outil ne l'expose pas : une IA qui INTERPRÈTE une
-  demande ambiguë et agit sur le chauffage d'une maison où vivent des personnes âgées est
-  un risque d'une autre nature que se tromper dans une réponse. Le pilotage viendra
-  éventuellement plus tard, avec des garde-fous explicites et un arbitrage séparé.
+⚠ IL NE PARLE PAS À HOME ASSISTANT — IL LIT LE CONTROL PLANE. C'est la décision de
+  conception la plus importante de ce fichier, et elle n'est pas un détour technique.
 
-⚠ RÉSEAU : Ava est en DMZ (192.168.100.15), Home Assistant sur le LAN (192.168.2.41).
-  La séparation de zones interdit ce trajet par défaut ; une règle nftables NOMMÉE
-  l'autorise (une IP, une destination, un port — cf. host_vars/firewall.yml du dépôt
-  infra_avalon). Sans elle, les appels échouent en TIMEOUT et non en erreur claire :
-  si cet outil ne répond plus, vérifier le pare-feu AVANT de suspecter Home Assistant.
+  Home Assistant vit sur le LAN (192.168.2.41) : un hub domotique DOIT partager le segment
+  de ses objets, mDNS et SSDP étant du multicast qui ne route pas. Ava vit en DMZ
+  (192.168.100.15) parce qu'elle exécute du code tiers et parle à des API externes. Les
+  deux placements sont justes, et pris isolément ils semblent imposer une règle pare-feu
+  DMZ → LAN — la première de cette infrastructure, dont l'asymétrie (LAN → DMZ, jamais
+  l'inverse) est le cœur de la séparation de zones.
+
+  Cette règle a été posée le 2026-08-03, puis RETIRÉE le jour même. Le control plane
+  tourne sur AVA, machine DUAL-HOMED : il atteint HA sans traverser la moindre frontière,
+  et Ava l'interroge par un chemin déjà ouvert (celui de `avalon_status`). Zéro règle
+  nouvelle.
+
+  ⚠ ET LE GAIN N'EST PAS QUE COMPTABLE. Le jeton HA autorise l'ÉCRITURE : allumer,
+    chauffer, ouvrir. L'accès direct plaçait ce pouvoir dans une VM qui exécute du code
+    tiers. Le module du control plane est en lecture seule et ne renvoie que des valeurs :
+    même compromise, Ava ne peut rien commander. C'est une réduction de portée, pas
+    seulement une économie de règle.
+
+⚠ SI CET OUTIL NE RÉPOND PLUS, ce n'est pas Home Assistant qu'il faut regarder en premier
+  mais le module `home_assistant` du control plane (`GET /api/v1/dashboard`). Deux pannes
+  distinctes se présentent identiquement côté Ava : le CP injoignable, et le CP joignable
+  dont le module est dégradé. Le code ci-dessous les distingue explicitement — c'est ce qui
+  évite de chercher une heure du mauvais côté.
 """
 from __future__ import annotations
 
@@ -28,170 +43,131 @@ from openjarvis.core.registry import ToolRegistry
 from openjarvis.core.types import ToolResult
 from openjarvis.tools._stubs import BaseTool, ToolSpec
 
-HA_URL = os.environ.get("HA_URL", "http://192.168.2.41:8123")
+# Patte DMZ d'AVA. ⚠ Pas le hostname public `control.avalon-network.com` : il est derrière
+# Cloudflare Access, une requête serveur s'y ferait rediriger vers un portail de connexion
+# et échouerait sans dire pourquoi. Même piège que l'endpoint interne de Renovate.
+CP_URL = os.environ.get("CP_URL", "http://192.168.100.31:8100")
 _TIMEOUT_S = 10.0
 
-# ⚠ CE QUE L'ON EXPOSE EST UNE SÉLECTION, PAS UN DÉVERSEMENT. Home Assistant compte plus
-#   de 650 entités, dont l'immense majorité est du réglage (seuils d'alarme, minuteurs,
-#   luminosité d'écran des prises). Tout envoyer au modèle coûterait cher, noierait le
-#   signal, et l'exposerait à des valeurs qu'il interpréterait de travers.
-#   Chaque entrée ci-dessous répond à une question qu'on pose réellement à voix haute.
-DOMAINES = {
-    "presence": {
-        "titre": "Qui est là",
-        "entites": [
-            ("Adrien", "person.adrien_cros"),
-            ("Aurélie", "person.aurelie_ruffray"),
-            ("Annie", "person.annie_cros"),
-            ("Jean-Pierre", "person.jean_pierre_cros"),
-        ],
-        # ⚠ `zone.home` EST le nombre de personnes présentes, calculé par HA sur les
-        #   coordonnées. Ne jamais recompter en comparant les états textuels : une app
-        #   companion publie parfois le nom d'une zone supprimée, et le compte tombe faux
-        #   (mesuré : 4 réels contre 2 comptés à la main).
-        "compteur": ("À la maison", "zone.home"),
-    },
-    "climat": {
-        "titre": "Températures",
-        "entites": [
-            ("Extérieur", "sensor.temperature_exterieure"),
-            ("Grange (moyenne)", "sensor.temperature_moyenne_grange"),
-            ("Parents (moyenne)", "sensor.temperature_moyenne_parents"),
-            ("Salon", "sensor.temp_salon_temperature"),
-            ("Cuisine", "sensor.temp_cuisine_temperature"),
-            ("Chambre", "sensor.temp_chambre_temperature"),
-            ("Salle de bain", "sensor.temp_salle_de_bain_temperature"),
-            ("Salle de bain étage (parents)", "sensor.salle_de_bain_etage_temperature"),
-        ],
-    },
-    "chauffage": {
-        "titre": "Chauffage des parents",
-        # ⚠ On lit les `sensor.*_mode` et NON les `climate.*` : ces derniers sont en
-        #   `unknown` permanent (l'intégration Tuya ne sait traduire ni « Standby », ni
-        #   « Comfort », ni « Anti_forst »). Interroger le climate rendrait « inconnu »
-        #   sur un chauffage qui fonctionne parfaitement.
-        "entites": [
-            ("Radiateur salon", "sensor.radiateur_salon_mode"),
-            ("Radiateur salle à manger", "sensor.radiateur_salle_a_manger_mode"),
-            ("Radiateur véranda", "sensor.radiateur_salon_veranda_mode"),
-            ("Thermostat maison", "sensor.thermostat_maison_mode"),
-            ("Ballon eau chaude", "sensor.ballon_eau_chaude_local_temperature"),
-            ("Disjoncteur chaufferie", "sensor.disjoncteur_chaufferie_local_etat"),
-        ],
-    },
-    "energie": {
-        "titre": "Consommation",
-        "entites": [
-            ("Baie serveur", "sensor.baie_serveur_local_puissance"),
-            ("Température baie", "sensor.baie_serveur_local_temperature"),
-            ("Chaufferie", "sensor.disjoncteur_chaufferie_local_puissance"),
-            ("Tension secteur", "sensor.baie_serveur_local_tension_b"),
-        ],
-    },
-    "maison": {
-        "titre": "État de la maison",
-        "entites": [
-            ("Lumière salon", "light.salon_local"),
-            ("Lumière cuisine", "light.cuisine_local"),
-            ("Lumière chambre gauche", "light.chambre_gauche_local"),
-            ("Lumière bureau", "light.bureau_local"),
-            ("Projecteur parking", "light.parking_projecteur"),
-            ("Détection personne (parking)", "binary_sensor.parking_personne"),
-            ("Météo", "weather.meteo_france"),
-        ],
-    },
-}
-
-# Vocabulaire des appareils traduit — le modèle recevrait sinon « Standby » ou
-# « remote_on », qu'il restituerait tels quels à l'oral.
-_LISIBLE = {
-    "Standby": "arrêt", "Comfort": "confort", "Anti_forst": "hors-gel",
-    "eco": "éco", "auto": "auto", "home": "normal", "temporary": "dérogation",
-    "on": "allumé", "off": "éteint", "remote_on": "sous tension",
-    "remote_off": "coupé à distance", "normal": "normal",
-    "home_zone": "à la maison", "not_home": "absent",
-    "unknown": "inconnu", "unavailable": "indisponible",
-    # ⚠ LES 15 CONDITIONS MÉTÉO, pas seulement celles déjà rencontrées. Sans cette liste
-    #   complète, le modèle recevait « lightning » (constaté au premier test réel) et
-    #   l'aurait restitué tel quel à l'oral. Même défaut que la page d'accueil Home
-    #   Assistant, corrigé le même jour : on ne traduit pas ce qu'on a vu passer, on
-    #   traduit ce que la source peut produire.
-    "clear-night": "nuit claire", "cloudy": "nuageux",
-    "exceptional": "conditions exceptionnelles", "fog": "brouillard",
-    "hail": "grêle", "lightning": "orage", "lightning-rainy": "orage et pluie",
-    "partlycloudy": "éclaircies", "pouring": "fortes pluies", "rainy": "pluie",
-    "snowy": "neige", "snowy-rainy": "pluie et neige", "sunny": "ensoleillé",
-    "windy": "venteux", "windy-variant": "venteux",
-}
+# ⚠ Les domaines sont des VUES sur la donnée du CP, pas des requêtes distinctes. Un seul
+#   appel rapporte tout ; le filtre sert à ne pas noyer le modèle quand la question est
+#   précise (« il fait combien dans la chambre ? » n'a pas besoin de la consommation).
+DOMAINES = ("presence", "climat", "chauffage", "energie", "maison")
 
 
-def _jeton() -> str:
-    """Jeton DÉDIÉ à Ava, distinct de celui de l'admin (donc révocable seul)."""
-    return os.environ.get("HA_TOKEN", "")
-
-
-def _etats() -> dict[str, dict[str, Any]]:
+def _dashboard() -> dict[str, Any]:
     req = urllib.request.Request(
-        f"{HA_URL}/api/states",
-        headers={"Authorization": f"Bearer {_jeton()}", "Accept": "application/json"},
+        f"{CP_URL}/api/v1/dashboard", headers={"Accept": "application/json"}
     )
-    with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
-        brut = json.loads(resp.read().decode("utf-8"))
-    return {e["entity_id"]: e for e in brut}
+    with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:  # noqa: S310
+        return json.loads(resp.read().decode("utf-8"))
 
 
-def _valeur(etats: dict[str, dict[str, Any]], eid: str) -> str | None:
-    """Valeur lisible d'une entité, ou None si elle ne dit rien d'exploitable.
+def _nombre(v: Any, unite: str = "") -> str | None:
+    """Formate une mesure, ou rend None si elle manque.
 
-    ⚠ On rend `None` — et non « 0 » ou « inconnu » — quand la donnée manque. Un zéro
-      inventé se propage : le modèle l'affirmerait à l'oral avec assurance. C'est le
-      défaut exact qui faisait dire à l'outil `avalon_status` « aucune alerte » alors
-      qu'une alerte tirait.
+    ⚠ Jamais « 0 » ni « inconnu » par défaut : un zéro inventé se propage et le modèle
+      l'affirmerait à l'oral avec assurance. C'est le défaut exact qui faisait dire à
+      l'outil `avalon_status` « aucune alerte » pendant qu'une alerte tirait.
     """
-    e = etats.get(eid)
-    if not e:
+    if v is None:
         return None
-    etat = str(e.get("state", "")).strip()
-    if etat.lower() in ("unknown", "unavailable", "none", ""):
-        return None
-    attrs = e.get("attributes") or {}
-    unite = attrs.get("unit_of_measurement")
-    if eid.startswith("weather."):
-        cond = _LISIBLE.get(etat, etat)
-        t = attrs.get("temperature")
-        return f"{cond}, {t} °C" if t is not None else cond
-    if eid.startswith("person."):
-        return "à la maison" if etat not in ("not_home",) else "absent"
-    lisible = _LISIBLE.get(etat, etat)
-    return f"{lisible} {unite}".strip() if unite else lisible
+    if isinstance(v, float):
+        # Virgule décimale : le modèle lit le texte tel quel, et « 25.4 » se dit
+        # « vingt-cinq point quatre » par un moteur vocal français.
+        return f"{v:.1f}".replace(".", ",") + unite
+    return f"{v}{unite}"
 
 
-def _resume(etats: dict[str, dict[str, Any]], domaine: str | None) -> str:
-    demandes = [domaine] if domaine and domaine in DOMAINES else list(DOMAINES)
+def _presence(d: dict[str, Any]) -> list[str]:
     lignes: list[str] = []
-    for cle in demandes:
-        d = DOMAINES[cle]
-        bloc: list[str] = []
-        compteur = d.get("compteur")
-        if compteur:
-            v = _valeur(etats, compteur[1])
-            if v is not None:
-                bloc.append(f"  {compteur[0]} : {v}")
-        for nom, eid in d["entites"]:
-            v = _valeur(etats, eid)
-            if v is not None:
-                bloc.append(f"  {nom} : {v}")
+    n = d.get("a_la_maison")
+    if n is not None:
+        lignes.append(f"  À la maison : {n} personne(s)")
+    for nom, etat in (d.get("presence") or {}).items():
+        lignes.append(f"  {nom} : {etat}")
+    return lignes
+
+
+def _climat(d: dict[str, Any]) -> list[str]:
+    lignes: list[str] = []
+    t = d.get("temperatures") or {}
+    for cle, libelle in (("exterieur", "Extérieur"), ("grange", "Grange (moyenne)"),
+                         ("parents", "Parents (moyenne)")):
+        v = _nombre(t.get(cle), " °C")
+        if v:
+            lignes.append(f"  {libelle} : {v}")
+    for piece, valeur in (d.get("pieces") or {}).items():
+        v = _nombre(valeur, " °C")
+        if v:
+            lignes.append(f"  {piece} : {v}")
+    meteo = d.get("meteo")
+    if meteo:
+        tm = _nombre(d.get("meteo_temperature"), " °C")
+        lignes.append(f"  Météo : {meteo}" + (f", {tm}" if tm else ""))
+    return lignes
+
+
+def _chauffage(d: dict[str, Any]) -> list[str]:
+    lignes: list[str] = []
+    for nom, info in (d.get("chauffage") or {}).items():
+        etat = info.get("mode", "?")
+        # ⚠ `chauffe` répond à la vraie question — « est-ce que ça chauffe MAINTENANT » —
+        #   qui est distincte du mode. Une vanne en « confort » avec `chauffe: false` a
+        #   atteint sa consigne ; dire seulement « confort » laisserait croire l'inverse.
+        actif = " (chauffe actuellement)" if info.get("chauffe") else ""
+        ouv = info.get("ouverture")
+        detail = f", vanne à {ouv} %" if isinstance(ouv, (int, float)) else ""
+        lignes.append(f"  {nom} : {etat}{actif}{detail}")
+    return lignes
+
+
+def _energie(d: dict[str, Any]) -> list[str]:
+    e = d.get("energie") or {}
+    paires = (
+        ("baie_serveur_kw", "Baie serveur", " kW"),
+        ("chaufferie_kw", "Chaufferie", " kW"),
+        ("baie_temperature_c", "Température baie", " °C"),
+        ("tension_v", "Tension secteur", " V"),
+    )
+    return [f"  {lib} : {v}" for cle, lib, u in paires if (v := _nombre(e.get(cle), u))]
+
+
+def _maison(d: dict[str, Any]) -> list[str]:
+    return [f"  {nom} : {val}" for nom, val in (d.get("maison") or {}).items()]
+
+
+_VUES = {
+    "presence": ("Qui est là", _presence),
+    "climat": ("Températures", _climat),
+    "chauffage": ("Chauffage des parents", _chauffage),
+    "energie": ("Consommation", _energie),
+    "maison": ("État de la maison", _maison),
+}
+
+
+def _resume(d: dict[str, Any], domaine: str | None) -> str:
+    cles = [domaine] if domaine in _VUES else list(_VUES)
+    sortie: list[str] = []
+    for cle in cles:
+        titre, rendu = _VUES[cle]
+        bloc = rendu(d)
         if bloc:
-            lignes.append(f"{d['titre']} :")
-            lignes.extend(bloc)
-    if not lignes:
-        return "Aucune donnée exploitable renvoyée par Home Assistant."
-    return "\n".join(lignes)
+            sortie.append(f"{titre} :")
+            sortie.extend(bloc)
+    # Les piles se disent partout : c'est une action à prendre, pas un domaine.
+    piles = d.get("piles_faibles") or []
+    if piles and (domaine is None or domaine == "maison"):
+        noms = ", ".join(f"{p['nom']} ({p['niveau']:.0f} %)" for p in piles)
+        sortie.append(f"À changer : pile(s) faible(s) — {noms}")
+    if not sortie:
+        return "Aucune donnée exploitable dans le relevé de la maison."
+    return "\n".join(sortie)
 
 
 @ToolRegistry.register("home_assistant")
 class HomeAssistantTool(BaseTool):
-    """Lit l'état de la maison depuis Home Assistant (lecture seule)."""
+    """Lit l'état de la maison via le control plane Avalon (lecture seule)."""
 
     tool_id = "home_assistant"
     is_local = True
@@ -201,12 +177,12 @@ class HomeAssistantTool(BaseTool):
         return ToolSpec(
             name="home_assistant",
             description=(
-                "Lit l'état RÉEL de la maison depuis Home Assistant : qui est présent, "
-                "températures intérieures et extérieure, état du chauffage des parents, "
-                "consommation électrique, lumières allumées, météo locale, détection au "
-                "parking. À utiliser dès qu'Adrien pose une question sur la maison, la "
-                "température, le chauffage, la présence de quelqu'un, la consommation, ou "
-                "ce qui se passe chez lui. Lecture seule : cet outil ne pilote rien."
+                "Lit l'état RÉEL de la maison : qui est présent, températures par pièce et "
+                "à l'extérieur, état du chauffage des parents, consommation électrique, "
+                "lumières allumées, météo locale, détection au parking, piles à changer. "
+                "À utiliser dès qu'Adrien pose une question sur la maison, la température, "
+                "le chauffage, la présence de quelqu'un, la consommation, ou ce qui se "
+                "passe chez lui. Lecture seule : cet outil ne pilote rien."
             ),
             parameters={
                 "type": "object",
@@ -228,31 +204,21 @@ class HomeAssistantTool(BaseTool):
         )
 
     def execute(self, **params: Any) -> ToolResult:
-        if not _jeton():
+        try:
+            dash = _dashboard()
+        except urllib.error.HTTPError as exc:
             return ToolResult(
                 tool_name=self.tool_id,
-                content=(
-                    "Jeton Home Assistant absent (HA_TOKEN). Il est déployé dans le .env "
-                    "d'Ava depuis SOPS (clé homeassistant.ava_token)."
-                ),
+                content=f"Le control plane a refusé la requête : HTTP {exc.code}.",
                 success=False,
             )
-        try:
-            etats = _etats()
-        except urllib.error.HTTPError as exc:
-            # ⚠ 401 = jeton refusé ; c'est une cause DIFFÉRENTE d'un réseau coupé, et le
-            #   dire évite de partir chercher le pare-feu quand c'est le jeton.
-            detail = "jeton refusé (401)" if exc.code == 401 else f"HTTP {exc.code}"
-            return ToolResult(tool_name=self.tool_id,
-                              content=f"Home Assistant a refusé la requête : {detail}",
-                              success=False)
         except urllib.error.URLError as exc:
             return ToolResult(
                 tool_name=self.tool_id,
                 content=(
-                    f"Home Assistant injoignable ({HA_URL}) : {exc}. "
-                    "Vérifier la règle pare-feu DMZ→LAN avant de suspecter HA — sans "
-                    "elle l'appel expire sans erreur explicite."
+                    f"Control plane injoignable ({CP_URL}) : {exc}. La donnée de la maison "
+                    "transite par lui — ce n'est donc pas Home Assistant qu'il faut "
+                    "regarder en premier."
                 ),
                 success=False,
             )
@@ -260,10 +226,39 @@ class HomeAssistantTool(BaseTool):
             return ToolResult(tool_name=self.tool_id,
                               content=f"Erreur inattendue : {exc}", success=False)
 
+        modules = dash.get("modules") or {}
+        mod = modules.get("home_assistant")
+        if mod is None:
+            # ⚠ Cause DISTINCTE des précédentes : le CP répond, mais le module n'est pas
+            #   déployé ou est désactivé en configuration. Sans ce cas, on lirait un
+            #   dictionnaire vide et on répondrait « la maison n'a rien à dire » — une
+            #   phrase fausse qui ferait chercher du côté des capteurs.
+            return ToolResult(
+                tool_name=self.tool_id,
+                content=(
+                    "Le control plane répond mais ne publie aucun module `home_assistant` "
+                    "(non déployé, ou `enabled: false` dans config.production.yml)."
+                ),
+                success=False,
+            )
+
+        data = (dash.get("module_data") or {}).get("home_assistant") or {}
+        if mod.get("health") != "ok" or not data:
+            raison = data.get("_error") or mod.get("health") or "état inconnu"
+            return ToolResult(
+                tool_name=self.tool_id,
+                content=f"Le relevé de la maison est indisponible : {raison}.",
+                success=False,
+            )
+
         domaine = params.get("domaine")
         return ToolResult(
             tool_name=self.tool_id,
-            content=_resume(etats, domaine if isinstance(domaine, str) else None),
+            content=_resume(data, domaine if isinstance(domaine, str) else None),
             success=True,
-            metadata={"entites_lues": len(etats), "domaine": domaine or "tous"},
+            metadata={
+                "source": "control-plane",
+                "entites_lues": data.get("entites_totales"),
+                "domaine": domaine or "tous",
+            },
         )
