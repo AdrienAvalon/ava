@@ -226,9 +226,16 @@ class HomeAssistantTool(BaseTool):
             return ToolResult(tool_name=self.tool_id,
                               content=f"Erreur inattendue : {exc}", success=False)
 
-        modules = dash.get("modules") or {}
-        mod = modules.get("home_assistant")
-        if mod is None:
+        # ⚠ LA CLÉ EST `module_health`, PAS `modules`. Le dashboard n'expose que
+        #   `module_data`, `module_health`, `networks`, `score`, `version`, `widgets`.
+        #   J'ai écrit `modules` la première fois : la clé n'existant pas, `.get()` rendait
+        #   un dictionnaire vide et l'outil répondait « module non déployé » — un message
+        #   parfaitement clair et parfaitement faux, sur un module qui tournait. C'est le
+        #   défaut récurrent de ce projet : *une source qui ne porte pas la donnée répond
+        #   « rien » sans erreur.* Vérifier les clés réelles d'une réponse, ne pas les
+        #   supposer.
+        sante = (dash.get("module_health") or {}).get("home_assistant")
+        if sante is None:
             # ⚠ Cause DISTINCTE des précédentes : le CP répond, mais le module n'est pas
             #   déployé ou est désactivé en configuration. Sans ce cas, on lirait un
             #   dictionnaire vide et on répondrait « la maison n'a rien à dire » — une
@@ -242,9 +249,11 @@ class HomeAssistantTool(BaseTool):
                 success=False,
             )
 
+        # ⚠ `module_health` est un dict de CHAÎNES (`{"home_assistant": "ok"}`), pas
+        #   d'objets : `sante.get("health")` lèverait un AttributeError sur une str.
         data = (dash.get("module_data") or {}).get("home_assistant") or {}
-        if mod.get("health") != "ok" or not data:
-            raison = data.get("_error") or mod.get("health") or "état inconnu"
+        if sante != "ok" or not data:
+            raison = data.get("_error") or sante or "état inconnu"
             return ToolResult(
                 tool_name=self.tool_id,
                 content=f"Le relevé de la maison est indisponible : {raison}.",
