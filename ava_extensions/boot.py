@@ -63,7 +63,11 @@ def _patches() -> None:
 
 def _skills() -> None:
     # ⚠ TOUT NOUVEL OUTIL DOIT ÊTRE AJOUTÉ ICI (et la CI le vérifie).
-    from ava_extensions.skills import avalon_status, home_assistant  # noqa: F401
+    from ava_extensions.skills import (  # noqa: F401
+        avalon_status,
+        home_assistant,
+        memoire,
+    )
 
 
 def _sonde_routage() -> None:
