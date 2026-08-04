@@ -96,6 +96,7 @@ jobs:
               ("outil", ToolRegistry, "home_assistant"),
               ("outil", ToolRegistry, "memoire"),
               ("outil", ToolRegistry, "journal"),
+              ("outil", ToolRegistry, "logs"),
               ("voix", TTSRegistry, "kokoro-fr"),
               ("dictee", SpeechRegistry, "openai_ava"),
           ]

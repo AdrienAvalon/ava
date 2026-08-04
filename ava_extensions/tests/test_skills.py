@@ -333,7 +333,7 @@ def test_charger_attrape_AUSSI_les_erreurs_d_execution() -> None:
 
 
 @pytest.mark.parametrize(
-    "cle", ["avalon_status", "home_assistant", "memoire", "journal"]
+    "cle", ["avalon_status", "home_assistant", "memoire", "journal", "logs"]
 )
 def test_l_outil_est_REELLEMENT_enregistre(cle: str) -> None:
     """⚠ AUCUN TEST NE VERIFIAIT CECI, et c'est le seul qui attraperait la panne.

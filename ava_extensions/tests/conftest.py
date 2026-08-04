@@ -41,6 +41,7 @@ _MODULES_PAR_CLE: tuple[tuple[str, str, str], ...] = (
     ("ToolRegistry", "home_assistant", "ava_extensions.skills.home_assistant"),
     ("ToolRegistry", "memoire", "ava_extensions.skills.memoire"),
     ("ToolRegistry", "journal", "ava_extensions.skills.journal"),
+    ("ToolRegistry", "logs", "ava_extensions.skills.logs"),
 )
 
 
