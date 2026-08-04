@@ -11,7 +11,7 @@ import os
 import threading
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
@@ -147,3 +147,49 @@ def prewarm_kokoro() -> None:
             logger.warning("kokoro-fr prewarm failed: %s", exc)
 
     threading.Thread(target=_worker, daemon=True, name="kokoro-prewarm").start()
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# Mémoire de conversation — cloisonnée par utilisateur OIDC
+# ══════════════════════════════════════════════════════════════════════════════════════
+# ⚠ Ces routes vivent ici plutôt que dans un routeur séparé pour une raison pratique :
+#   `server/app.py` (fichier AMONT, donc source de conflits à chaque synchronisation)
+#   inclut déjà CE routeur. En créer un second obligerait à patcher `app.py` une fois de
+#   plus — le dépôt en compte déjà 4, et chacun se paie à chaque merge upstream.
+
+
+@router.get("/conversation")
+async def lire_conversation(request: Request) -> dict:
+    """Historique de l'utilisateur courant, du plus ancien au plus récent."""
+    from ava_extensions.server import conversation as conv
+
+    utilisateur = conv.identite(request.headers)
+    lignes = conv.lire(utilisateur, limite=400)
+    return {"utilisateur": utilisateur, "lignes": lignes}
+
+
+@router.post("/conversation")
+async def ajouter_conversation(request: Request) -> dict:
+    """Ajoute des lignes à l'historique de l'utilisateur courant.
+
+    ⚠ L'utilisateur n'est JAMAIS pris dans le corps de la requête : il est dérivé du
+      jeton. Accepter un champ `utilisateur` transmis par le client laisserait n'importe
+      qui écrire dans la mémoire d'un autre — le cloisonnement ne vaudrait rien.
+    """
+    from ava_extensions.server import conversation as conv
+
+    corps = await request.json()
+    lignes = corps.get("lignes") or []
+    if not isinstance(lignes, list):
+        raise HTTPException(status_code=400, detail="`lignes` doit être une liste")
+    utilisateur = conv.identite(request.headers)
+    return {"ecrites": conv.ajouter(utilisateur, lignes)}
+
+
+@router.delete("/conversation")
+async def effacer_conversation(request: Request) -> dict:
+    """Efface l'historique de l'utilisateur courant — et de lui seul."""
+    from ava_extensions.server import conversation as conv
+
+    utilisateur = conv.identite(request.headers)
+    return {"effacees": conv.effacer(utilisateur)}

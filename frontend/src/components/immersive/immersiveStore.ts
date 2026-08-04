@@ -71,6 +71,8 @@ interface ImmersiveStore {
   /** Ferme la ligne d'Ava en cours (fin de réponse). */
   endAvaStream: () => void;
   clearTranscript: () => void;
+  /** Remplace l'historique par celui du serveur (source de vérité inter-appareils). */
+  hydraterDepuisServeur: (lignes: TurnLine[]) => void;
   setCognitive: (c: Partial<CognitiveSignals>) => void;
   clearCognitive: () => void;
 }
@@ -234,6 +236,22 @@ export const useImmersiveStore = create<ImmersiveStore>((set) => ({
     sauverTranscript([]);
     set({ transcript: [] });
   },
+
+  /**
+   * Remplace l'historique par celui du SERVEUR.
+   *
+   * ⚠ Le cache local (`localStorage`) reste utilisé comme affichage IMMÉDIAT au
+   *   chargement — le serveur répond en quelques dizaines de millisecondes, mais une
+   *   page qui s'ouvre vide puis se remplit donne l'impression d'avoir tout perdu.
+   *   Le serveur fait ensuite autorité : c'est lui qui suit l'utilisateur d'un
+   *   appareil à l'autre.
+   */
+  hydraterDepuisServeur: (lignes) =>
+    set(() => {
+      const transcript = lignes.slice(-MAX_LIGNES);
+      sauverTranscript(transcript);
+      return { transcript };
+    }),
   setCognitive: (c) => set((prev) => ({ cognitive: { ...prev.cognitive, ...c } })),
   clearCognitive: () => set({ cognitive: { ...emptyCognitive } }),
 }));

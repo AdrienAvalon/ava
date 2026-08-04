@@ -1,5 +1,6 @@
-import { useRef } from 'react';
+import { useEffect, useRef } from 'react';
 import { chargerHistoriqueModele, useImmersiveStore } from './immersiveStore';
+import { ajouterConversation, lireConversation } from './memoireServeur';
 
 interface Message {
   role: 'user' | 'assistant' | 'system';
@@ -180,6 +181,36 @@ export function useDaemonChat() {
    */
   const history = useRef<Message[]>(chargerHistoriqueModele() as Message[]);
   const abortCtrl = useRef<AbortController | null>(null);
+
+  /**
+   * ⚠ HYDRATATION DEPUIS LE SERVEUR — c'est ce qui rend la mémoire d'Ava indépendante du
+   *   navigateur. Le cache local a déjà peuplé l'écran (affichage immédiat) ; ici on
+   *   remplace par la vérité serveur, qui suit l'utilisateur d'un appareil à l'autre.
+   *
+   * ⚠ On met à jour AUSSI `history.current` : sans ça, l'écran afficherait la
+   *   conversation venue du serveur pendant qu'Ava, elle, ne connaîtrait que le cache
+   *   local — deux mémoires divergentes, et une IA qui se contredit sans qu'aucune
+   *   erreur n'apparaisse.
+   */
+  useEffect(() => {
+    let annule = false;
+    lireConversation().then((lignes) => {
+      if (annule || !lignes.length) return;
+      const s = useImmersiveStore.getState();
+      s.hydraterDepuisServeur(
+        lignes.map((l, i) => ({
+          id: -(lignes.length - i), // ids négatifs : jamais en collision avec le compteur local
+          role: (l.role === 'assistant' ? 'ava' : l.role) as 'user' | 'ava' | 'system',
+          text: l.texte,
+          at: new Date(l.horodatage * 1000).toLocaleTimeString('fr-FR', {
+            hour: '2-digit', minute: '2-digit',
+          }),
+        })),
+      );
+      history.current = chargerHistoriqueModele() as Message[];
+    });
+    return () => { annule = true; };
+  }, []);
   const inFlight = useRef(false);
   const currentSource = useRef<AudioBufferSourceNode | null>(null);
   const mutedRef = useRef(false);
@@ -356,6 +387,14 @@ export function useDaemonChat() {
       }
       if (assembled) {
         history.current.push({ role: 'assistant', content: assembled });
+        // ⚠ On persiste les DEUX lignes en un seul appel : la question et la réponse
+        //   forment un tour. Les envoyer séparément laisserait, en cas de coupure entre
+        //   les deux, une question sans réponse dans la mémoire d'Ava — elle croirait
+        //   n'avoir jamais répondu.
+        ajouterConversation([
+          { role: 'user', texte: userText },
+          { role: 'assistant', texte: assembled },
+        ]);
       } else {
         // ⚠ Une réponse vide doit se VOIR. Sans ce cas, l'interface resterait figée sur
         //   « réfléchit » sans rien afficher, et l'on croirait à un blocage réseau.
