@@ -91,6 +91,22 @@ def _resume(d: dict[str, Any]) -> str:
             ou = " et ".join(x.get("zones") or []) or "dans le champ"
             lignes.append(f"  EN CE MOMENT : {x['objet']} {ou}.")
 
+    # ⚠ LES ALERTES D'ABORD, ET SEPAREMENT DU RESTE. Mesure du 2026-08-04 : 5 evenements
+    #   « voiture » en 40 minutes de nuit, tous produits par les voitures GAREES
+    #   redetectees par salves — et zero alerte. Annoncer « 5 detections » sans dire
+    #   « aucune alerte » decrit la meme realite d'une facon inquietante. Ce qui compte
+    #   n'est pas combien il s'est passe de choses, c'est combien meritaient qu'on se leve.
+    r = d.get("revue")
+    if r:
+        if r.get("alertes"):
+            lignes.append(f"  ⚠ {r['alertes']} alerte(s) sur 24 h :")
+            for a in r.get("dernieres_alertes") or []:
+                quoi = " et ".join(a.get("objets") or ["quelque chose"])
+                ou = " et ".join(a.get("zones") or []) or "dans le champ"
+                lignes.append(f"    · {_quand(a.get('debut'))} — {quoi} {ou}")
+        else:
+            lignes.append("  Aucune alerte sur les dernières 24 h.")
+
     e = d.get("evenements_24h")
     if e and e.get("total"):
         # ⚠ ACCORD AU PLURIEL : Ava DIT ces phrases à voix haute. « 3 voiture » s'entend,

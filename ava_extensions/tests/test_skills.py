@@ -521,3 +521,27 @@ def test_camera_ACCORDE_au_pluriel(cam: Any) -> None:
     sortie = cam.CameraTool().execute().content
     assert "30 voitures" in sortie
     assert "30 voiture," not in sortie and "30 voiture " not in sortie
+
+
+def test_camera_dit_AUCUNE_ALERTE_quand_le_bruit_domine(cam: Any, monkeypatch: Any) -> None:
+    """⚠ « 5 detections » et « 5 detections, aucune alerte » decrivent la MEME realite,
+    l'une de facon inquietante et l'autre rassurante. Mesure du 2026-08-04 : les 5
+    evenements nocturnes etaient tous des voitures GAREES redetectees par salves, et
+    Frigate les classait correctement en `detection` — zero alerte. Ava doit le dire."""
+    dash = {**DASH_CAM, "module_data": {"frigate": {
+        **DASH_CAM["module_data"]["frigate"],
+        "revue": {"alertes": 0, "detections": 5, "dernieres_alertes": []},
+    }}}
+    monkeypatch.setattr(cam, "_dashboard", lambda: dash)
+    assert "Aucune alerte" in cam.CameraTool().execute().content
+
+
+def test_camera_RACONTE_les_alertes_quand_il_y_en_a(cam: Any, monkeypatch: Any) -> None:
+    dash = {**DASH_CAM, "module_data": {"frigate": {
+        **DASH_CAM["module_data"]["frigate"],
+        "revue": {"alertes": 1, "detections": 2, "dernieres_alertes": [
+            {"objets": ["personne"], "zones": ["le portail"], "debut": 1.0}]},
+    }}}
+    monkeypatch.setattr(cam, "_dashboard", lambda: dash)
+    s = cam.CameraTool().execute().content
+    assert "1 alerte" in s and "le portail" in s
