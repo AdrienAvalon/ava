@@ -74,6 +74,36 @@ def _skills() -> None:
     )
 
 
+def _journalisation() -> None:
+    """Rend les journaux d'`ava_extensions` VISIBLES dans journald, donc dans Loki.
+
+    ⚠ SANS CELA, TOUT CE QU'ECRIT NOTRE CODE EN `INFO` EST AVALE — mesure du
+      2026-08-04 : le daemon journalisait bien des INFO (uvicorn configure son propre
+      logging), mais le logger racine de Python reste a WARNING, donc nos
+      `logger.info(...)` ne sortaient nulle part. La perception tournait, ecrivait sa
+      base, et **rien ne permettait de le voir**.
+
+      C'est exactement le defaut qu'on vient de fermer trois fois aujourd'hui, sous une
+      quatrieme forme : un composant qui fonctionne sans laisser de trace se comporte,
+      pour l'observateur, comme un composant qui ne tourne pas. On l'aurait cru mort et
+      on serait parti chercher une panne inexistante.
+
+    ⚠ On ne touche PAS au logger racine : y poser un handler ferait remonter aussi tout
+      ce que journalisent les bibliotheques tierces (torch, httpx, anthropic), ce qui
+      noierait Loki pour un benefice nul. On ne configure que notre propre arbre.
+    """
+    import logging
+    import sys
+
+    racine = logging.getLogger("ava_extensions")
+    if not racine.handlers:
+        h = logging.StreamHandler(sys.stdout)
+        h.setFormatter(logging.Formatter("ava[%(name)s] %(levelname)s: %(message)s"))
+        racine.addHandler(h)
+    racine.setLevel(logging.INFO)
+    racine.propagate = False
+
+
 def _perception() -> None:
     """Demarre la perception continue d'Avalon (infra + maison).
 
@@ -106,6 +136,10 @@ def _sonde_routage() -> None:
     brancher_bus_serveur()
 
 
+# ⚠ EN PREMIER, avant tout le reste : c'est ce qui rend visibles les echecs des
+#   groupes suivants. Un `_charger` qui journalise un warning que personne ne voit
+#   equivaut a un echec silencieux.
+_charger("journalisation", _journalisation)
 _charger("backends voix (TTS/STT)", _backends)
 _charger("patches SDK Anthropic", _patches)
 _charger("outils Avalon", _skills)

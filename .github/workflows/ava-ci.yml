@@ -116,6 +116,23 @@ jobs:
           #   se comporte exactement comme un garde-fou qui marche.
           uv run python scripts/verifier-lecture-seule.py ava_extensions/skills/home_assistant.py
 
+      - name: "Invariant : Ava ne detient AUCUN jeton Matrix"
+        run: |
+          # ⚠ INVARIANT DE SECURITE, et c'est le cœur du montage de la parole.
+          #   Ava vit en DMZ et execute du code communautaire ainsi qu'un LLM. Elle parle
+          #   par `POST /api/v1/ava/message` du control plane, qui detient le jeton Matrix
+          #   pour `matrix_alerting` — le jeton ne quitte JAMAIS le CP. Ava ne connait
+          #   qu'un jeton de PAROLE dont le seul pouvoir est d'emettre dans un salon fixe.
+          #   Cette infrastructure a deja refuse le montage inverse (jeton Matrix sur une
+          #   VM exposee) pour Home Assistant, le 2026-08-02. Si un jour quelqu'un
+          #   « simplifie » en appelant Matrix en direct, tout le benefice disparait —
+          #   Ava pourrait alors LIRE les salons et usurper l'identite du bot.
+          if grep -rnE "_matrix/client|matrix\.avalon-network|m\.room\.message" \
+               ava_extensions/ --include="*.py" | grep -v "^ava_extensions/tests/"; then
+            echo "::error::appel Matrix DIRECT detecte — la parole doit passer par le control plane"
+            exit 1
+          fi
+
       # ⚠ `--select F` (pyflakes) EST BLOQUANT, `E501` NE L'EST PAS — et la distinction
       #   n'est pas du confort. C'est `F821` qui a trouvé, le 2026-08-04, un
       #   `CP_V2_URL` inexistant dans le gestionnaire d'erreur d'`avalon_status` : le

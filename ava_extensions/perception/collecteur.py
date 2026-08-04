@@ -48,6 +48,7 @@ import urllib.request
 from typing import Any
 
 from ava_extensions.perception import memoire_perception as memoire
+from ava_extensions.perception import parole
 from ava_extensions.perception.qualification import qualifier
 
 logger = logging.getLogger(__name__)
@@ -113,11 +114,16 @@ def observer_une_fois() -> int:
             "perception: %d fait(s), dont %d a signaler", len(faits), len(interruptions)
         )
         for f in interruptions:
-            # ⚠ Journalisé en WARNING : depuis le 2026-08-04 le journal d'Ava part vers
-            #   Loki, donc ces lignes sont cherchables et datées même si aucun canal de
-            #   parole n'existe encore. C'est ce qui rend la perception VÉRIFIABLE avant
-            #   qu'elle ne soit audible.
+            # ⚠ Journalisé en WARNING **en plus** d'être dit : le journal part vers Loki,
+            #   donc reste cherchable et daté même si la parole échoue (jeton absent,
+            #   Matrix injoignable). Une trace locale rend la perception vérifiable
+            #   indépendamment du canal — c'est ce qui permet de distinguer « Ava n'a
+            #   rien vu » de « Ava n'a pas pu le dire ».
             logger.warning("perception: %s — %s", f.sujet, f.fait)
+        # ⚠ La parole décide seule de se taire (anti-répétition, plafond horaire) : on
+        #   lui passe TOUS les faits, elle filtre. Centraliser la discipline à un seul
+        #   endroit évite que deux règles de silence divergent.
+        parole.dire(faits)
     return len(faits)
 
 
