@@ -79,11 +79,13 @@ def _sonde_routage() -> None:
     réglé ne tombe pas en panne — il rend de MAUVAISES réponses, bien plus difficiles à
     diagnostiquer.
     """
-    from openjarvis.core.events import get_event_bus
+    from ava_extensions.telemetry.routing_probe import brancher_bus_serveur
 
-    from ava_extensions.telemetry.routing_probe import brancher
-
-    brancher(get_event_bus())
+    # ⚠ PAS `brancher(get_event_bus())` : le serveur construit SON PROPRE `EventBus`
+    #   (`cli/serve.py`), pas le singleton global. La sonde a écouté pendant des heures
+    #   un bus que personne n'utilisait — « active », journal vide, aucun moyen de le
+    #   savoir. On s'abonne donc à la création de tout bus.
+    brancher_bus_serveur()
 
 
 _charger("backends voix (TTS/STT)", _backends)

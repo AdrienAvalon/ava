@@ -155,3 +155,48 @@ def brancher(bus: Any) -> bool:
         return False
     logger.info("routing-probe active → %s", CHEMIN)
     return True
+
+
+def brancher_bus_serveur() -> bool:
+    """Branche la sonde sur le bus RÉELLEMENT utilisé par le serveur.
+
+    ⚠ LA SONDE ÉCOUTAIT UN BUS QUE PERSONNE N'UTILISE — mesuré le 2026-08-04 : elle
+      était « active » depuis des heures et son journal était resté VIDE.
+      `boot.py` la branchait sur `get_event_bus()`, le singleton global. Or `cli/serve.py`
+      construit **son propre** `EventBus(record_history=False)` et ne le publie nulle part.
+      Deux bus distincts : les événements partaient dans l'un, la sonde écoutait l'autre.
+
+      ⚠ Le défaut est invisible par construction : `brancher()` réussissait, journalisait
+        « routing-probe active », et rien ne pouvait signaler que le bus était le mauvais.
+        C'est la même famille que le HUD qui affirmait une configuration qu'il ne lisait
+        pas — un composant qui rend compte de son intention, jamais de son effet.
+
+    ⚠ ON S'ABONNE À LA CRÉATION DE TOUT `EventBus`, et c'est délibérément direct. Le bus
+      de `serve.py` est une variable LOCALE, passée à une dizaine de composants mais
+      publiée nulle part : tenter de la retrouver après coup reviendrait à deviner un
+      chemin qu'une montée amont déplacerait. Le constructeur, lui, est le seul point par
+      lequel tout bus passe forcément.
+      Le marqueur d'idempotence évite les abonnements en double si plusieurs bus naissent
+      (tests, rechargements), et le patch est silencieux en cas d'échec : une sonde ne
+      doit jamais empêcher un démarrage.
+    """
+    try:
+        from openjarvis.core import events as _ev
+
+        if getattr(_ev.EventBus, "_ava_sonde", False):
+            return True
+        _init_origine = _ev.EventBus.__init__
+
+        def _init_instrumente(self: Any, *args: Any, **kwargs: Any) -> None:
+            _init_origine(self, *args, **kwargs)
+            try:
+                brancher(self)
+            except Exception:  # noqa: BLE001
+                pass  # une sonde ne fait jamais échouer la création d'un bus
+
+        _ev.EventBus.__init__ = _init_instrumente  # type: ignore[method-assign]
+        _ev.EventBus._ava_sonde = True  # type: ignore[attr-defined]
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("routing-probe: instrumentation du bus impossible (%s)", exc)
+        return False
+    return True
