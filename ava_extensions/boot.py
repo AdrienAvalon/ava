@@ -58,7 +58,11 @@ def _backends() -> None:
 def _patches() -> None:
     # ⚠ Le groupe le plus fragile : il importe le SDK `anthropic`, fourni par l'extra
     #   `inference-cloud`. C'est celui qui a sauté le 2026-08-03.
-    from ava_extensions.patches import anthropic_enhancements, system_prompt_loader  # noqa: F401
+    from ava_extensions.patches import (  # noqa: F401
+        anthropic_enhancements,
+        system_prompt_loader,
+        traces_observabilite,
+    )
 
 
 def _skills() -> None:

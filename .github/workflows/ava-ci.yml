@@ -86,8 +86,8 @@ jobs:
           #   couvre qu'une partie est pire qu'un contrôle absent : on cesse de vérifier
           #   à la main ce qu'on le croit vérifier.
           for module in kokoro_fr_tts openai_whisper_ava_stt anthropic_enhancements \
-                        system_prompt_loader avalon_status home_assistant memoire \
-                        routing_probe; do
+                        system_prompt_loader traces_observabilite avalon_status \
+                        home_assistant memoire routing_probe; do
             grep -q "$module" ava_extensions/boot.py || {
               echo "::error file=ava_extensions/boot.py::$module n'est plus importe — il ne s'enregistrera jamais"
               exit 1
