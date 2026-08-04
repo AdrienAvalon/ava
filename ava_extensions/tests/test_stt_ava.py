@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -230,3 +231,58 @@ def test_le_format_de_reponse_depend_du_modele() -> None:
     b2._client = _ClientFactice("ok")
     b2.transcribe(b"\x00", format="webm")
     assert b2._client.dernier_appel["response_format"] == "verbose_json"
+
+
+# ══ Le modele annonce vs le modele appele — corrige le 2026-08-04 ═════════════════
+
+
+def test_le_modele_par_defaut_est_celui_que_la_docstring_ANNONCE() -> None:
+    """⚠ La docstring promettait `gpt-4o-mini-transcribe` « instead of the legacy
+    whisper-1 », et le constructeur posait `whisper-1`. Aucun appelant ne surchargeant
+    ce parametre, le modele annonce n'a JAMAIS ete utilise.
+
+    Une docstring fausse coute plus qu'un silence : on renonce a enqueter sur des
+    hallucinations en croyant deja employer le modele qui les reduit. Ce test verrouille
+    l'accord entre les deux — c'est le seul moyen d'empecher l'ecart de revenir.
+    """
+    import ava_extensions.backends.openai_whisper_ava_stt as m
+
+    source = Path(m.__file__).read_text(encoding="utf-8")
+    defaut = m.OpenAIWhisperAvaBackend()._model
+    entete = source.split('"""')[1]
+    # Le modele reellement pose doit apparaitre dans l'en-tete, et aucun autre modele
+    # ne doit y etre presente comme celui qui est employe.
+    assert defaut in entete, f"le defaut {defaut!r} n'est pas annonce dans la docstring"
+
+
+def test_le_modele_est_configurable_par_environnement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Le passage a `gpt-4o-mini-transcribe` doit etre possible sans modifier le code —
+    mais rester un geste DELIBERE, pas un defaut silencieux."""
+    monkeypatch.setenv("AVA_STT_MODEL", "gpt-4o-mini-transcribe")
+    import ava_extensions.backends.openai_whisper_ava_stt as m
+
+    assert m.OpenAIWhisperAvaBackend()._model == "gpt-4o-mini-transcribe"
+
+
+@pytest.mark.parametrize(
+    ("modele", "format_attendu"),
+    [
+        ("whisper-1", "verbose_json"),
+        ("gpt-4o-mini-transcribe", "json"),
+        ("gpt-4o-transcribe", "json"),
+    ],
+)
+def test_le_format_de_reponse_suit_le_modele(modele: str, format_attendu: str) -> None:
+    """⚠ CETTE BRANCHE ETAIT MORTE. `response_format` vaut `json` pour les modeles
+    `gpt-4o-*` et `verbose_json` pour whisper — mais comme le modele etait toujours
+    `whisper-1`, la moitie `json` n'a jamais ete executee. Maintenant que le modele est
+    configurable, quelqu'un le changera : autant que le chemin soit eprouve avant.
+    """
+    import ava_extensions.backends.openai_whisper_ava_stt as m
+
+    b = m.OpenAIWhisperAvaBackend(model=modele)
+    assert (
+        "json" if b._model.startswith("gpt-4o") else "verbose_json"
+    ) == format_attendu

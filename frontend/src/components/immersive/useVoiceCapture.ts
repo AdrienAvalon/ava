@@ -1,4 +1,4 @@
-import { useCallback, useRef } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 
 // Debug logs are gated on import.meta.env.DEV or localStorage.AVA_DEBUG=1 to
 // keep production console clean. Toggle in DevTools: localStorage.AVA_DEBUG=1
@@ -9,6 +9,32 @@ const _debugEnabled = (): boolean =>
 const debug = (...args: any[]): void => { if (_debugEnabled()) console.log(...args); };
 // eslint-disable-next-line no-console, @typescript-eslint/no-explicit-any
 const debugWarn = (...args: any[]): void => { if (_debugEnabled()) console.warn(...args); };
+
+/**
+ * Libère le micro : arrête l'enregistreur puis toutes les pistes du flux.
+ *
+ * ⚠ FONCTION SÉPARÉE ET EXPORTÉE POUR ÊTRE TESTÉE SANS DOM. Tester le hook lui-même
+ *   demanderait `jsdom` + `@testing-library/react` — deux dépendances pour vérifier
+ *   une garantie que React fournit déjà (il APPELLE la fonction de nettoyage). Ce qui
+ *   peut réellement casser, c'est la logique de libération : oublier les pistes, ou
+ *   laisser `stop()` lever et interrompre le reste du nettoyage. C'est elle qu'on teste.
+ *   La limite est assumée : rien ici ne prouve que le `useEffect` est bien branché.
+ *
+ * ⚠ `stop()` sur un enregistreur déjà inactif lève `InvalidStateError`. L'exception est
+ *   absorbée **avant** l'arrêt des pistes : si elle remontait, le flux resterait ouvert
+ *   et le voyant micro allumé — précisément le défaut qu'on corrige.
+ */
+export function libererMicro(
+  recorder: { stop: () => void } | null,
+  stream: { getTracks: () => Array<{ stop: () => void }> } | null,
+): void {
+  try {
+    recorder?.stop();
+  } catch {
+    /* déjà arrêté */
+  }
+  stream?.getTracks().forEach((t) => t.stop());
+}
 
 /**
  * Captures the microphone via MediaRecorder, sends the audio blob to
@@ -55,13 +81,36 @@ export function useVoiceCapture() {
   }, []);
 
   const cancel = useCallback(() => {
-    try {
-      recorderRef.current?.stop();
-    } catch {
-      /* ignore */
-    }
-    cleanup();
-  }, [cleanup]);
+    libererMicro(recorderRef.current, streamRef.current);
+    streamRef.current = null;
+    recorderRef.current = null;
+  }, []);
+
+  // ⚠ NETTOYAGE AU DÉMONTAGE — il n'y en avait AUCUN jusqu'au 2026-08-04, et ça se
+  //   voyait à l'œil nu sans qu'on fasse le lien. `cleanup()` n'était appelé que depuis
+  //   `cancel()` et `stopAndTranscribe()` ; `MicButton`, son seul consommateur, ne
+  //   l'invoque dans aucun de ses trois effets.
+  //
+  //   Scénario, tout à fait ordinaire : on clique le micro, `getUserMedia` est accordé,
+  //   l'enregistrement démarre — puis on appuie sur **Échap**, que `ImmersivePage`
+  //   traduit par une navigation. Le composant est démonté, et :
+  //     · les pistes du flux ne sont jamais arrêtées → **le voyant micro du navigateur
+  //       reste allumé jusqu'au rechargement complet de la page**. Sur un assistant
+  //       personnel installé à demeure, un micro qui reste ouvert n'est pas une fuite de
+  //       ressource, c'est un problème de vie privée ;
+  //     · le `MediaRecorder` continue d'émettre ses fragments toutes les 250 ms dans le
+  //       vide.
+  //
+  //   On lit les refs dans la fonction de nettoyage — c'est leur usage légitime : elles
+  //   portent la ressource impérative à libérer, et leur valeur au moment du démontage
+  //   est précisément celle qu'on veut.
+  useEffect(() => {
+    return () => {
+      libererMicro(recorderRef.current, streamRef.current);
+      streamRef.current = null;
+      recorderRef.current = null;
+    };
+  }, []);
 
   const stopAndTranscribe = useCallback(async (): Promise<string> => {
     const rec = recorderRef.current;

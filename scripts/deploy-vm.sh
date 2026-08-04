@@ -75,8 +75,31 @@ ssh_vm "cd $RACINE_VM && $UV sync $EXTRA_ARGS"
 titre "3/6  Extension native Rust (apres le sync, jamais avant)"
 WHEEL=$(ssh -o BatchMode=yes "$VM_JUMP" "ssh -o BatchMode=yes $VM 'ls -t /tmp/openjarvis_rust-*.whl 2>/dev/null | head -1'")
 if [ -n "$WHEEL" ]; then
+  # ⚠ LA WHEEL EST-ELLE PLUS RECENTE QUE LE CODE RUST QU'ELLE EST CENSEE PORTER ?
+  #   Elle etait choisie par `ls -t` sans le moindre controle d'identite : ni version,
+  #   ni empreinte, ni correspondance avec le commit qu'on vient de tirer a l'etape 1.
+  #   Scenario vecu-en-puissance : on modifie `rust/crates/openjarvis-security`, on
+  #   pousse, on lance ce script en OUBLIANT de reconstruire la wheel dans le conteneur
+  #   Debian 13 (procedure manuelle en 5 etapes). L'etape 3 retrouve alors la wheel de
+  #   la semaine precedente, l'installe, et l'etape 6 reussit son `get_rust_module()`
+  #   → « couche securite active », « Deploiement complet et verifie ».
+  #   **La couche de securite tournerait sur du code ancien pendant que le rapport
+  #   affirme le contraire** — et le script signale lui-meme plus bas que cette couche
+  #   « ne se voit PAS a l'usage ». C'est exactement le genre d'ecart qu'on ne
+  #   decouvrirait qu'en cherchant autre chose.
+  WHEEL_TS=$(ssh_vm "stat -c %Y '$WHEEL'" || echo 0)
+  RUST_TS=$(ssh_vm "cd $RACINE_VM && git log -1 --format=%ct -- rust/ 2>/dev/null" || echo 0)
   ssh_vm "cd $RACINE_VM && $UV pip install --no-deps -q '$WHEEL'"
   echo "   wheel : $(basename "$WHEEL")"
+  if [ "${WHEEL_TS:-0}" -lt "${RUST_TS:-0}" ]; then
+    echo "   ✗ WHEEL PERIMEE — construite le $(date -d "@$WHEEL_TS" '+%F %H:%M' 2>/dev/null)," \
+         "le code Rust a change le $(date -d "@$RUST_TS" '+%F %H:%M' 2>/dev/null)."
+    echo "     La couche securite tournerait sur du code ancien. Reconstruire la wheel :"
+    echo "     cf. CLAUDE.md § « Recompiler apres une modification du code Rust »."
+    echec_precoce=1
+  else
+    echo "   ✓ wheel posterieure au dernier changement du code Rust"
+  fi
 else
   echo "   ⚠ AUCUNE wheel sur la VM — la couche securite (security/, 17 fichiers) sera INERTE."
   echo "     Recompiler : cf. CLAUDE.md § « Recompiler apres une modification du code Rust »."
@@ -97,7 +120,46 @@ ssh_vm "sudo systemctl restart openjarvis"
 
 titre "6/6  Verification — ce qui FAIT FOI, pas ce qu'on espere"
 sleep 12
-echec=0
+echec=${echec_precoce:-0}
+
+# ⚠ LES EXTENSIONS SONT-ELLES REELLEMENT ENREGISTREES ? Aucun des controles suivants ne
+#   le disait jusqu'au 2026-08-04 — on verifiait le service, deux ports HTTP, `import
+#   anthropic` et le module Rust. Or `boot.py` attrape `Exception` PAR GROUPE et se
+#   contente d'un `logger.warning` : c'est le bon choix (l'isolation evite la perte
+#   totale), mais il transforme une panne franche en degradation MUETTE.
+#   Demontre en live sur ce depot : `python -c 'import openjarvis'` imprime
+#   « Ava: patches SDK Anthropic indisponible » puis continue, les trois autres groupes
+#   se chargeant normalement. Une synchro amont qui deplace `openjarvis.tools._stubs`
+#   (importe par `home_assistant.py`) ferait echouer tout le groupe `_skills` → Ava
+#   repondrait « je n'ai pas acces a la maison » sur une infra parfaitement saine,
+#   pendant que ce script afficherait « Deploiement complet et verifie ».
+#   Un registre vide est SILENCIEUX par construction : le decorateur ne s'execute pas,
+#   rien ne leve. Il faut donc aller le lire.
+titre_extensions=$(ssh_vm "cd $RACINE_VM && ./.venv/bin/python -c \"
+import ava_extensions.boot
+from openjarvis.core.registry import ToolRegistry, TTSRegistry, SpeechRegistry
+attendus = {
+    'outil avalon_status': 'avalon_status' in ToolRegistry.keys(),
+    'outil home_assistant': 'home_assistant' in ToolRegistry.keys(),
+    'outil memoire': 'memoire' in ToolRegistry.keys(),
+    'voix kokoro-fr (TTS)': 'kokoro-fr' in TTSRegistry.keys(),
+    'dictee openai_ava (STT)': 'openai_ava' in SpeechRegistry.keys(),
+}
+for nom, ok in attendus.items():
+    print(('OK ' if ok else 'KO ') + nom)
+\" 2>/dev/null" || echo "")
+if [ -z "$titre_extensions" ]; then
+  echo "   ✗ impossible de lire les registres — boot.py n'a peut-etre pas pu s'importer"
+  echec=1
+else
+  while IFS= read -r ligne; do
+    [ -z "$ligne" ] && continue
+    case "$ligne" in
+      OK*) echo "   ✓ ${ligne#OK }" ;;
+      KO*) echo "   ✗ ${ligne#KO } — NON ENREGISTRE (groupe boot.py en echec, cf. journal systemd)"; echec=1 ;;
+    esac
+  done <<< "$titre_extensions"
+fi
 
 verifier "service actif" "$(ssh_vm 'systemctl is-active openjarvis' || true)" "active"
 

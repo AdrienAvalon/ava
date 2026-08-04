@@ -30,8 +30,34 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const MODEL = 'claude-sonnet-5';
 const MAX_TOKENS = 800;
 
-const TTS_BACKEND = "openai_tts";
-const TTS_VOICE = "nova";
+/**
+ * ⚠ LA VOIX D'AVA REPASSE EN SOUVERAIN (2026-08-04). Ces deux constantes valaient
+ * `openai_tts` / `nova` : **chaque phrase prononcée par Ava était POSTée chez OpenAI** —
+ * y compris « Adrien est présent, Aurélie est absente » ou l'état de l'infrastructure,
+ * c'est-à-dire exactement les données que `conversation.py` qualifie de personnelles et
+ * que la persona d'Ava lui prescrit de ne pas laisser fuir vers un cloud tiers.
+ *
+ * Et la documentation du projet affirmait le contraire, en quatre endroits : « Souverain,
+ * CPU-only, 0 €/mois », « Pas de clé API TTS — économie 15-22 €/mois », « Budget mensuel
+ * TTS = 0 € », et `openai_tts` rangé parmi les backends **rejetés au POC**. Le code et la
+ * doc se contredisaient, ce qui est le pire des deux mondes : on croit avoir une garantie
+ * qu'on n'a pas.
+ *
+ * ⚠ CE QUI REND LA BASCULE POSSIBLE AUJOURD'HUI, ce n'est pas un changement d'avis mais
+ * la correction du cache d'instances dans `/v1/ava/speak` : le backend était réinstancié
+ * à chaque requête, donc **rechargeait son modèle à chaque phrase**. Mesuré sur la VM :
+ *   · à froid (chargement inclus) : 3,2 s d'audio en 5,3 s → ratio 1,64× ;
+ *   · à chaud, instance réutilisée : 3,1 s d'audio en 0,7 s → **ratio 0,22×**.
+ * Kokoro était donc réputé « trop lent » à cause d'un défaut serveur, pas de ses
+ * performances. C'est ce qui a probablement motivé le passage à OpenAI à l'époque.
+ *
+ * ⚠ LE BACKEND ET LA VOIX VONT PAR PAIRE : `ff_siwis` est une voix Kokoro, `nova` une
+ * voix OpenAI. Changer l'un sans l'autre donne une voix inconnue du backend — donc un
+ * 502 sur chaque phrase, et une Ava muette. Les surcharges d'environnement existent pour
+ * pouvoir revenir en arrière sans reconstruire, mais elles doivent bouger ensemble.
+ */
+const TTS_BACKEND = import.meta.env.VITE_TTS_BACKEND || 'kokoro-fr';
+const TTS_VOICE = import.meta.env.VITE_TTS_VOICE || 'ff_siwis';
 const TTS_MIN_CHARS = 4; // don't synthesize dust
 
 /**
@@ -143,7 +169,7 @@ function playBuffer(
  * `lastEnd`. Returns the list of new sentences + the new "consumed" offset.
  * Keeps trailing (in-flight) partial sentence for the next call.
  */
-function extractNewSentences(
+export function extractNewSentences(
   assembled: string,
   lastEnd: number,
 ): { sentences: string[]; newEnd: number } {
@@ -400,9 +426,23 @@ export function useDaemonChat() {
         s.streamAva(assembled);
         // Le texte arrive d'un bloc : on découpe pour que le TTS parle par phrases
         // plutôt que d'attaquer 300 mots d'une traite.
-        const { sentences } = extractNewSentences(assembled, 0);
+        // ⚠ ON UTILISE `newEnd`, PAS `sentences.join(' ').length` — corrigé le
+        //   2026-08-04. Les deux ne coïncident que si chaque séparation entre phrases
+        //   fait EXACTEMENT un caractère : les phrases sont `.trim()`ées, et `join(' ')`
+        //   ne réinjecte qu'un espace. Dès qu'il y a une ligne vide — c'est-à-dire dès
+        //   qu'Ava répond en paragraphes, ce qu'elle fait constamment — le décalage
+        //   dérive d'un caractère par séparateur, et **cumule**.
+        //
+        //   Mesuré sur une vraie réponse d'Ava :
+        //     « Il fait 26,7 degrés dehors.⏎⏎Adrien est présent…⏎⏎La baie serveur… »
+        //     newEnd = 67, join(' ').length = 64
+        //     → Ava prononçait « . La baie serveur tire 738 watts » — donc un point
+        //       isolé, puis la répétition de la fin de la phrase précédente.
+        //   Le cas à espace unique fonctionnait parfaitement : c'est pourquoi le défaut
+        //   a survécu, tout en s'entendant à chaque réponse un peu longue.
+        const { sentences, newEnd } = extractNewSentences(assembled, 0);
         for (const sentence of sentences) enqueueSentence(sentence);
-        const reste = assembled.slice(sentences.join(' ').length).trim();
+        const reste = assembled.slice(newEnd).trim();
         if (reste) enqueueSentence(reste);
       }
       if (assembled) {

@@ -1,8 +1,23 @@
-"""Ava speech-to-text backend — OpenAI GPT-4o-mini-transcribe with hallucination guard.
+"""Ava speech-to-text backend — OpenAI Whisper avec garde anti-hallucination.
 
-Improvements over the upstream `openai` backend:
-- Uses `gpt-4o-mini-transcribe` (2024) instead of the legacy `whisper-1`.
-  Lower hallucination rate, similar latency, similar cost (~0.006 USD/min).
+⚠ CE FICHIER ANNONÇAIT UN MODÈLE QU'IL N'APPELAIT JAMAIS (corrigé le 2026-08-04). Son
+  titre et son premier point disaient « Uses `gpt-4o-mini-transcribe` instead of the
+  legacy `whisper-1` », alors que le constructeur pose `model: str = "whisper-1"` et
+  qu'**aucun appelant ne surcharge ce paramètre** : `_discovery.py` instancie tout
+  backend non reconnu par `backend_cls()` sans argument, et la clé `openai_ava` tombe
+  précisément dans ce cas. Le modèle réellement utilisé est donc `whisper-1` — celui
+  que la docstring se vantait d'avoir abandonné pour son taux d'hallucination.
+  Conséquence directe : la branche `response_format="json"` (ligne ~129) n'a jamais
+  été exécutée, donc jamais éprouvée.
+
+  Une docstring fausse coûte plus qu'un silence : on renonce à enquêter sur des
+  hallucinations en croyant déjà utiliser le modèle qui les réduit.
+
+Ce que ce backend apporte RÉELLEMENT par rapport à l'`openai` amont :
+- Modèle configurable par `AVA_STT_MODEL` (défaut `whisper-1` = comportement
+  historique, inchangé). Passer à `gpt-4o-mini-transcribe` est **possible et non
+  validé en réel** : le format de réponse bascule alors en `json`, branche couverte
+  par les tests mais jamais éprouvée sur de l'audio.
 - `temperature=0` to make decoding deterministic and minimize creative drift
   on silence or low-SNR audio.
 - A short FR `prompt` that anchors the model in conversational context with
@@ -93,10 +108,12 @@ class OpenAIWhisperAvaBackend(SpeechBackend):
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "whisper-1",
+        model: str | None = None,
     ) -> None:
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
-        self._model = model
+        # ⚠ Lu à la construction, pas à l'import : une variable d'environnement posée
+        #   par le service doit pouvoir changer sans reconstruire l'image.
+        self._model = model or os.environ.get("AVA_STT_MODEL", "whisper-1")
         self._client: Optional[OpenAI] = None
         if self._api_key and OpenAI is not None:
             self._client = OpenAI(api_key=self._api_key)
