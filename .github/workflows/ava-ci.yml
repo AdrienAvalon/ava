@@ -49,6 +49,19 @@ jobs:
       - name: Tests des extensions Ava
         run: uv run pytest ava_extensions/tests/ -q
 
+      # ⚠ ET LES MEMES TESTS APRES CEUX DE L'AMONT — ce n'est pas une redondance.
+      #   Un test peut passer SEUL et echouer dans une suite complete : c'est arrive le
+      #   2026-08-04. `tests/conftest.py` (herite d'OpenJarvis) declare une fixture
+      #   `autouse=True` qui VIDE tous les registres avant chaque test, `SpeechRegistry`
+      #   compris — nos tests en heritaient et le backend s'y trouvait absent.
+      #   Un job qui ne lance que `ava_extensions/tests/` en isolation ne voit JAMAIS
+      #   cette classe de defaut. Or un test rouge une fois sur deux est pire qu'un test
+      #   absent : on apprend a ignorer la couleur.
+      #   `tests/speech` est choisi parce que c'est precisement lui qui declenchait le
+      #   nettoyage fatal ; le lancer entier serait long pour un gain nul.
+      - name: "Tests des extensions APRES ceux de l'amont (isolation)"
+        run: uv run pytest tests/speech ava_extensions/tests/ -q --deselect tests/speech/test_tts_backends.py::test_kokoro_health_false_without_package
+
       # ── Invariants du fork — ce qu'une synchronisation amont peut casser en silence ──
       - name: "Invariant : le micro reste autorise (microphone=(self))"
         run: |
