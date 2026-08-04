@@ -218,6 +218,28 @@ def relire(
     return resultat
 
 
+def lisible() -> bool:
+    """La base est-elle exploitable ? Distingue « rien à dire » de « je ne peux pas lire ».
+
+    ⚠ POURQUOI CETTE FONCTION EXISTE — défaut trouvé par un test, pas par relecture.
+      `relire()` ne lève jamais : c'est voulu, une perception ne doit pas tomber sur une
+      base abîmée. Mais elle rend `[]` aussi bien quand rien ne s'est passé que quand le
+      fichier est corrompu. L'outil `journal` répondait donc « rien de noté sur cette
+      période » sur une base illisible — la réponse la plus trompeuse possible, et
+      exactement le défaut récurrent de ce projet : *une source qui ne porte pas la
+      donnée répond « rien » sans erreur.*
+      Même distinction que `null` vs `[]` côté client (`memoireServeur.ts`), qui avait
+      été introduite pour la même raison.
+    """
+    try:
+        with contextlib.closing(_connexion()) as conn:
+            conn.execute("SELECT 1 FROM faits LIMIT 1").fetchone()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("perception: base illisible (%s)", exc)
+        return False
+
+
 def compter(sujet: str, depuis_secondes: float = 2592000) -> int:
     """Combien de fois un sujet est apparu dans le journal.
 

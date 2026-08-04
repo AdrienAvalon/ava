@@ -68,6 +68,7 @@ def _patches() -> None:
 def _skills() -> None:
     # ⚠ TOUT NOUVEL OUTIL DOIT ÊTRE AJOUTÉ ICI (et la CI le vérifie).
     from ava_extensions.skills import (  # noqa: F401
+        journal,
         avalon_status,
         home_assistant,
         memoire,

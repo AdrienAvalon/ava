@@ -332,7 +332,9 @@ def test_charger_attrape_AUSSI_les_erreurs_d_execution() -> None:
 # ══ Enregistrement dans le registre — transpose du STT le 2026-08-04 ══════════════
 
 
-@pytest.mark.parametrize("cle", ["avalon_status", "home_assistant", "memoire"])
+@pytest.mark.parametrize(
+    "cle", ["avalon_status", "home_assistant", "memoire", "journal"]
+)
 def test_l_outil_est_REELLEMENT_enregistre(cle: str) -> None:
     """⚠ AUCUN TEST NE VERIFIAIT CECI, et c'est le seul qui attraperait la panne.
 

@@ -75,25 +75,36 @@ jobs:
             exit 1
           }
 
-      - name: "Invariant : boot.py charge toutes les extensions"
+      - name: "Invariant : boot.py charge REELLEMENT toutes les extensions"
         run: |
-          # ⚠ Un backend ou un outil present sur le disque mais jamais IMPORTE est du
-          #   code mort que rien ne signale : le decorateur d'enregistrement ne s'execute
-          #   pas, le registre reste vide, et aucune erreur n'est levee.
-          # ⚠ LES HUIT MODULES, pas quatre — l'audit du 2026-08-04 a relevé que ce pas
-          #   s'intitule « boot.py charge TOUTES les extensions » alors qu'il n'en
-          #   vérifiait que la moitié. Un contrôle qui affirme couvrir un ensemble et n'en
-          #   couvre qu'une partie est pire qu'un contrôle absent : on cesse de vérifier
-          #   à la main ce qu'on le croit vérifier.
-          for module in kokoro_fr_tts openai_whisper_ava_stt anthropic_enhancements \
-                        system_prompt_loader traces_observabilite avalon_status \
-                        perception \
-                        home_assistant memoire routing_probe; do
-            grep -q "$module" ava_extensions/boot.py || {
-              echo "::error file=ava_extensions/boot.py::$module n'est plus importe — il ne s'enregistrera jamais"
-              exit 1
-            }
-          done
+          # ⚠ VERIFICATION PAR EXECUTION, PAS PAR `grep` — corrige le 2026-08-04 apres
+          #   avoir constate que le garde-fou etait AVEUGLE. Il cherchait le nom de chaque
+          #   module dans `boot.py` ; or `journal` est un SOUS-MOT de « journalise », qui
+          #   apparait dans un commentaire du fichier. Le grep trouvait donc le module
+          #   meme apres l'avoir retire de l'import — mesure : contre-preuve faite, le
+          #   controle repondait « present » sur un boot.py ampute.
+          #   C'est la troisieme fois aujourd'hui qu'un controle textuel se revele plus
+          #   faible qu'il n'en a l'air (apres le grep POST/urllib et celui du jeton).
+          #   Ce qui fait foi, c'est le REGISTRE : on importe boot.py et on regarde.
+          uv run python - <<'PY'
+          import sys
+          import ava_extensions.boot  # noqa: F401
+          from openjarvis.core.registry import SpeechRegistry, ToolRegistry, TTSRegistry
+
+          attendus = [
+              ("outil", ToolRegistry, "avalon_status"),
+              ("outil", ToolRegistry, "home_assistant"),
+              ("outil", ToolRegistry, "memoire"),
+              ("outil", ToolRegistry, "journal"),
+              ("voix", TTSRegistry, "kokoro-fr"),
+              ("dictee", SpeechRegistry, "openai_ava"),
+          ]
+          manquants = [f"{k} {c}" for k, r, c in attendus if not r.contains(c)]
+          if manquants:
+              print("::error file=ava_extensions/boot.py::non enregistres : " + ", ".join(manquants))
+              sys.exit(1)
+          print(f"{len(attendus)} extensions enregistrees")
+          PY
 
       - name: "Invariant : l'outil Home Assistant reste en LECTURE SEULE"
         run: |
