@@ -415,3 +415,101 @@ def test_les_domaines_annonces_ont_TOUS_une_vue(ha: Any) -> None:
     spec = ha.HomeAssistantTool().spec
     annonces = spec.parameters["properties"]["domaine"]["enum"]
     assert set(annonces) == set(ha._VUES), "enum et _VUES ont divergé"
+
+
+# ══ camera — l'historique qualifie de l'exterieur ══════════════════════════════════
+
+DASH_CAM = {
+    "module_health": {"frigate": "ok"},
+    "module_data": {
+        "frigate": {
+            "_health": "ok",
+            "camera": "parking",
+            "camera_fps": 5.1,
+            "detection_active": True,
+            "historique_lisible": True,
+            "evenements_24h": {
+                "total": 32,
+                "par_objet": {"voiture": 30, "personne": 2},
+                "par_zone": {"la cour": 30, "le portail": 2},
+            },
+            "derniers": [
+                {"objet": "personne", "zones": ["le portail"], "debut": 1.0, "en_cours": True},
+                {"objet": "voiture", "zones": ["la cour"], "debut": 1.0, "en_cours": False},
+            ],
+        }
+    },
+}
+
+
+@pytest.fixture
+def cam(monkeypatch: pytest.MonkeyPatch) -> Any:
+    m = _charger("camera")
+    monkeypatch.setattr(m, "_dashboard", lambda: DASH_CAM)
+    return m
+
+
+def test_camera_dit_que_ce_sont_des_DETECTIONS_pas_des_vehicules(cam: Any) -> None:
+    """⚠ LE TEST QUI EMPECHE LA REPONSE FAUSSE QUI A LANCE CE CHANTIER.
+
+    « 32 detections de voiture » s'entend « 32 voitures » — alors qu'il y en a QUATRE,
+    dont trois garees en permanence dans le champ. Une meme voiture qui part et revient
+    compte deux fois. Sans cette precision, Ava donnerait un chiffre exact et une
+    reponse fausse, ce qui est pire qu'un « je ne sais pas »."""
+    sortie = cam.CameraTool().execute().content
+    assert "32" in sortie
+    assert "DÉTECTIONS" in sortie or "détections" in sortie
+    assert "pas des véhicules distincts" in sortie
+
+
+def test_camera_signale_ce_qui_est_EN_COURS(cam: Any) -> None:
+    """« Il y a quelqu'un au portail EN CE MOMENT » n'est pas « quelqu'un est venu » —
+    et c'est la seule des deux qui demande de se lever."""
+    sortie = cam.CameraTool().execute().content
+    assert "EN CE MOMENT" in sortie
+    assert "personne" in sortie
+
+
+def test_camera_AVEUGLE_ne_dit_pas_qu_il_ne_s_est_rien_passe(
+    cam: Any, monkeypatch: Any
+) -> None:
+    """⚠ LE CAS LE PLUS IMPORTANT. Sans flux RTSP, « rien detecte » ne veut PAS dire
+    « rien ne s'est passe ». Ava doit le dire, pas le taire — sinon elle rassure sur une
+    camera morte."""
+    dash = {
+        "module_health": {"frigate": "ok"},
+        "module_data": {
+            "frigate": {
+                **DASH_CAM["module_data"]["frigate"],
+                "camera_fps": 0.0,
+                "evenements_24h": {"total": 0, "par_objet": {}, "par_zone": {}},
+                "derniers": [],
+            }
+        },
+    }
+    monkeypatch.setattr(cam, "_dashboard", lambda: dash)
+    sortie = cam.CameraTool().execute().content
+    assert "n'envoie plus d'image" in sortie
+
+
+def test_camera_distingue_le_CP_injoignable(cam: Any, monkeypatch: Any) -> None:
+    """Deux pannes distinctes se presentent identiquement : le CP injoignable, et la
+    camera qui ne voit rien. Chercher du mauvais cote coute une heure."""
+    import urllib.error
+
+    def _boum() -> Any:
+        raise urllib.error.URLError("refuse")
+
+    monkeypatch.setattr(cam, "_dashboard", _boum)
+    r = cam.CameraTool().execute()
+    assert r.success is False
+    assert "Control plane injoignable" in r.content
+
+
+def test_camera_est_DISTINCTE_de_home_assistant(cam: Any) -> None:
+    """Les deux parlent du parking mais repondent a des questions differentes :
+    l'un donne l'etat instantane, l'autre l'historique date. La description doit le dire
+    au modele — c'est elle qui guide le choix, comme pour `journal` vs `memoire`."""
+    d = cam.CameraTool().spec.description
+    assert "home_assistant" in d
+    assert "INSTANTANÉ" in d or "instantané" in d
