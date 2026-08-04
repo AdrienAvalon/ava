@@ -167,7 +167,7 @@ def test_ajouter_ecarte_AUSSI_un_role_inconnu(tmp_path: Any, monkeypatch: Any) -
         ],
     )
     assert n == 1
-    assert [l["texte"] for l in conv.lire("sub:x")] == ["vraie question"]
+    assert [x["texte"] for x in conv.lire("sub:x")] == ["vraie question"]
 
 
 # ══ /speak — ressources bornées, pas de divulgation ══════════════════════════════

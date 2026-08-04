@@ -62,7 +62,61 @@ CHEMIN = Path(
 _verrou = threading.Lock()
 
 # État de l'échange en cours. Réinitialisé à chaque `CHAT_EXCHANGE_COMPLETED`.
-_courant: dict[str, Any] = {}
+# ⚠ UN ÉTAT PAR ÉCHANGE, ET NON UN DICTIONNAIRE DE MODULE (corrigé le 2026-08-04).
+#   `_courant` était un unique dict partagé, muté par `_sur_debut_outil` et
+#   `_sur_fin_inference`, puis vidé par `.clear()`. Rien n'y distinguait un échange
+#   d'un autre. Or le daemon sert plusieurs clients, et la sonde s'abonne à TOUT bus
+#   créé. Deux échanges qui se chevauchent — A appelle `home_assistant` et consomme
+#   3 200 jetons, B n'appelle rien — donnaient : B termine le premier et **emporte les
+#   outils et les jetons de A**, puis `clear()` ; A sortait ensuite avec
+#   `outil_appele: false` et `jetons_entree: null`.
+#   Ce n'est pas un détail cosmétique : `outil_appele` est présenté en tête de ce
+#   fichier comme LE signal sur lequel se régleront les seuils Haiku/Sonnet/Opus. Une
+#   sonde qui attribue les mesures au mauvais échange ne produit pas un bruit — elle
+#   produit une CORRÉLATION INVERSÉE, sur laquelle on réglerait le routage à l'envers.
+#
+# ⚠ La clé est le contexte d'EXÉCUTION, pas un identifiant applicatif : les événements
+#   n'en portent aucun. `EventBus.publish` est **synchrone** (`callback(event)` dans la
+#   boucle de `publish`), donc les trois événements d'un même échange sont émis dans la
+#   même tâche asyncio, ou le même thread pour une route `def`. C'est ce qui rend cette
+#   clé fiable — si un jour l'amont dispatche les événements en tâche de fond, elle
+#   cesserait de l'être et il faudrait un identifiant de corrélation.
+_etats: dict[int, dict[str, Any]] = {}
+_verrou_etats = threading.Lock()
+
+# ⚠ BORNE ANTI-FUITE. Un échange interrompu (exception pendant l'inférence, client qui
+#   raccroche) ne publie jamais son événement de fin : son entrée resterait
+#   indéfiniment. Au-delà de cette borne on purge les plus anciennes — une sonde ne
+#   doit jamais faire grossir la mémoire du processus qu'elle observe.
+_ETATS_MAX = 64
+
+
+def _cle_echange() -> int:
+    """Identifiant du contexte d'exécution courant (tâche asyncio, sinon thread)."""
+    try:
+        import asyncio
+
+        tache = asyncio.current_task()
+        if tache is not None:
+            return id(tache)
+    except Exception:  # noqa: BLE001 — hors boucle d'événements
+        pass
+    return threading.get_ident()
+
+
+def _etat() -> dict[str, Any]:
+    """L'état de l'échange en cours, créé au besoin."""
+    cle = _cle_echange()
+    with _verrou_etats:
+        etat = _etats.get(cle)
+        if etat is None:
+            if len(_etats) >= _ETATS_MAX:
+                # purge des plus anciennes (dict ordonné par insertion)
+                for vieille in list(_etats)[: len(_etats) - _ETATS_MAX + 1]:
+                    _etats.pop(vieille, None)
+            etat = {"_ne_le": time.time()}
+            _etats[cle] = etat
+        return etat
 
 
 def _score_complexite(texte: str) -> float | None:
@@ -93,7 +147,7 @@ def _ecrire(ligne: dict[str, Any]) -> None:
 
 def _sur_debut_outil(evenement: Any) -> None:
     d = getattr(evenement, "data", {}) or {}
-    _courant.setdefault("outils", []).append(d.get("tool") or d.get("name") or "?")
+    _etat().setdefault("outils", []).append(d.get("tool") or d.get("name") or "?")
 
 
 def _sur_fin_inference(evenement: Any) -> None:
@@ -117,10 +171,11 @@ def _sur_fin_inference(evenement: Any) -> None:
                 #   PLUSIEURS inférences (une pour décider de l'outil, une pour rédiger la
                 #   réponse). Garder la dernière sous-estimerait le coût réel — soit
                 #   exactement la grandeur qu'on cherche à mesurer.
+                etat = _etat()
                 if cle.startswith("jetons") and isinstance(d[champ], int):
-                    _courant[cle] = _courant.get(cle, 0) + d[champ]
+                    etat[cle] = etat.get(cle, 0) + d[champ]
                 else:
-                    _courant[cle] = d[champ]
+                    etat[cle] = d[champ]
                 break
 
 
@@ -140,7 +195,8 @@ def _sur_echange_termine(evenement: Any) -> None:
         or d.get("prompt")
         or ""
     )
-    outils = _courant.get("outils") or []
+    etat = _etat()
+    outils = etat.get("outils") or []
 
     _ecrire(
         {
@@ -150,12 +206,13 @@ def _sur_echange_termine(evenement: Any) -> None:
             "complexite": _score_complexite(question) if question else None,
             "outil_appele": bool(outils),
             "outils": outils,
-            "modele": _courant.get("modele"),
-            "jetons_entree": _courant.get("jetons_entree"),
-            "jetons_sortie": _courant.get("jetons_sortie"),
+            "modele": etat.get("modele"),
+            "jetons_entree": etat.get("jetons_entree"),
+            "jetons_sortie": etat.get("jetons_sortie"),
         }
     )
-    _courant.clear()
+    with _verrou_etats:
+        _etats.pop(_cle_echange(), None)
 
 
 def brancher(bus: Any) -> bool:

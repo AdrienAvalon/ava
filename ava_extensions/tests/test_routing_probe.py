@@ -27,7 +27,7 @@ class _Evenement:
 def _journal_temporaire(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     chemin = tmp_path / "routing.jsonl"
     monkeypatch.setattr(routing_probe, "CHEMIN", chemin)
-    routing_probe._courant.clear()
+    routing_probe._etats.clear()
     return chemin
 
 
@@ -233,3 +233,95 @@ def test_le_branchement_au_bus_serveur_est_idempotent() -> None:
     bus = EventBus()
     abonnes = {getattr(t, "value", str(t)): len(c) for t, c in bus._subscribers.items()}
     assert abonnes.get("chat_exchange_completed") == 1, abonnes
+
+
+# ══ Isolation entre echanges concurrents — corrige le 2026-08-04 ══════════════════
+
+
+def test_deux_echanges_qui_se_CHEVAUCHENT_ne_melangent_pas_leurs_mesures(
+    _journal_temporaire: Path,
+) -> None:
+    """⚠ LE DEFAUT LE PLUS PERNICIEUX DE CETTE SONDE.
+
+    `_courant` etait un unique dict de module. Deux echanges concurrents — A appelle
+    `home_assistant` et consomme 3 200 jetons, B n'appelle aucun outil — donnaient :
+    B termine le premier et **emporte les outils et les jetons de A**, puis `clear()` ;
+    A sortait ensuite avec `outil_appele: false` et `jetons_entree: null`.
+
+    Ce n'est pas du bruit, c'est une CORRELATION INVERSEE : `outil_appele` est le
+    signal sur lequel se regleront les seuils Haiku/Sonnet/Opus. On reglerait le
+    routage a l'envers, avec des mesures d'apparence parfaitement propre.
+
+    Le scenario est reproduit ici en deux threads, chacun jouant la sequence complete
+    d'un echange, entrelaces par des barrieres pour forcer le chevauchement.
+    """
+    import threading
+
+    barriere = threading.Barrier(2)
+
+    def echange_avec_outil() -> None:
+        routing_probe._sur_debut_outil(_Evenement({"tool": "home_assistant"}))
+        routing_probe._sur_fin_inference(
+            _Evenement({"model": "claude-sonnet-5", "usage": {"prompt_tokens": 3200}})
+        )
+        barriere.wait()  # B publie sa fin AVANT nous
+        barriere.wait()
+        routing_probe._sur_echange_termine(_Evenement({"user_text": "avec outil"}))
+
+    def echange_sans_outil() -> None:
+        routing_probe._sur_fin_inference(
+            _Evenement({"model": "claude-haiku-4-5", "usage": {"prompt_tokens": 90}})
+        )
+        barriere.wait()
+        routing_probe._sur_echange_termine(_Evenement({"user_text": "sans"}))
+        barriere.wait()
+
+    fils = [
+        threading.Thread(target=echange_avec_outil),
+        threading.Thread(target=echange_sans_outil),
+    ]
+    for f in fils:
+        f.start()
+    for f in fils:
+        f.join()
+
+    lignes = {
+        ligne["longueur_question"]: ligne for ligne in _lignes(_journal_temporaire)
+    }
+    avec, sans = lignes[10], lignes[4]
+    assert avec["outils"] == ["home_assistant"], "l'echange A a perdu son outil"
+    assert avec["jetons_entree"] == 3200
+    assert avec["modele"] == "claude-sonnet-5"
+    assert sans["outils"] == [], "l'echange B a herite de l'outil de A"
+    assert sans["jetons_entree"] == 90
+    assert sans["modele"] == "claude-haiku-4-5"
+
+
+def test_l_etat_d_un_echange_est_LIBERE_a_sa_fin(_journal_temporaire: Path) -> None:
+    """Sinon la sonde ferait grossir la memoire du processus qu'elle observe — et une
+    sonde qui degrade son hote est pire que pas de sonde."""
+    routing_probe._sur_debut_outil(_Evenement({"tool": "x"}))
+    assert routing_probe._etats
+    routing_probe._sur_echange_termine(_Evenement({"user_text": "fini"}))
+    assert not routing_probe._etats
+
+
+def test_les_echanges_JAMAIS_TERMINES_ne_fuient_pas(_journal_temporaire: Path) -> None:
+    """⚠ Un echange interrompu (exception pendant l'inference, client qui raccroche) ne
+    publie jamais son evenement de fin : son entree resterait indefiniment. La borne
+    purge les plus anciennes."""
+    for i in range(routing_probe._ETATS_MAX * 3):
+        routing_probe._etats[10_000 + i] = {"_ne_le": 0.0}
+        if len(routing_probe._etats) > routing_probe._ETATS_MAX:
+            routing_probe._etats.clear()  # garde-fou du test lui-meme
+    routing_probe._etats.clear()
+    import threading
+
+    def un_echange_abandonne() -> None:
+        routing_probe._sur_debut_outil(_Evenement({"tool": "abandonne"}))
+
+    for _ in range(routing_probe._ETATS_MAX * 2):
+        f = threading.Thread(target=un_echange_abandonne)
+        f.start()
+        f.join()
+    assert len(routing_probe._etats) <= routing_probe._ETATS_MAX
