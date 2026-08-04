@@ -158,38 +158,74 @@ def prewarm_kokoro() -> None:
 #   plus — le dépôt en compte déjà 4, et chacun se paie à chaque merge upstream.
 
 
+class LigneEntrante(BaseModel):
+    """Une ligne de conversation soumise par le client.
+
+    ⚠ MODÈLE PYDANTIC ET NON `await request.json()` — corrigé après revue adversariale.
+      Le parsing manuel produisait des **HTTP 500** sur trois entrées banales : un corps
+      non-JSON, un corps JSON non-objet, et un élément de liste mal typé. Un modèle rend
+      des 422 explicites, et borne les tailles au passage.
+      Le fichier contenait déjà `SpeakRequest` avec `max_length=500` juste au-dessus :
+      la route conversation ne bornait rien, alors que le motif était sous les yeux.
+    """
+
+    role: str = Field(max_length=32)
+    texte: str = Field(max_length=8000)
+    horodatage: float | None = None
+
+
+class EnvoiConversation(BaseModel):
+    # ⚠ `max_length` sur la liste : sans borne, un client pouvait faire matérialiser un
+    #   corps arbitrairement grand en mémoire, sur la boucle d'événements.
+    lignes: list[LigneEntrante] = Field(default_factory=list, max_length=50)
+
+
+# ⚠ CES TROIS ROUTES SONT `def` ET NON `async def` — c'est délibéré, et l'incohérence
+#   était réelle : elles font de l'I/O SQLite BLOQUANTE derrière un verrou global, avec
+#   un `timeout=10`. En `async def`, FastAPI les exécute directement sur la boucle
+#   d'événements : un fichier verrouillé ou un disque lent gelait TOUT le daemon pendant
+#   dix secondes — plus de `/speak`, plus de healthcheck. En `def`, FastAPI les délègue
+#   au threadpool. C'est d'ailleurs ce que fait `speak` juste au-dessus.
+
+
 @router.get("/conversation")
-async def lire_conversation(request: Request) -> dict:
+def lire_conversation(request: Request) -> dict:
     """Historique de l'utilisateur courant, du plus ancien au plus récent."""
     from ava_extensions.server import conversation as conv
 
     utilisateur = conv.identite(request.headers)
-    lignes = conv.lire(utilisateur, limite=400)
-    return {"utilisateur": utilisateur, "lignes": lignes}
+    if utilisateur is None:
+        # ⚠ Pas d'identité → pas d'historique, et surtout PAS de seau commun : c'était
+        #   une fuite réelle (deux jetons expirés partageaient la même conversation).
+        return {"utilisateur": None, "lignes": []}
+    return {"utilisateur": utilisateur, "lignes": conv.lire(utilisateur, limite=400)}
 
 
 @router.post("/conversation")
-async def ajouter_conversation(request: Request) -> dict:
+def ajouter_conversation(envoi: EnvoiConversation, request: Request) -> dict:
     """Ajoute des lignes à l'historique de l'utilisateur courant.
 
     ⚠ L'utilisateur n'est JAMAIS pris dans le corps de la requête : il est dérivé du
-      jeton. Accepter un champ `utilisateur` transmis par le client laisserait n'importe
-      qui écrire dans la mémoire d'un autre — le cloisonnement ne vaudrait rien.
+      jeton. Accepter un champ transmis par le client laisserait n'importe qui écrire
+      dans la mémoire d'un autre — le cloisonnement ne vaudrait rien.
     """
     from ava_extensions.server import conversation as conv
 
-    corps = await request.json()
-    lignes = corps.get("lignes") or []
-    if not isinstance(lignes, list):
-        raise HTTPException(status_code=400, detail="`lignes` doit être une liste")
     utilisateur = conv.identite(request.headers)
+    if utilisateur is None:
+        # ⚠ 401 plutôt qu'un écrit mutualisé : mieux vaut perdre la mémoire d'une session
+        #   que mélanger celles de deux personnes.
+        raise HTTPException(status_code=401, detail="identité absente ou illisible")
+    lignes = [x.model_dump() for x in envoi.lignes]
     return {"ecrites": conv.ajouter(utilisateur, lignes)}
 
 
 @router.delete("/conversation")
-async def effacer_conversation(request: Request) -> dict:
+def effacer_conversation(request: Request) -> dict:
     """Efface l'historique de l'utilisateur courant — et de lui seul."""
     from ava_extensions.server import conversation as conv
 
     utilisateur = conv.identite(request.headers)
+    if utilisateur is None:
+        raise HTTPException(status_code=401, detail="identité absente ou illisible")
     return {"effacees": conv.effacer(utilisateur)}

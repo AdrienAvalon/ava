@@ -52,8 +52,10 @@ j'utilise, une mémoire interne à Ava ».
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import logging
+import math
 import sqlite3
 import threading
 import time
@@ -95,20 +97,33 @@ def _connexion() -> sqlite3.Connection:
     return cx
 
 
-def identite(entetes: Any) -> str:
-    """Identifiant stable de l'appelant, extrait du jeton OIDC.
+def identite(entetes: Any) -> str | None:
+    """Identifiant stable de l'appelant, ou `None` s'il n'a pas pu être établi.
 
-    ⚠ Rend `"anonyme"` plutôt que de lever : un jeton absent ou illisible ne doit pas
-      casser la conversation, il doit seulement priver du cloisonnement. Un utilisateur
-      sans identité écrit et lit son propre espace « anonyme », isolé des autres.
+    ⚠ REND `None` ET NON UNE CHAÎNE « anonyme » — corrigé le 2026-08-04 après une revue
+      adversariale, et c'était une FUITE RÉELLE, pas théorique. Tous les chemins d'échec
+      rendaient la même chaîne littérale, utilisée ensuite comme clé de cloisonnement :
+      ce n'étaient donc pas des espaces distincts mais **un seul seau partagé**. Deux
+      personnes dont le jeton a simplement expiré se retrouvaient dans la même
+      conversation, et le `DELETE` de l'une effaçait celle de l'autre. Le docstring
+      affirmait le contraire (« son propre espace, isolé des autres ») : c'était faux au
+      sens qui compte.
+      Déclenché par une panne ordinaire — jeton expiré, client qui n'envoie pas
+      l'en-tête — donc bien plus probable qu'une attaque. L'appelant refuse maintenant
+      d'écrire plutôt que de mutualiser.
+
+    ⚠ LA PROVENANCE DU CLAIM EST PRÉFIXÉE (`sub:`, `un:`, `mail:`) : sans ça, les trois
+      claims partagent un espace de noms plat, et un compte dont le `preferred_username`
+      vaut le `sub` d'un autre lit sa conversation. Or `preferred_username` est
+      modifiable par l'utilisateur dans plusieurs configurations Keycloak — cette
+      confusion survivrait donc à la validation de signature.
     """
-    brut = ""
     try:
         brut = entetes.get("X-Ava-Identity") or ""
     except Exception:  # noqa: BLE001
-        return "anonyme"
+        return None
     if not brut:
-        return "anonyme"
+        return None
     jeton = brut.removeprefix("Bearer ").strip()
     try:
         # ⚠ Le corps d'un JWT est du base64url SANS remplissage : `urlsafe_b64decode`
@@ -116,23 +131,33 @@ def identite(entetes: Any) -> str:
         corps = jeton.split(".")[1]
         corps += "=" * (-len(corps) % 4)
         charge = json.loads(base64.urlsafe_b64decode(corps))
+        # ⚠ `isinstance` DANS le `try` : un corps JSON valide mais non-objet (`[1,2]`,
+        #   `null`, `"x"`) décode sans erreur puis fait échouer `.get()` — un
+        #   `AttributeError` qui remontait en HTTP 500 sur les trois routes, y compris
+        #   `GET`. Le filet s'arrêtait une ligne trop tôt.
+        if not isinstance(charge, dict):
+            return None
     except Exception:  # noqa: BLE001
         logger.debug("jeton d'identité illisible")
-        return "anonyme"
+        return None
     # ⚠ `sub` d'abord : c'est le SEUL identifiant stable. L'e-mail et le nom d'utilisateur
     #   changent — l'infra Avalon a migré l'adresse de `acros` le 2026-08-01, et deux
     #   consommateurs qui indexaient dessus ont cassé en silence.
-    for cle in ("sub", "preferred_username", "email"):
+    for prefixe, cle in (
+        ("sub", "sub"),
+        ("un", "preferred_username"),
+        ("mail", "email"),
+    ):
         valeur = charge.get(cle)
         if isinstance(valeur, str) and valeur:
-            return valeur
-    return "anonyme"
+            return f"{prefixe}:{valeur}"
+    return None
 
 
 def lire(utilisateur: str, limite: int = 200) -> list[dict[str, Any]]:
     """Les `limite` dernières lignes de CET utilisateur, du plus ancien au plus récent."""
     try:
-        with _verrou, _connexion() as cx:
+        with _verrou, contextlib.closing(_connexion()) as cx, cx:
             rangs = cx.execute(
                 "SELECT role, texte, horodatage FROM lignes"
                 " WHERE utilisateur = ? ORDER BY id DESC LIMIT ?",
@@ -147,22 +172,55 @@ def lire(utilisateur: str, limite: int = 200) -> list[dict[str, Any]]:
     ]
 
 
+# ⚠ LISTE BLANCHE DES RÔLES — sans elle, un client pouvait écrire une ligne
+#   `role: "system"` au contenu arbitraire. Comme l'historique est REJOUÉ dans le
+#   contexte du modèle à chaque tour, c'était une **injection de prompt persistante** :
+#   une consigne posée une fois, respectée indéfiniment. Trouvé en revue adversariale.
+ROLES_ADMIS = frozenset({"user", "assistant"})
+
+# ⚠ Bornes de taille. `MAX_LIGNES` compte des LIGNES, pas des octets : 2000 lignes de
+#   10 Mio feraient conserver ~20 Gio, et le plafond ne s'y opposerait pas. Contraste
+#   relevé en revue : la route `speak` du même fichier borne déjà ses entrées à 500
+#   caractères, celle-ci ne bornait rien.
+MAX_CAR_TEXTE = 8000
+MAX_LIGNES_PAR_ENVOI = 50
+
+
 def ajouter(utilisateur: str, lignes: list[dict[str, Any]]) -> int:
-    """Ajoute des lignes et applique le plafond. Rend le nombre écrit."""
-    valides = [
-        (
-            utilisateur,
-            str(ligne.get("role", "")),
-            str(ligne.get("texte", "")),
-            float(ligne.get("horodatage") or time.time()),
-        )
-        for ligne in lignes
-        if ligne.get("texte")
-    ]
+    """Ajoute des lignes et applique le plafond. Rend le nombre écrit.
+
+    ⚠ Tolérant aux entrées mal formées PLUTÔT QUE levant : la construction du lot se
+      faisait hors du `try`, si bien qu'un élément non-dict ou un horodatage textuel
+      produisait un HTTP 500. Une mémoire qui refuse une ligne doit refuser la ligne,
+      pas la requête.
+    """
+    valides: list[tuple[str, str, str, float]] = []
+    for ligne in lignes[:MAX_LIGNES_PAR_ENVOI]:
+        if not isinstance(ligne, dict):
+            continue
+        texte = str(ligne.get("texte") or "")[:MAX_CAR_TEXTE]
+        if not texte:
+            continue
+        role = str(ligne.get("role") or "")
+        if role not in ROLES_ADMIS:
+            continue
+        # ⚠ `math.isfinite` : `float("NaN")` RÉUSSIT, mais SQLite stocke NaN comme NULL
+        #   et la contrainte `NOT NULL` fait alors échouer TOUT l'`executemany`, qui est
+        #   atomique. Une seule ligne empoisonnée effaçait donc le tour entier — question
+        #   ET réponse — en rendant `{"ecrites": 0}` avec un HTTP 200. Un tour de
+        #   conversation qui disparaît sans erreur visible est précisément ce que ce
+        #   module doit empêcher.
+        try:
+            horodatage = float(ligne.get("horodatage") or time.time())
+        except (TypeError, ValueError):
+            horodatage = time.time()
+        if not math.isfinite(horodatage):
+            horodatage = time.time()
+        valides.append((utilisateur, role, texte, horodatage))
     if not valides:
         return 0
     try:
-        with _verrou, _connexion() as cx:
+        with _verrou, contextlib.closing(_connexion()) as cx, cx:
             cx.executemany(
                 "INSERT INTO lignes (utilisateur, role, texte, horodatage) VALUES (?,?,?,?)",
                 valides,
@@ -183,7 +241,7 @@ def ajouter(utilisateur: str, lignes: list[dict[str, Any]]) -> int:
 def effacer(utilisateur: str) -> int:
     """Efface la conversation de CET utilisateur uniquement."""
     try:
-        with _verrou, _connexion() as cx:
+        with _verrou, contextlib.closing(_connexion()) as cx, cx:
             cur = cx.execute("DELETE FROM lignes WHERE utilisateur = ?", (utilisateur,))
             return cur.rowcount or 0
     except Exception as exc:  # noqa: BLE001
