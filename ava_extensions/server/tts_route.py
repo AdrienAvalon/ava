@@ -10,6 +10,7 @@ import logging
 import os
 import threading
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
@@ -23,6 +24,62 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/ava", tags=["ava"])
 
 
+# ⚠ FORMATS ADMIS — `output_format` n'avait AUCUNE contrainte jusqu'au 2026-08-04,
+#   contrairement à `text` (min/max_length) et `speed` (ge/le) juste à côté : le motif
+#   était sous les yeux. La valeur descend jusqu'à `sf.write(..., format=fmt.upper())`
+#   dans `kokoro_tts.py`, donc `{"output_format": "zzz"}` faisait lever `soundfile`
+#   dans une route sans `try/except` → HTTP 500 nu. Un 422 dit au client ce qu'il a
+#   fait de travers ; un 500 lui fait croire que le serveur est cassé.
+#   ⚠ Ce dict est la SOURCE UNIQUE : le `Literal` du champ doit lui rester aligné, et
+#   un test le vérifie (`test_tts_route.py`). Deux listes de formats divergeraient —
+#   on accepterait un format qu'on ne saurait pas étiqueter, et le navigateur
+#   recevrait de l'audio en `application/octet-stream` qu'il refuserait de lire.
+MIME_PAR_FORMAT = {
+    "wav": "audio/wav",
+    "mp3": "audio/mpeg",
+    "ogg": "audio/ogg",
+    "opus": "audio/ogg",
+    "flac": "audio/flac",
+}
+
+# ⚠ INSTANCES MISES EN CACHE — le défaut le plus coûteux de cette route.
+#   `backend_cls()` était appelé à CHAQUE requête. Or le pipeline de synthèse est mis
+#   en cache sur l'INSTANCE (`KokoroTTSBackend.__init__` pose `self._pipeline = None`,
+#   et `_ensure_pipeline` ne teste que `self._pipeline`) : chaque phrase rechargeait
+#   donc un `KPipeline` complet. La route est un `def`, donc exécutée dans le
+#   threadpool FastAPI — jusqu'à 40 chargements de modèle EN PARALLÈLE, sur une VM qui
+#   n'a pas la mémoire pour un seul de trop. Une boucle de 60 `curl` suffisait à la
+#   mettre par terre, sans authentification ni limite de débit.
+_instances: dict[str, object] = {}
+_verrou_instances = threading.Lock()
+
+# ⚠ UNE SYNTHÈSE À LA FOIS PAR BACKEND. Deux raisons, et la seconde est la vraie :
+#   (1) borner la charge ; (2) **rien ne garantit qu'un backend soit réentrant** — on
+#   partage désormais une instance, donc deux appels concurrents se marcheraient
+#   dessus dans le pipeline. Sérialiser par backend est le seul choix sûr, et sans
+#   coût réel ici : Ava sert une poignée d'humains, pas un service public.
+_verrous_backend: dict[str, threading.Lock] = {}
+
+# ⚠ ET UNE FILE D'ATTENTE BORNÉE, sinon la sérialisation ne fait que déplacer le
+#   problème : les requêtes s'empileraient dans le threadpool jusqu'à l'épuiser, et
+#   TOUT le daemon deviendrait muet (les routes `/conversation` comprises). Au-delà,
+#   on refuse en 503 — un refus franc vaut mieux qu'une attente que le client
+#   abandonnera de toute façon.
+_ATTENTE_MAX = max(1, int(os.environ.get("AVA_TTS_ATTENTE_MAX", "4")))
+_places = threading.BoundedSemaphore(_ATTENTE_MAX)
+
+
+def _instance(cle: str) -> object:
+    """L'instance partagée du backend `cle`, créée une seule fois."""
+    with _verrou_instances:
+        obj = _instances.get(cle)
+        if obj is None:
+            obj = TTSRegistry.get(cle)()
+            _instances[cle] = obj
+            _verrous_backend[cle] = threading.Lock()
+        return obj
+
+
 class SpeakRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=500)
     voice_id: str = Field("ff_siwis", description="Voice identifier for the backend")
@@ -31,7 +88,9 @@ class SpeakRequest(BaseModel):
         description="TTS backend key (kokoro-fr, kokoro, cartesia, openai_tts)",
     )
     speed: float = Field(1.0, ge=0.5, le=2.0, description="Playback speed multiplier")
-    output_format: str = Field("wav", description="Preferred audio format (wav, mp3)")
+    output_format: Literal["wav", "mp3", "ogg", "opus", "flac"] = Field(
+        "wav", description="Preferred audio format"
+    )
 
 
 @router.post("/speak")
@@ -41,29 +100,45 @@ def speak(req: SpeakRequest) -> Response:
         raise HTTPException(status_code=400, detail="empty text")
 
     if not TTSRegistry.contains(req.backend):
-        raise HTTPException(
-            status_code=404,
-            detail=f"tts backend '{req.backend}' not registered. Available: {list(TTSRegistry.keys())}",
-        )
+        # ⚠ NE PLUS ÉNUMÉRER LE REGISTRE. Le message d'origine renvoyait
+        #   `list(TTSRegistry.keys())`, c'est-à-dire l'inventaire des backends
+        #   configurés — donc des intégrations en place et des clés d'API détenues — à
+        #   tout appelant, y compris non identifié. La liste des backends valides est
+        #   déjà dans la description du champ, à destination des clients légitimes.
+        logger.warning("tts: backend inconnu demandé (%r)", req.backend[:40])
+        raise HTTPException(status_code=404, detail="unknown tts backend")
 
-    backend_cls = TTSRegistry.get(req.backend)
-    backend = backend_cls()
-    result = backend.synthesize(
-        text,
-        voice_id=req.voice_id,
-        speed=req.speed,
-        output_format=req.output_format,
-    )
+    backend = _instance(req.backend)
+
+    if not _places.acquire(blocking=False):
+        # ⚠ 503 + `Retry-After` : le client SAIT qu'il doit réessayer, au lieu
+        #   d'interpréter un échec comme une panne du serveur.
+        raise HTTPException(
+            status_code=503,
+            detail="tts busy",
+            headers={"Retry-After": "2"},
+        )
+    try:
+        with _verrous_backend[req.backend]:
+            result = backend.synthesize(  # type: ignore[attr-defined]
+                text,
+                voice_id=req.voice_id,
+                speed=req.speed,
+                output_format=req.output_format,
+            )
+    except Exception as e:  # noqa: BLE001
+        # ⚠ La route n'avait AUCUN gestionnaire : toute erreur du backend (clé d'API
+        #   expirée, modèle absent, voix inconnue) sortait en 500 nu, sans trace
+        #   utilisable. On journalise le détail côté serveur et on rend un message
+        #   stable au client — sans recopier l'exception, qui peut porter une URL
+        #   interne ou un fragment de clé.
+        logger.exception("tts: échec de synthèse (backend=%s)", req.backend)
+        raise HTTPException(status_code=502, detail="tts backend failed") from e
+    finally:
+        _places.release()
 
     fmt = (result.format or req.output_format or "wav").lower()
-    mime_by_fmt = {
-        "wav": "audio/wav",
-        "mp3": "audio/mpeg",
-        "ogg": "audio/ogg",
-        "opus": "audio/ogg",
-        "flac": "audio/flac",
-    }
-    mime = mime_by_fmt.get(fmt, "application/octet-stream")
+    mime = MIME_PAR_FORMAT.get(fmt, "application/octet-stream")
 
     return Response(
         content=result.audio,
@@ -78,9 +153,20 @@ def speak(req: SpeakRequest) -> Response:
 
 @router.get("/speak/health")
 def speak_health() -> dict:
-    backends = list(TTSRegistry.keys())
+    """Sonde de vivacité de la synthèse vocale.
+
+    ⚠ NE PLUS ÉNUMÉRER LES BACKENDS. Cette route rendait `list(TTSRegistry.keys())`,
+      soit exactement la divulgation qu'on vient de retirer du 404 quelques lignes
+      plus haut — sur une route GET, sans authentification, et **sans aucun
+      consommateur** (vérifié : rien dans `frontend/`, `ava_extensions/` ni
+      `scripts/`). L'inventaire des backends dit quelles intégrations sont
+      configurées, donc quelles clés d'API la machine détient.
+      Le nombre suffit à répondre à la seule question utile : « la synthèse est-elle
+      opérationnelle ? »
+    """
     return {
-        "available_backends": backends,
+        "ok": TTSRegistry.contains("kokoro-fr") or bool(list(TTSRegistry.keys())),
+        "backends_enregistres": len(list(TTSRegistry.keys())),
         "default_backend": "kokoro-fr",
         "default_voice": "ff_siwis",
     }
@@ -169,7 +255,19 @@ class LigneEntrante(BaseModel):
       la route conversation ne bornait rien, alors que le motif était sous les yeux.
     """
 
-    role: str = Field(max_length=32)
+    # ⚠ REFUS EXPLICITE PLUTÔT QUE FILTRAGE SILENCIEUX (2026-08-04). Le rôle était un
+    #   `str` libre. `ajouter()` écartait bien les rôles inconnus — la protection
+    #   contre l'injection d'un `system` dans l'historique rejoué a TOUJOURS fonctionné,
+    #   il ne faut pas prétendre le contraire — mais la route rendait **200**, et le
+    #   client n'apprenait le rejet qu'en comparant `ecrites` au nombre de lignes qu'il
+    #   avait envoyées. Personne ne fait cette comparaison. Un client qui se met à
+    #   émettre un rôle invalide (bug de sérialisation, montée de version du frontend)
+    #   croirait donc écrire un historique qui n'existe pas, et le défaut ne se
+    #   manifesterait que bien plus tard, sous la forme « Ava ne se souvient pas » —
+    #   c'est-à-dire loin de sa cause.
+    #   `ajouter()` GARDE son filtre : c'est une fonction publique, appelable hors
+    #   de cette route. Deux couches, chacune à sa place.
+    role: Literal["user", "assistant"]
     texte: str = Field(max_length=8000)
     horodatage: float | None = None
 
