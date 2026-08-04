@@ -74,6 +74,20 @@ def _skills() -> None:
     )
 
 
+def _perception() -> None:
+    """Demarre la perception continue d'Avalon (infra + maison).
+
+    ⚠ Ava etait purement REACTIVE : elle ne percevait rien entre deux questions.
+      pve-02 pouvait tomber, une pile s'epuiser, quelqu'un rentrer — elle l'ignorait
+      jusqu'a ce qu'on le lui demande. Ce groupe la branche sur la cloche du control
+      plane, qui lui donne acces a l'infrastructure ET a la maison (le module
+      `home_assistant` du CP porte presence, temperatures, chauffage et energie).
+    """
+    from ava_extensions.perception.collecteur import demarrer
+
+    demarrer()
+
+
 def _sonde_routage() -> None:
     """Sonde de routage — MESURER avant de router (2026-08-04).
 
@@ -96,3 +110,7 @@ _charger("backends voix (TTS/STT)", _backends)
 _charger("patches SDK Anthropic", _patches)
 _charger("outils Avalon", _skills)
 _charger("sonde de routage", _sonde_routage)
+# ⚠ EN DERNIER, ET C'EST DELIBERE. La perception lance un thread : si elle echoue, tout
+#   ce qui precede (voix, outils, patches) doit deja etre en place. Une Ava qui ne
+#   percoit pas reste une Ava qui parle ; l'inverse ne serait pas vrai.
+_charger("perception continue", _perception)
