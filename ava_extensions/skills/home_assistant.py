@@ -53,7 +53,7 @@ _TIMEOUT_S = 10.0
 # ⚠ Les domaines sont des VUES sur la donnée du CP, pas des requêtes distinctes. Un seul
 #   appel rapporte tout ; le filtre sert à ne pas noyer le modèle quand la question est
 #   précise (« il fait combien dans la chambre ? » n'a pas besoin de la consommation).
-DOMAINES = ("presence", "climat", "chauffage", "energie", "maison")
+DOMAINES = ("presence", "climat", "chauffage", "energie", "maison", "surveillance")
 
 
 def _dashboard() -> dict[str, Any]:
@@ -141,12 +141,37 @@ def _maison(d: dict[str, Any]) -> list[str]:
     return [f"  {nom} : {val}" for nom, val in (d.get("maison") or {}).items()]
 
 
+def _surveillance(d: dict[str, Any]) -> list[str]:
+    """La caméra du parking : ce qu'elle voit, et dans quelles conditions.
+
+    ⚠ CE DOMAINE EXISTE PARCE QUE `DOMAINES` EST UNE LISTE BLANCHE — et c'est le défaut le
+      plus récurrent de tout ce projet, rencontré ici pour la troisième fois : le control
+      plane a beau collecter un champ, s'il n'est relayé par aucune vue, Ava répond « je ne
+      sais pas » sur une donnée qu'elle possède. Écrire la collecte et la RELIER sont deux
+      gestes distincts, et le second se fait oublier parce que le premier « marche ».
+    """
+    c = d.get("camera_parking") or {}
+    if not c:
+        return []
+    lignes = []
+    if moment := c.get("moment"):
+        lignes.append(f"  Il fait {moment} sur le parking")
+    if sd := c.get("carte_sd"):
+        lignes.append(f"  Carte SD : {sd}")
+    # ⚠ Une IA à 0 se comporte EXACTEMENT comme un capteur sain qui ne voit rien. C'est ce
+    #   qui a rendu la détection véhicule invisible du 25 au 28 juillet.
+    if muettes := c.get("detections_muettes"):
+        lignes.append(f"  ⚠ Détection désactivée (sensibilité à 0) : {', '.join(muettes)}")
+    return lignes
+
+
 _VUES = {
     "presence": ("Qui est là", _presence),
     "climat": ("Températures", _climat),
     "chauffage": ("Chauffage des parents", _chauffage),
     "energie": ("Consommation", _energie),
     "maison": ("État de la maison", _maison),
+    "surveillance": ("Caméra du parking", _surveillance),
 }
 
 
@@ -196,7 +221,7 @@ class HomeAssistantTool(BaseTool):
                         "enum": list(DOMAINES),
                         "description": (
                             "Restreint la réponse à un domaine : presence, climat, "
-                            "chauffage, energie, maison. Omettre pour tout obtenir."
+                            "chauffage, energie, maison, surveillance. Omettre pour tout obtenir."
                         ),
                     }
                 },

@@ -71,7 +71,17 @@ DASHBOARD = {
                 },
             },
             "energie": {"baie_serveur_kw": 0.738, "baie_temperature_c": 25.0},
-            "maison": {"Lumière salon": "éteint", "Ballon eau chaude": "31 °C"},
+            "maison": {
+                "Lumière salon": "éteint",
+                "Ballon eau chaude": "31 °C",
+                "Détection véhicule (parking)": "aucune détection",
+            },
+            "camera_parking": {
+                "moment": "jour",
+                "carte_sd_pourcent": 95.22,
+                "carte_sd": "occupée à 95 % (enregistrement en boucle, normal)",
+                "sensibilite_ia": {"personne": 70.0, "véhicule": 50.0, "animal": 50.0},
+            },
             "piles_faibles": [{"nom": "Sonde salon", "niveau": 12.0}],
             "entites_absentes": [],
             "meteo": "orage",
@@ -366,3 +376,42 @@ def test_la_voix_kokoro_fr_est_REELLEMENT_enregistree() -> None:
     from openjarvis.core.registry import TTSRegistry
 
     assert TTSRegistry.contains("kokoro-fr")
+
+
+def test_ha_relaie_la_CAMERA_du_parking(ha: Any) -> None:
+    """⚠ LE MEME DEFAUT POUR LA TROISIEME FOIS, ET C'EST CE QUI JUSTIFIE CE TEST.
+
+    Le 2026-08-04 l'admin signale « Ava ne detecte pas les voitures sur le parking ».
+    Mesure : la camera detecte (32 declenchements en 24 h cote Home Assistant) — le
+    maillon manquant etait la liste `MAISON` du collecteur. Corrige.
+    Mais `DOMAINES` cote Ava est **aussi** une liste blanche : un champ collecte que
+    n'expose aucune vue reste invisible, sans erreur nulle part. Collecter et RELIER
+    sont deux gestes distincts ; le second se fait oublier parce que le premier marche.
+    """
+    sortie = ha.HomeAssistantTool().execute(domaine="surveillance").content
+    assert "parking" in sortie.lower()
+    assert "jour" in sortie
+
+
+def test_ha_dit_qu_une_detection_est_DESACTIVEE(ha: Any, monkeypatch: Any) -> None:
+    """⚠ Une sensibilite IA a 0 se comporte EXACTEMENT comme un capteur sain qui ne voit
+    rien — c'est ce qui a rendu la detection vehicule invisible du 25 au 28 juillet. Ava
+    doit pouvoir trancher en une phrase au lieu d'envoyer enqueter."""
+    dash = {**DASHBOARD}
+    dash["module_data"] = {
+        "home_assistant": {
+            **DASHBOARD["module_data"]["home_assistant"],
+            "camera_parking": {"moment": "nuit", "detections_muettes": ["véhicule"]},
+        }
+    }
+    monkeypatch.setattr(ha, "_dashboard", lambda: dash)
+    sortie = ha.HomeAssistantTool().execute(domaine="surveillance").content
+    assert "véhicule" in sortie and "0" in sortie
+
+
+def test_les_domaines_annonces_ont_TOUS_une_vue(ha: Any) -> None:
+    """Un domaine propose au modele mais sans vue rendrait une reponse vide — et le
+    modele conclurait a une maison sans donnee plutot qu'a un outil incomplet."""
+    spec = ha.HomeAssistantTool().spec
+    annonces = spec.parameters["properties"]["domaine"]["enum"]
+    assert set(annonces) == set(ha._VUES), "enum et _VUES ont divergé"
