@@ -93,7 +93,13 @@ def _resume(d: dict[str, Any]) -> str:
 
     e = d.get("evenements_24h")
     if e and e.get("total"):
-        objets = ", ".join(f"{v} {k}" for k, v in sorted(e["par_objet"].items(), key=lambda x: -x[1]))
+        # ⚠ ACCORD AU PLURIEL : Ava DIT ces phrases à voix haute. « 3 voiture » s'entend,
+        #   et s'entend mal. Les noms retenus ici prennent tous un `s` simple (voiture,
+        #   personne, moto, vélo, chat, chien, camion) — pas de cas particulier à traiter.
+        objets = ", ".join(
+            f"{v} {k}{'s' if v > 1 else ''}"
+            for k, v in sorted(e["par_objet"].items(), key=lambda x: -x[1])
+        )
         lignes.append(f"  Sur 24 h : {e['total']} détections — {objets}.")
         if e.get("par_zone"):
             zones = ", ".join(f"{k} ({v})" for k, v in sorted(e["par_zone"].items(), key=lambda x: -x[1]))

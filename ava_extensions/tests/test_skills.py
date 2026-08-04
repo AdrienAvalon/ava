@@ -513,3 +513,11 @@ def test_camera_est_DISTINCTE_de_home_assistant(cam: Any) -> None:
     d = cam.CameraTool().spec.description
     assert "home_assistant" in d
     assert "INSTANTANÉ" in d or "instantané" in d
+
+
+def test_camera_ACCORDE_au_pluriel(cam: Any) -> None:
+    """⚠ Ava DIT ces phrases a voix haute. « 3 voiture » s'entend, et s'entend mal.
+    Defaut constate sur la sortie reelle, pas en relisant le code."""
+    sortie = cam.CameraTool().execute().content
+    assert "30 voitures" in sortie
+    assert "30 voiture," not in sortie and "30 voiture " not in sortie
