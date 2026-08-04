@@ -238,7 +238,7 @@ def test_le_branchement_au_bus_serveur_est_idempotent() -> None:
 # ══ Isolation entre echanges concurrents — corrige le 2026-08-04 ══════════════════
 
 
-def test_deux_echanges_qui_se_CHEVAUCHENT_ne_melangent_pas_leurs_mesures(
+def test_deux_echanges_qui_se_CHEVAUCHENT_sont_MARQUES_ambigus(
     _journal_temporaire: Path,
 ) -> None:
     """⚠ LE DEFAUT LE PLUS PERNICIEUX DE CETTE SONDE.
@@ -285,16 +285,23 @@ def test_deux_echanges_qui_se_CHEVAUCHENT_ne_melangent_pas_leurs_mesures(
     for f in fils:
         f.join()
 
-    lignes = {
-        ligne["longueur_question"]: ligne for ligne in _lignes(_journal_temporaire)
-    }
-    avec, sans = lignes[10], lignes[4]
-    assert avec["outils"] == ["home_assistant"], "l'echange A a perdu son outil"
-    assert avec["jetons_entree"] == 3200
-    assert avec["modele"] == "claude-sonnet-5"
-    assert sans["outils"] == [], "l'echange B a herite de l'outil de A"
-    assert sans["jetons_entree"] == 90
-    assert sans["modele"] == "claude-haiku-4-5"
+    lignes = _lignes(_journal_temporaire)
+    assert len(lignes) == 2
+    # ⚠ CE QUI EST GARANTI, ET CE QUI NE L'EST PAS — la distinction est le sujet meme
+    #   de ce test. On ne peut PAS rattacher chaque mesure a son echange : l'evenement
+    #   de fin est publie dans un thread different de celui des outils (mesure faite en
+    #   production le 2026-08-04, cf. l'en-tete du module ; un `ContextVar` a ete essaye
+    #   et ne traverse pas davantage).
+    #   Ce qui EST garanti — et c'est tout le progres sur l'etat global d'avant : les
+    #   deux lignes sont MARQUEES `ambigue`, donc filtrables a l'analyse. L'ancienne
+    #   version produisait exactement les memes rapprochements douteux SANS LE DIRE.
+    assert all(x["correlation"] == "ambigue" for x in lignes), [
+        x["correlation"] for x in lignes
+    ]
+    # Et rien n'est INVENTE ni DUPLIQUE : l'outil et les deux comptes de jetons
+    # apparaissent chacun exactement une fois sur l'ensemble.
+    assert sum(len(x["outils"]) for x in lignes) == 1
+    assert sorted(x["jetons_entree"] for x in lignes) == [90, 3200]
 
 
 def test_l_etat_d_un_echange_est_LIBERE_a_sa_fin(_journal_temporaire: Path) -> None:
@@ -325,3 +332,39 @@ def test_les_echanges_JAMAIS_TERMINES_ne_fuient_pas(_journal_temporaire: Path) -
         f.start()
         f.join()
     assert len(routing_probe._etats) <= routing_probe._ETATS_MAX
+
+
+def test_un_echange_SEUL_est_marque_certain(_journal_temporaire: Path) -> None:
+    """⚠ LE CAS NOMINAL, et de loin le plus frequent : Ava sert une poignee d'humains,
+    les echanges se chevauchent rarement. Il doit donc etre mesure EXACTEMENT, et su
+    comme tel — sinon on filtrerait par prudence des lignes parfaitement fiables, et il
+    ne resterait rien pour regler les seuils."""
+    routing_probe._sur_debut_outil(_Evenement({"tool": "home_assistant"}))
+    routing_probe._sur_fin_inference(
+        _Evenement({"model": "claude-sonnet-5", "usage": {"prompt_tokens": 3200}})
+    )
+    routing_probe._sur_echange_termine(
+        _Evenement({"user_text": "il fait quoi dehors ?"})
+    )
+    ligne = _lignes(_journal_temporaire)[0]
+    assert ligne["correlation"] == "certaine"
+    assert ligne["outils"] == ["home_assistant"]
+    assert ligne["jetons_entree"] == 3200
+    assert ligne["outil_appele"] is True
+
+
+def test_une_fin_SANS_etat_est_marquee_aucune(_journal_temporaire: Path) -> None:
+    """Un echange termine sans qu'aucune inference n'ait ete tracee : la ligne existe
+    (on veut compter l'echange) mais elle ne pretend pas mesurer un appel d'outil."""
+    routing_probe._sur_echange_termine(_Evenement({"user_text": "bonjour"}))
+    ligne = _lignes(_journal_temporaire)[0]
+    assert ligne["correlation"] == "aucune"
+    assert ligne["outils"] == []
+    assert ligne["outil_appele"] is False
+
+
+def test_la_correlation_est_TOUJOURS_presente(_journal_temporaire: Path) -> None:
+    """⚠ Le champ ne doit jamais manquer : une ligne sans niveau de confiance serait
+    interpretee comme fiable par defaut — exactement le defaut qu'on corrige."""
+    routing_probe._sur_echange_termine(_Evenement({"user_text": "x"}))
+    assert "correlation" in _lignes(_journal_temporaire)[0]

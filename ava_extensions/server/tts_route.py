@@ -48,8 +48,17 @@ MIME_PAR_FORMAT = {
 #   et `_ensure_pipeline` ne teste que `self._pipeline`) : chaque phrase rechargeait
 #   donc un `KPipeline` complet. La route est un `def`, donc exécutée dans le
 #   threadpool FastAPI — jusqu'à 40 chargements de modèle EN PARALLÈLE, sur une VM qui
-#   n'a pas la mémoire pour un seul de trop. Une boucle de 60 `curl` suffisait à la
-#   mettre par terre, sans authentification ni limite de débit.
+#   n'a pas la mémoire pour un seul de trop.
+#   ⚠ RECTIFICATION D'UNE AFFIRMATION DE L'AUDIT, mesurée le 2026-08-04 : cette route
+#   n'est **pas** anonyme. Le daemon exige `Authorization: Bearer` (`OPENJARVIS_API_KEY`
+#   dans `/home/avalon/ava/.env`, injectée au build du frontend) — un appel sans clé
+#   reçoit un 401, vérifié en direct sur 8000 comme sur le relais 8080. Le scénario
+#   « boucle de 60 curl anonymes » de l'audit était donc faux, et il ne faut pas le
+#   propager. Ce qui restait vrai, et suffit à justifier la correction : le navigateur
+#   POSTe une requête PAR PHRASE, donc plusieurs synthèses se chevauchent réellement à
+#   chaque réponse d'Ava — chacune rechargeant tout un modèle.
+#   Gain mesuré par le vrai chemin HTTP, après correction : 1er appel 2,35 s (chargement
+#   inclus), puis **0,55 s** — soit 4,3× plus rapide dès la deuxième phrase.
 _instances: dict[str, object] = {}
 _verrou_instances = threading.Lock()
 
@@ -102,9 +111,13 @@ def speak(req: SpeakRequest) -> Response:
     if not TTSRegistry.contains(req.backend):
         # ⚠ NE PLUS ÉNUMÉRER LE REGISTRE. Le message d'origine renvoyait
         #   `list(TTSRegistry.keys())`, c'est-à-dire l'inventaire des backends
-        #   configurés — donc des intégrations en place et des clés d'API détenues — à
-        #   tout appelant, y compris non identifié. La liste des backends valides est
-        #   déjà dans la description du champ, à destination des clients légitimes.
+        #   configurés — donc des intégrations en place et des clés d'API détenues.
+        #   Portée exacte (mesurée) : l'appelant est authentifié par `OPENJARVIS_API_KEY`,
+        #   donc ce n'était pas une fuite publique — mais cette clé est **injectée dans le
+        #   bundle du frontend au build**, elle n'a donc pas la valeur d'un secret fort.
+        #   Ne pas divulguer l'inventaire reste le bon réflexe ; ce n'était simplement pas
+        #   une urgence. La liste des backends valides est déjà dans la description du
+        #   champ, à destination des clients légitimes.
         logger.warning("tts: backend inconnu demandé (%r)", req.backend[:40])
         raise HTTPException(status_code=404, detail="unknown tts backend")
 
@@ -157,10 +170,12 @@ def speak_health() -> dict:
 
     ⚠ NE PLUS ÉNUMÉRER LES BACKENDS. Cette route rendait `list(TTSRegistry.keys())`,
       soit exactement la divulgation qu'on vient de retirer du 404 quelques lignes
-      plus haut — sur une route GET, sans authentification, et **sans aucun
-      consommateur** (vérifié : rien dans `frontend/`, `ava_extensions/` ni
-      `scripts/`). L'inventaire des backends dit quelles intégrations sont
-      configurées, donc quelles clés d'API la machine détient.
+      plus haut, et **sans aucun consommateur** (vérifié : rien dans `frontend/`,
+      `ava_extensions/` ni `scripts/`). L'inventaire des backends dit quelles
+      intégrations sont configurées, donc quelles clés d'API la machine détient.
+      ⚠ Comme la route `/speak`, celle-ci est derrière `OPENJARVIS_API_KEY` — ce n'était
+      pas une divulgation publique. Mais cette clé vit dans le bundle du frontend : elle
+      protège d'un passant, pas de quelqu'un qui a ouvert la page.
       Le nombre suffit à répondre à la seule question utile : « la synthèse est-elle
       opérationnelle ? »
     """

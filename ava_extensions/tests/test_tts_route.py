@@ -186,8 +186,12 @@ def test_un_format_inconnu_rend_422_et_non_500(client: Any) -> None:
 
 def test_le_404_ne_divulgue_PAS_l_inventaire_des_backends(client: Any) -> None:
     """⚠ Le message d'origine renvoyait `list(TTSRegistry.keys())` — donc les
-    intégrations configurées, donc les clés d'API détenues — à tout appelant, sur une
-    route sans authentification."""
+    intégrations configurées, donc les clés d'API détenues.
+    Portée exacte, mesurée en prod le 2026-08-04 : la route EST derrière
+    `OPENJARVIS_API_KEY` (un appel sans clé reçoit 401). Ce n'était donc pas une fuite
+    publique, contrairement à ce qu'affirmait l'audit — mais cette clé est injectée
+    dans le bundle du frontend au build, elle protège d'un passant, pas de quelqu'un
+    qui a ouvert la page."""
     r = client.post("/v1/ava/speak", json={"text": "bonjour", "backend": "inexistant"})
     assert r.status_code == 404
     detail = r.json().get("detail", "")

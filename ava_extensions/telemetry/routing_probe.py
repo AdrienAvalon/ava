@@ -75,12 +75,36 @@ _verrou = threading.Lock()
 #   sonde qui attribue les mesures au mauvais échange ne produit pas un bruit — elle
 #   produit une CORRÉLATION INVERSÉE, sur laquelle on réglerait le routage à l'envers.
 #
-# ⚠ La clé est le contexte d'EXÉCUTION, pas un identifiant applicatif : les événements
-#   n'en portent aucun. `EventBus.publish` est **synchrone** (`callback(event)` dans la
-#   boucle de `publish`), donc les trois événements d'un même échange sont émis dans la
-#   même tâche asyncio, ou le même thread pour une route `def`. C'est ce qui rend cette
-#   clé fiable — si un jour l'amont dispatche les événements en tâche de fond, elle
-#   cesserait de l'être et il faudrait un identifiant de corrélation.
+# ⚠ LA CORRÉLATION NE PEUT PAS ÊTRE FAITE PAR LE CONTEXTE D'EXÉCUTION — mesuré en
+#   production le 2026-08-04, après avoir cru le contraire. Sur un échange réel avec
+#   appel d'outil, les clés relevées sont :
+#       inference  cle=125651746027200
+#       outil      cle=125651746027200
+#       inference  cle=125651746027200
+#       FIN        cle=125650636716160   ← AUTRE THREAD
+#   `CHAT_EXCHANGE_COMPLETED` est publié depuis `_record_completed_exchange`, hors du
+#   contexte qui a exécuté les outils. Un `contextvars.ContextVar` a été essayé et ne
+#   traverse pas davantage (`ctxvar=None` côté FIN) : le contexte n'est pas hérité, il
+#   est indépendant.
+#   ⚠ C'est POUR CETTE RAISON que l'état global d'origine « marchait » : il marchait par
+#   accident, et au prix du mélange entre échanges concurrents. Le corriger naïvement
+#   par une clé de contexte ne fait donc pas que déplacer le problème — cela **perd
+#   toutes les mesures d'outils**, ce qu'une première version de ce correctif a fait
+#   pendant quelques minutes en production.
+#
+# ⚠ D'OÙ CE COMPROMIS, ET SON HONNÊTETÉ EST LE POINT ESSENTIEL. La collecte reste
+#   indexée par contexte (outils et jetons, eux, SONT bien émis ensemble). À la fin, on
+#   consomme l'état actif — et l'on ENREGISTRE le niveau de confiance de ce
+#   rapprochement dans la ligne elle-même :
+#     · `certaine` : un seul échange était en cours, aucune ambiguïté possible ;
+#     · `ambigue`  : plusieurs échanges se chevauchaient, on prend le plus ancien (ils
+#                    se terminent approximativement dans l'ordre) — la ligne reste
+#                    exploitable mais se filtre à l'analyse ;
+#     · `aucune`   : aucun état à rapprocher (échange sans inférence tracée).
+#   L'état global d'avant produisait des lignes `ambigue` SANS LE DIRE. Une mesure qui
+#   annonce son incertitude vaut infiniment mieux qu'une mesure fausse d'apparence
+#   propre — c'est tout l'enjeu, puisque ces lignes serviront à régler les seuils
+#   Haiku/Sonnet/Opus.
 _etats: dict[int, dict[str, Any]] = {}
 _verrou_etats = threading.Lock()
 
@@ -114,8 +138,18 @@ def _etat() -> dict[str, Any]:
                 # purge des plus anciennes (dict ordonné par insertion)
                 for vieille in list(_etats)[: len(_etats) - _ETATS_MAX + 1]:
                     _etats.pop(vieille, None)
-            etat = {"_ne_le": time.time()}
+            etat = {"_ne_le": time.time(), "_a_coexiste": bool(_etats)}
             _etats[cle] = etat
+            # ⚠ LA CONTAMINATION SE PROPAGE DANS LES DEUX SENS, et l'oublier produit une
+            #   fausse assurance — trouvé par le test, pas par raisonnement. Si un second
+            #   échange démarre, l'ANCIEN devient lui aussi douteux : à sa fin, il ne
+            #   restera peut-être qu'un seul état, et le rapprochement se déclarerait
+            #   « certain » alors que les deux se sont chevauchés. Compter les états
+            #   présents AU MOMENT DE LA FIN ne suffit donc pas ; il faut se souvenir
+            #   qu'un chevauchement a eu lieu.
+            if len(_etats) > 1:
+                for autre in _etats.values():
+                    autre["_a_coexiste"] = True
         return etat
 
 
@@ -179,6 +213,24 @@ def _sur_fin_inference(evenement: Any) -> None:
                 break
 
 
+def _consommer_etat() -> tuple[dict[str, Any], str]:
+    """L'état de l'échange qui se termine, avec le niveau de confiance du rapprochement.
+
+    ⚠ On ne peut PAS se fier au contexte courant : cet événement est publié depuis un
+      autre thread que les outils (mesuré, cf. l'en-tête). On consomme donc l'état actif
+      le plus ancien, en disant à quel point ce rapprochement est sûr.
+    """
+    with _verrou_etats:
+        if not _etats:
+            return {}, "aucune"
+        cle = next(iter(_etats))  # dict ordonné par insertion → le plus ancien
+        etat = _etats.pop(cle)
+        # `certaine` exige les DEUX conditions : aucun autre état en cours maintenant,
+        # ET aucun chevauchement depuis la naissance de celui-ci.
+        douteux = bool(_etats) or etat.get("_a_coexiste", False)
+        return etat, "ambigue" if douteux else "certaine"
+
+
 def _sur_echange_termine(evenement: Any) -> None:
     d = getattr(evenement, "data", {}) or {}
     # ⚠ LE CHAMP S'APPELLE `user_text` — `publish_completed_exchange` (memory/service.py)
@@ -195,7 +247,7 @@ def _sur_echange_termine(evenement: Any) -> None:
         or d.get("prompt")
         or ""
     )
-    etat = _etat()
+    etat, confiance = _consommer_etat()
     outils = etat.get("outils") or []
 
     _ecrire(
@@ -209,10 +261,12 @@ def _sur_echange_termine(evenement: Any) -> None:
             "modele": etat.get("modele"),
             "jetons_entree": etat.get("jetons_entree"),
             "jetons_sortie": etat.get("jetons_sortie"),
+            # ⚠ Sans ce champ, une ligne issue d'un rapprochement douteux serait
+            #   indiscernable d'une mesure exacte — c'est précisément ce que faisait
+            #   l'état global d'avant.
+            "correlation": confiance,
         }
     )
-    with _verrou_etats:
-        _etats.pop(_cle_echange(), None)
 
 
 def brancher(bus: Any) -> bool:
