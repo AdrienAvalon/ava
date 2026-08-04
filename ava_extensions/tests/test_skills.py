@@ -264,3 +264,55 @@ def test_avalon_status_ne_confond_pas_les_endpoints(
     assert r.success is True
     assert "/hosts" in appels, "les hotes doivent venir de /hosts, jamais de /dashboard"
     assert "98/100" in r.content
+
+
+# ══ boot.py — l'isolation des groupes ══════════════════════════════════════════════
+
+
+def test_un_groupe_casse_n_emporte_pas_les_autres(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """⚠ LE DEFAUT STRUCTUREL CORRIGE LE 2026-08-04.
+
+    `openjarvis/__init__.py` importe `ava_extensions.boot` dans un
+    `try: ... except ImportError: pass`. Avec des imports NUS au niveau du module, un
+    seul echec faisait donc disparaitre TOUT `ava_extensions` — STT, outils, TTS — sans
+    un mot. Ce n'est pas theorique : le 2026-08-03, un `uv sync` aux extras incomplets a
+    retire le SDK `anthropic`, precisement ce qu'importe `patches/`.
+    Il aurait suffi que le moteur demarre par ailleurs pour qu'Ava reponde normalement,
+    **sans aucun de ses outils**. Une panne qui ressemble a un fonctionnement normal est
+    la pire de toutes.
+    """
+    from ava_extensions import boot
+
+    appels: list[str] = []
+
+    def _casse() -> None:
+        raise ModuleNotFoundError("No module named 'anthropic'")
+
+    def _sain() -> None:
+        appels.append("charge")
+
+    with caplog.at_level("WARNING"):
+        boot._charger("groupe casse", _casse)
+        boot._charger("groupe sain", _sain)
+
+    assert appels == ["charge"], "un groupe en echec a empeche le suivant de se charger"
+    # ⚠ L'echec doit LAISSER UNE TRACE : une extension qui disparait sans journal est
+    #   indistinguable d'une extension qui n'a jamais existe.
+    assert "groupe casse" in caplog.text
+    assert "anthropic" in caplog.text
+
+
+def test_charger_attrape_AUSSI_les_erreurs_d_execution() -> None:
+    """⚠ Pas seulement `ImportError` : un module d'extension peut echouer a l'execution
+    de son propre corps (constante mal formee, fichier de configuration absent). Le
+    resultat serait identique — tout le reste perdu — pour une cause qui n'est pas un
+    import manquant.
+    """
+    from ava_extensions import boot
+
+    def _explose() -> None:
+        raise ValueError("configuration illisible")
+
+    boot._charger("groupe qui explose", _explose)  # ne doit pas lever
