@@ -197,15 +197,26 @@ def test_ha_ne_fabrique_pas_de_valeur_absente(
     assert "0" not in r.content.replace("°C", "")
 
 
-def test_ha_est_en_lecture_seule() -> None:
+def test_ha_est_en_lecture_seule(verificateur_lecture_seule: Any) -> None:
     """⚠ INVARIANT DE SECURITE. Le jeton HA autorise l'ECRITURE (allumer, chauffer,
     ouvrir). Cet outil ne doit exposer AUCUN chemin d'ecriture : Ava execute du code
     tiers, et une IA qui interprete de travers une demande ambigue commanderait le
     chauffage d'une maison habitee.
+
+    ⚠ CE TEST CHERCHAIT QUATRE LITTERAUX JUSQU'AU 2026-08-04 — `requests.post`,
+      `urlopen(req, data=`, `"POST"`, `method='POST'` — et **aucun ne couvrait la seule
+      bibliotheque HTTP du fichier**. `home_assistant.py` fait exclusivement du
+      `urllib`, ou `Request(url, data=…)` bascule en POST sans qu'aucun verbe
+      n'apparaisse : le test etait vert par construction, quoi qu'on ajoute.
+      Il delegue desormais a `scripts/verifier-lecture-seule.py` (analyse AST, alias
+      d'import resolus), qui est le MEME detecteur que la CI — pour qu'il n'existe pas
+      deux definitions de l'invariant qui divergent. Elles divergeaient deja : le grep
+      existait en double, et les deux copies etaient aveugles de la meme facon.
+      Le detecteur est lui-meme couvert par `test_lecture_seule.py`.
     """
     source = (RACINE / "skills" / "home_assistant.py").read_text()
-    for interdit in ("requests.post", "urlopen(req, data=", '"POST"', "method='POST'"):
-        assert interdit not in source, f"chemin d'ecriture potentiel : {interdit}"
+    constats = verificateur_lecture_seule.analyser(source)
+    assert constats == [], f"chemin(s) d'ecriture dans home_assistant.py : {constats}"
 
 
 def _code_sans_commentaires(chemin: Path) -> str:

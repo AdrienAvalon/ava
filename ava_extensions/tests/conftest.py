@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 import importlib
 
 import pytest
@@ -37,3 +38,26 @@ def _reenregistrer_les_extensions() -> None:
             "ava_extensions.backends.openai_whisper_ava_stt"
         )
         importlib.reload(module)
+
+
+@pytest.fixture(scope="session")
+def verificateur_lecture_seule():
+    """Le détecteur de chemins d'écriture HTTP (`scripts/verifier-lecture-seule.py`).
+
+    ⚠ Chargé PAR CHEMIN, et exposé en fixture plutôt qu'importé de fichier à fichier.
+      Deux raisons : le script porte un tiret (donc n'est pas importable par son nom),
+      et surtout le test doit porter sur le fichier RÉELLEMENT exécuté par la CI. Une
+      copie du détecteur dans les tests dériverait — c'est exactement ce qui était
+      arrivé au `grep` qu'il remplace, dupliqué entre le workflow et `test_skills.py`,
+      les deux copies étant aveugles de la même façon.
+    """
+    import importlib.util
+
+    chemin = (
+        Path(__file__).resolve().parents[2] / "scripts" / "verifier-lecture-seule.py"
+    )
+    spec = importlib.util.spec_from_file_location("verifier_lecture_seule", chemin)
+    assert spec and spec.loader, f"détecteur introuvable : {chemin}"
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module

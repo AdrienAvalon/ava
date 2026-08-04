@@ -97,12 +97,23 @@ jobs:
       - name: "Invariant : l'outil Home Assistant reste en LECTURE SEULE"
         run: |
           # ⚠ INVARIANT DE SECURITE. Le jeton HA autorise l'ECRITURE (allumer, chauffer,
-          #   ouvrir). Ava execute du code tiers : aucun chemin d'ecriture ne doit
-          #   apparaitre ici, meme par inadvertance lors d'un merge.
-          if grep -nE '"POST"|requests\.post|method=.POST' ava_extensions/skills/home_assistant.py; then
-            echo "::error::chemin d'ecriture detecte dans l'outil home_assistant"
-            exit 1
-          fi
+          #   ouvrir). Ava execute du code tiers depuis la DMZ : aucun chemin d'ecriture
+          #   ne doit apparaitre ici, meme par inadvertance lors d'un merge.
+          #
+          # ⚠ CE PAS ETAIT UN `grep` AVEUGLE JUSQU'AU 2026-08-04, et c'est le pire etat
+          #   possible pour un garde-fou : present, intitule « INVARIANT DE SECURITE »,
+          #   vert a chaque execution, et incapable de voir une ecriture.
+          #   Il cherchait `"POST"`, `requests.post` et `method=POST` — or ce fichier
+          #   n'utilise NI `requests` NI de verbe explicite : uniquement `urllib`, ou
+          #   **passer `data=` suffit a basculer en POST**. Mesure : le grep rend 1
+          #   (aucune correspondance) sur
+          #     `urllib.request.Request(url, data=json.dumps(charge).encode())`
+          #   c'est-a-dire sur une ecriture parfaitement fonctionnelle.
+          #   Le detecteur AST le remplace : il raisonne sur la STRUCTURE de l'appel,
+          #   resout les alias d'import, et il est lui-meme couvert par 19 tests
+          #   (`ava_extensions/tests/test_lecture_seule.py`) — un garde-fou non teste
+          #   se comporte exactement comme un garde-fou qui marche.
+          uv run python scripts/verifier-lecture-seule.py ava_extensions/skills/home_assistant.py
 
       # ⚠ `--select F` (pyflakes) EST BLOQUANT, `E501` NE L'EST PAS — et la distinction
       #   n'est pas du confort. C'est `F821` qui a trouvé, le 2026-08-04, un
