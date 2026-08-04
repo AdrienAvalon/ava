@@ -33,5 +33,7 @@ def _reenregistrer_les_extensions() -> None:
     from openjarvis.core.registry import SpeechRegistry
 
     if not SpeechRegistry.contains("openai_ava"):
-        module = importlib.import_module("ava_extensions.backends.openai_whisper_ava_stt")
+        module = importlib.import_module(
+            "ava_extensions.backends.openai_whisper_ava_stt"
+        )
         importlib.reload(module)
