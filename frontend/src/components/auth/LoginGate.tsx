@@ -1,5 +1,58 @@
+import { useEffect, useRef } from 'react';
 import { useAuth } from 'react-oidc-context';
 import type { PropsWithChildren } from 'react';
+
+/**
+ * ⚠ AUTO-LOGIN — pourquoi ce comportement, et pourquoi il a fallu l'ajouter.
+ *
+ * Ava est derrière DEUX SSO empilés : Cloudflare Access (silencieux, car son
+ * fournisseur d'identité EST Keycloak) puis le SSO propre à Ava. Sans auto-login,
+ * l'utilisateur franchit Access sans s'en rendre compte… et tombe sur un écran
+ * « SE CONNECTER » qui redirige vers le MÊME Keycloak où il vient de s'authentifier.
+ * Un clic pour rien, à chaque visite — et l'impression que la connexion a échoué.
+ *
+ * C'est exactement ce que l'infrastructure a déjà réglé pour Grafana
+ * (`GF_AUTH_GENERIC_OAUTH_AUTO_LOGIN=true`), avec la même contrepartie obligatoire :
+ * un break-glass. D'où les deux gardes ci-dessous.
+ */
+
+/** ⚠ BREAK-GLASS. Si Keycloak tombe ou qu'une session est corrompue, l'auto-login
+ *  renverrait en boucle vers un fournisseur en panne, sans aucun moyen de reprendre la
+ *  main. `?noauto` rend le bouton — c'est le pendant du `/login?disableAutoLogin` de
+ *  Grafana, et il doit exister AVANT d'en avoir besoin. */
+function autoLoginDesactive(): boolean {
+  try {
+    return new URLSearchParams(window.location.search).has('noauto');
+  } catch {
+    return false;
+  }
+}
+
+/** ⚠ ANTI-BOUCLE, et c'est le garde-fou qui compte vraiment.
+ *  Si la redirection revient sans authentifier (session Keycloak expirée, cookie
+ *  bloqué, `prompt=none` refusé), un auto-login inconditionnel repartirait aussitôt :
+ *  la page clignoterait indéfiniment entre Ava et Keycloak, sans jamais afficher
+ *  d'erreur. On n'essaie donc qu'une fois par fenêtre de 30 s ; passé cet essai,
+ *  l'écran manuel reprend la main et l'utilisateur voit ce qui se passe. */
+const CLE_TENTATIVE = 'ava.autologin.dernier';
+const FENETRE_MS = 30_000;
+
+function tentativeRecente(): boolean {
+  try {
+    const t = Number(sessionStorage.getItem(CLE_TENTATIVE) || 0);
+    return t > 0 && Date.now() - t < FENETRE_MS;
+  } catch {
+    return true; // sessionStorage indisponible → on ne tente pas, on montre le bouton
+  }
+}
+
+function marquerTentative(): void {
+  try {
+    sessionStorage.setItem(CLE_TENTATIVE, String(Date.now()));
+  } catch {
+    /* navigation privée : le bouton reste, c'est le repli correct */
+  }
+}
 
 /**
  * Guard wrapper: renders the GitS-themed login screen while the user is not authenticated,
@@ -7,6 +60,15 @@ import type { PropsWithChildren } from 'react';
  */
 export function LoginGate({ children }: PropsWithChildren) {
   const auth = useAuth();
+  const lance = useRef(false);
+
+  useEffect(() => {
+    if (auth.isLoading || auth.isAuthenticated || auth.error) return;
+    if (lance.current || autoLoginDesactive() || tentativeRecente()) return;
+    lance.current = true;
+    marquerTentative();
+    void auth.signinRedirect();
+  }, [auth.isLoading, auth.isAuthenticated, auth.error, auth]);
 
   if (auth.isLoading) {
     return <Screen title="AUTHENTICATING" subtitle="... sync with keycloak ..." />;
@@ -27,6 +89,9 @@ export function LoginGate({ children }: PropsWithChildren) {
   }
 
   if (!auth.isAuthenticated) {
+    // ⚠ On n'arrive ici QUE si l'auto-login est désactivé, a déjà été tenté sans
+    //   succès, ou que la redirection est en cours. Le bouton reste donc le filet —
+    //   jamais le chemin normal.
     return (
       <Screen
         title="AVA"
