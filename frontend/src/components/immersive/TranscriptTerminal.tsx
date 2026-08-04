@@ -81,7 +81,11 @@ export function TranscriptTerminal() {
   //   que la conversation s'y consulte du coin de l'œil.
   const cadre: React.CSSProperties = vp.chatFirst
     ? {
-        left: 8, right: 8,
+        left: 8,
+        // ⚠ Sur portable, on laisse la colonne de droite à l'orbe (32vw + une gouttière).
+        //   Sans ça, le terminal passe SOUS elle : l'orbe reste visible en transparence
+        //   par-dessus le texte, et les deux deviennent pénibles à lire.
+        right: vp.orbeACote ? 'calc(32vw + 12px)' : 8,
         top: vp.topBar + 4,
         bottom: vp.bottomBar + 8,
         // ⚠ Pas de `maxHeight` ici : `top` ET `bottom` fixent la hauteur. En ajouter une

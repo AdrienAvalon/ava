@@ -8,7 +8,24 @@ interface Message {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-const MODEL = 'claude-sonnet-4-6';
+/**
+ * ⚠ LE MODÈLE EST CODÉ EN DUR ICI, ET C'EST UN PIÈGE COÛTEUX (constaté le 2026-08-04).
+ *
+ * Le frontend envoie ce nom dans le corps de la requête, donc il **écrase la
+ * configuration du serveur**. On a passé `default_model` à `claude-sonnet-5` côté VM en
+ * croyant avoir changé le modèle d'Ava : le navigateur a continué d'envoyer
+ * `claude-sonnet-4-6`, et rien ne l'a signalé — les deux existent, les deux répondent.
+ *
+ * ⚠ Le HUD affiche cette même constante : il annonçait donc fidèlement un modèle que le
+ *   serveur n'avait pas choisi. Deux sources de vérité pour une seule valeur, dont une
+ *   invisible depuis la machine.
+ *
+ * Correction de fond possible (non faite) : ne PAS envoyer `model` du tout et laisser le
+ * serveur décider — c'est lui qui porte la configuration. Elle demande de vérifier que le
+ * daemon retombe bien sur `config.server.model` quand le champ est absent, et de revoir
+ * le HUD, qui n'aurait alors rien à afficher avant le premier échange.
+ */
+const MODEL = 'claude-sonnet-5';
 const MAX_TOKENS = 800;
 
 const TTS_BACKEND = "openai_tts";

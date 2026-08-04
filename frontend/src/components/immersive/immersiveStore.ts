@@ -93,6 +93,49 @@ const emptyCognitive: CognitiveSignals = {
  */
 const MAX_LIGNES = 400;
 
+/**
+ * ⚠ L'HISTORIQUE SURVIT AU RECHARGEMENT DE LA PAGE (2026-08-04).
+ *
+ * Il ne vivait qu'en mémoire : un F5 et toute la conversation disparaissait. L'admin l'a
+ * signalé en une phrase — « j'ai rafraîchi la page et il n'y avait plus rien » — et c'est
+ * une critique juste : un terminal qui perd tout au moindre rechargement ne remplit pas
+ * la fonction qu'on lui demandait, à savoir « voir tout l'historique ».
+ *
+ * ⚠ `sessionStorage` ET NON `localStorage` : la conversation avec Ava porte des données
+ *   personnelles (présence des gens dans la maison, état de l'infrastructure). Elle
+ *   disparaît donc à la fermeture de l'onglet, ce qui reste conforme à l'esprit d'une
+ *   « session ». `localStorage` la garderait indéfiniment sur le disque du navigateur,
+ *   y compris sur un poste partagé — un compromis que personne n'a demandé.
+ *
+ * ⚠ Toute lecture/écriture est protégée : un navigateur en navigation privée stricte,
+ *   ou un quota atteint, fait LEVER ces API. Une conversation ne doit pas casser parce
+ *   que son journal ne peut pas être écrit.
+ */
+const CLE_STOCKAGE = 'ava.transcript.v1';
+
+function chargerTranscript(): TurnLine[] {
+  try {
+    const brut = sessionStorage.getItem(CLE_STOCKAGE);
+    if (!brut) return [];
+    const lignes = JSON.parse(brut);
+    if (!Array.isArray(lignes)) return [];
+    // ⚠ Aucune ligne n'est réputée « en cours d'écriture » après un rechargement : le
+    //   flux qui l'alimentait est mort avec la page. Sans ce nettoyage, la dernière
+    //   réponse d'Ava garderait son curseur clignotant pour toujours.
+    return lignes.map((l: TurnLine) => ({ ...l, streaming: false })).slice(-MAX_LIGNES);
+  } catch {
+    return [];
+  }
+}
+
+function sauverTranscript(lignes: TurnLine[]): void {
+  try {
+    sessionStorage.setItem(CLE_STOCKAGE, JSON.stringify(lignes));
+  } catch {
+    /* quota atteint ou stockage indisponible — la conversation continue sans journal */
+  }
+}
+
 let compteur = 0;
 const heure = () =>
   new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
@@ -102,7 +145,7 @@ export const useImmersiveStore = create<ImmersiveStore>((set) => ({
   userMsg: '',
   avaMsg: '',
   runtime: { model: null, engine: null, tts: null, stt: null },
-  transcript: [],
+  transcript: chargerTranscript(),
   cognitive: { ...emptyCognitive },
   rippleKey: 0,
 
@@ -112,12 +155,14 @@ export const useImmersiveStore = create<ImmersiveStore>((set) => ({
   setAvaMsg: (avaMsg) => set({ avaMsg }),
 
   pushLine: (role, text) =>
-    set((prev) => ({
-      transcript: [
+    set((prev) => {
+      const transcript = [
         ...prev.transcript,
         { id: ++compteur, role, text, at: heure() },
-      ].slice(-MAX_LIGNES),
-    })),
+      ].slice(-MAX_LIGNES);
+      sauverTranscript(transcript);
+      return { transcript };
+    }),
 
   // ⚠ Le flux d'Ava MET À JOUR la dernière ligne au lieu d'en créer une par fragment.
   //   Sans ça, une réponse de 300 mots produirait des centaines de lignes d'une syllabe
@@ -142,10 +187,18 @@ export const useImmersiveStore = create<ImmersiveStore>((set) => ({
       const derniere = prev.transcript[prev.transcript.length - 1];
       if (!derniere?.streaming) return {};
       const copie = prev.transcript.slice(0, -1);
-      return { transcript: [...copie, { ...derniere, streaming: false }] };
+      // ⚠ On persiste ICI, a la FIN du flux, et pas a chaque fragment : `streamAva`
+      //   est appele des dizaines de fois par reponse, et serialiser 400 lignes a
+      //   chaque token ferait ramer la page pour rien.
+      const transcript = [...copie, { ...derniere, streaming: false }];
+      sauverTranscript(transcript);
+      return { transcript };
     }),
 
-  clearTranscript: () => set({ transcript: [] }),
+  clearTranscript: () => {
+    sauverTranscript([]);
+    set({ transcript: [] });
+  },
   setCognitive: (c) => set((prev) => ({ cognitive: { ...prev.cognitive, ...c } })),
   clearCognitive: () => set({ cognitive: { ...emptyCognitive } }),
 }));

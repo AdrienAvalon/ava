@@ -210,12 +210,22 @@ function OrbGroup({ state, groupScale }: OrbGroupProps) {
 interface OrbAuraProps {
   state: ImmersiveState;
   groupScale?: number;
+  /**
+   * Cadre du canvas. Par défaut plein écran (`inset: 0`) — la vue « présence » d'origine.
+   *
+   * ⚠ EXISTE POUR METTRE L'ORBE DANS UN COIN (demande de l'admin, 2026-08-04 : « le
+   *   terminal de chat avec l'historique et l'affichage d'Ava un peu plus petit ou dans
+   *   un coin »). Réduire seulement `groupScale` ne suffisait pas : le canvas reste
+   *   plein écran, donc l'orbe reste CENTRÉE — juste plus petite, et toujours derrière
+   *   le terminal. Il faut déplacer le cadre, pas la sphère.
+   */
+  cadre?: React.CSSProperties;
 }
 
-export function OrbAura({ state, groupScale = 1.3 }: OrbAuraProps) {
+export function OrbAura({ state, groupScale = 1.3, cadre }: OrbAuraProps) {
   return (
     <Canvas
-      style={{ position: 'fixed', inset: 0, pointerEvents: 'none' }}
+      style={{ position: 'fixed', inset: 0, pointerEvents: 'none', ...cadre }}
       camera={{ position: [0, 0, 7.5], fov: 45 }}
       dpr={[1, 2]}
       gl={{ antialias: true, alpha: true }}

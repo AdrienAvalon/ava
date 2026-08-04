@@ -71,7 +71,27 @@ export function ImmersivePage() {
         pointerEvents: 'none', zIndex: 999,
       }} />
 
-      <OrbAura state={state} groupScale={vp.orbScale} />
+      {/* ⚠ EN MODE CONVERSATION, L'ORBE VA DANS UN COIN — elle ne peut pas rester
+          centrée : le terminal occupe désormais l'espace utile et la masquerait
+          entièrement. Réduire son échelle ne suffisait pas (le canvas reste plein écran,
+          donc l'orbe reste au milieu, simplement plus petite et toujours cachée).
+          Elle est donc cadrée en haut à droite, au-dessus du terminal — visible comme
+          signe de présence, sans disputer la place à la conversation. */}
+      <OrbAura
+        state={state}
+        groupScale={vp.orbScale}
+        cadre={
+          vp.orbeACote
+            ? // Portable : colonne de droite, sur toute la hauteur — l'orbe garde sa
+              // présence sans recouvrir la conversation.
+              { inset: 'auto', top: 0, right: 0, bottom: 0, width: '32vw' }
+            : vp.chatFirst
+              ? // Téléphone : vignette en haut à droite, SOUS le bandeau (topBar = 46)
+                // pour ne pas passer derrière les boutons CHAT et VOIX.
+                { inset: 'auto', top: 46, right: 0, width: 180, height: 180 }
+              : undefined
+        }
+      />
       <StateRings />
       <HudLayers />
       {!vp.hideCognitive && <CognitivePanel />}
