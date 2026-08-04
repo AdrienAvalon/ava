@@ -26,12 +26,32 @@ _ADAPTIVE_THINKING_MODELS = frozenset(
 # Modèles qui rejettent temperature/top_p/top_k avec thinking
 _NO_SAMPLING_WITH_THINKING = frozenset({"claude-opus-4-7"})
 
+# ⚠ GÉNÉRATION 5 : `temperature` EST REFUSÉ, TOUJOURS — pas seulement avec thinking.
+#   L'API répond `400 invalid_request_error: "temperature is deprecated for this model"`,
+#   et OpenJarvis l'envoie systématiquement (`engine/cloud.py`) : **tout appel échoue**.
+#   Vécu le 2026-08-04 en passant `default_model` de `claude-sonnet-4-6` à
+#   `claude-sonnet-5` — Ava a cessé de répondre d'un coup.
+#   ⚠ ET LE SYMPTÔME NE DÉSIGNE PAS LA CAUSE : le navigateur affiche « Error during
+#   generation: Client error '400 Bad Request' », l'API rend un `500 Internal Server
+#   Error` sans trace, et le journal systemd ne montre rien. Le motif utile est enterré
+#   trois couches plus bas, dans le SDK. On part chercher une clé invalide, un quota
+#   épuisé, un nom de modèle inexistant — trois pistes fausses.
+#   ⚠ Préfixes et non liste exhaustive : `claude-sonnet-5`, `claude-opus-5` et leurs
+#   futures variantes datées partagent la contrainte. Énumérer obligerait à éditer ce
+#   fichier à chaque sortie, et l'oubli se paierait par une panne TOTALE.
+_TEMPERATURE_INTERDITE = ("claude-sonnet-5", "claude-opus-5", "claude-fable-5")
+
 _PATCH_MARKER = "_ava_enhanced"
 
 
 def _enhance_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     """Injecte thinking + cache_control sur un appel messages.create/stream."""
     model = kwargs.get("model", "") or ""
+
+    # ⚠ AVANT toute autre logique : un `temperature` refusé fait échouer l'appel entier,
+    #   quels que soient les autres réglages. On le retire donc en premier.
+    if model.startswith(_TEMPERATURE_INTERDITE):
+        kwargs.pop("temperature", None)
 
     # --- Extended thinking (adaptive) ---
     if model in _ADAPTIVE_THINKING_MODELS and "thinking" not in kwargs:
