@@ -6,6 +6,7 @@ agent.default_system_prompt. Ce patch comble le gap : si system_prompt_path
 est défini et que le fichier existe, on le lit et on écrase
 default_system_prompt au moment du premier accès à la config.
 """
+
 from __future__ import annotations
 
 import logging

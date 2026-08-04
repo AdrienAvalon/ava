@@ -5,21 +5,24 @@ cache_control ephemeral dans tous les appels messages.create / stream
 faits par OpenJarvis via le SDK anthropic. Idempotent : safe à importer
 plusieurs fois.
 """
+
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable
+from typing import Any
 
 import anthropic.resources.messages as _ant_msgs
 
 log = logging.getLogger(__name__)
 
 # Modèles Claude 4.6+ qui supportent adaptive thinking (cf doc API 2026-04)
-_ADAPTIVE_THINKING_MODELS = frozenset({
-    "claude-opus-4-7",
-    "claude-opus-4-6",
-    "claude-sonnet-4-6",
-})
+_ADAPTIVE_THINKING_MODELS = frozenset(
+    {
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+    }
+)
 # Modèles qui rejettent temperature/top_p/top_k avec thinking
 _NO_SAMPLING_WITH_THINKING = frozenset({"claude-opus-4-7"})
 

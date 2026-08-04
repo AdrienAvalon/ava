@@ -31,6 +31,7 @@ tourne. Les autres outils décrivent l'infrastructure ; celui-ci décrit le mond
   dont le module est dégradé. Le code ci-dessous les distingue explicitement — c'est ce qui
   évite de chercher une heure du mauvais côté.
 """
+
 from __future__ import annotations
 
 import json
@@ -92,8 +93,11 @@ def _presence(d: dict[str, Any]) -> list[str]:
 def _climat(d: dict[str, Any]) -> list[str]:
     lignes: list[str] = []
     t = d.get("temperatures") or {}
-    for cle, libelle in (("exterieur", "Extérieur"), ("grange", "Grange (moyenne)"),
-                         ("parents", "Parents (moyenne)")):
+    for cle, libelle in (
+        ("exterieur", "Extérieur"),
+        ("grange", "Grange (moyenne)"),
+        ("parents", "Parents (moyenne)"),
+    ):
         v = _nombre(t.get(cle), " °C")
         if v:
             lignes.append(f"  {libelle} : {v}")
@@ -223,8 +227,11 @@ class HomeAssistantTool(BaseTool):
                 success=False,
             )
         except Exception as exc:  # pragma: no cover - défensif
-            return ToolResult(tool_name=self.tool_id,
-                              content=f"Erreur inattendue : {exc}", success=False)
+            return ToolResult(
+                tool_name=self.tool_id,
+                content=f"Erreur inattendue : {exc}",
+                success=False,
+            )
 
         # ⚠ LA CLÉ EST `module_health`, PAS `modules`. Le dashboard n'expose que
         #   `module_data`, `module_health`, `networks`, `score`, `version`, `widgets`.

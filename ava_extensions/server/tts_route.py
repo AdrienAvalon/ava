@@ -3,6 +3,7 @@
 Returns raw audio bytes with the correct `audio/*` MIME type, usable directly
 from the browser as an `<audio>` source or `new Audio(blob)`.
 """
+
 from __future__ import annotations
 
 import logging
@@ -18,7 +19,6 @@ from pydantic import BaseModel, Field
 import openjarvis.speech  # noqa: F401
 from openjarvis.core.registry import TTSRegistry
 
-
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/ava", tags=["ava"])
 
@@ -26,7 +26,10 @@ router = APIRouter(prefix="/v1/ava", tags=["ava"])
 class SpeakRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=500)
     voice_id: str = Field("ff_siwis", description="Voice identifier for the backend")
-    backend: str = Field("kokoro-fr", description="TTS backend key (kokoro-fr, kokoro, cartesia, openai_tts)")
+    backend: str = Field(
+        "kokoro-fr",
+        description="TTS backend key (kokoro-fr, kokoro, cartesia, openai_tts)",
+    )
     speed: float = Field(1.0, ge=0.5, le=2.0, description="Playback speed multiplier")
     output_format: str = Field("wav", description="Preferred audio format (wav, mp3)")
 
@@ -96,6 +99,7 @@ def _load_persona() -> str:
     """Load the Ava persona system prompt, respecting config.agent.system_prompt_path."""
     try:
         from openjarvis.core.config import load_config
+
         cfg = load_config()
         path = getattr(getattr(cfg, "agent", None), "system_prompt_path", None)
     except Exception:
@@ -130,6 +134,7 @@ def prewarm_kokoro() -> None:
     Called from FastAPI startup hook (see openjarvis.server.app). Logged on
     failure rather than swallowed silently.
     """
+
     def _worker() -> None:
         try:
             if not TTSRegistry.contains("kokoro-fr"):
@@ -140,4 +145,5 @@ def prewarm_kokoro() -> None:
             logger.info("kokoro-fr prewarm completed")
         except Exception as exc:
             logger.warning("kokoro-fr prewarm failed: %s", exc)
+
     threading.Thread(target=_worker, daemon=True, name="kokoro-prewarm").start()

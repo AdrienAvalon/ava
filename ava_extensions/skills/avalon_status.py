@@ -4,6 +4,7 @@ Enregistré comme tool OpenJarvis via @ToolRegistry.register("avalon_status").
 Ava peut linvoquer quand Adrien demande "comment va linfra", "quel est le
 score", etc.
 """
+
 from __future__ import annotations
 
 import json
@@ -102,8 +103,10 @@ def _format_summary(data: dict[str, Any]) -> str:
     hosts = _fetch_hosts()
     if hosts:
         inactifs = [
-            h for h in hosts
-            if isinstance(h, dict) and (h.get("active") is False or h.get("maintenance"))
+            h
+            for h in hosts
+            if isinstance(h, dict)
+            and (h.get("active") is False or h.get("maintenance"))
         ]
         detail = ""
         if inactifs:
@@ -154,7 +157,14 @@ class AvalonStatusTool(BaseTool):
         except urllib.error.URLError as exc:
             return ToolResult(
                 tool_name=self.tool_id,
-                content=f"Impossible de joindre le Control Plane v2 ({CP_V2_URL}): {exc}",
+                # ⚠ Etait `CP_V2_URL` — un nom QUI N'EXISTE PAS (la constante s'appelle
+                #   `CP_V2_BASE`). Ce chemin ne s'emprunte que si le control plane est
+                #   injoignable : le jour ou il l'aurait ete, l'outil aurait leve un
+                #   `NameError` AU LIEU d'afficher son message d'erreur. Un gestionnaire
+                #   d'erreur casse ne se voit jamais tant que l'erreur ne survient pas —
+                #   c'est-a-dire jamais avant le pire moment.
+                #   Trouve par `ruff` (F821) le 2026-08-04, en branchant la CI du fork.
+                content=f"Impossible de joindre le Control Plane v2 ({CP_V2_BASE}): {exc}",
                 success=False,
             )
         except Exception as exc:  # pragma: no cover - defensive

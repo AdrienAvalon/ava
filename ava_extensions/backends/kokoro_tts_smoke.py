@@ -3,15 +3,16 @@
 
 Usage : uv run python ava_extensions/backends/kokoro_tts_smoke.py
 """
+
 from __future__ import annotations
 
 import os
 import time
 from pathlib import Path
 
-from dotenv import load_dotenv
 import numpy as np
 import soundfile as sf
+from dotenv import load_dotenv
 
 load_dotenv()
 

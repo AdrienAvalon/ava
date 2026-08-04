@@ -4,6 +4,7 @@ Override de l upstream KokoroTTSBackend qui est câblé en lang_code=\"a\"
 (US English) : on fournit un backend distinct enregistré sous l ID
 \"kokoro-fr\" qui utilise lang_code=\"f\" et la voix validée \"ff_siwis\".
 """
+
 from __future__ import annotations
 
 from typing import List

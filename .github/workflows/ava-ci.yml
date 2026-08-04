@@ -1,0 +1,146 @@
+# CI propre au fork Ava.
+#
+# ⚠ POURQUOI UN FICHIER DEDIE PLUTOT QUE D'AJOUTER `ava-main` AUX WORKFLOWS EXISTANTS.
+#   Les 12 workflows herites d'OpenJarvis se declenchent tous sur `main` — la branche
+#   qui miroite l'amont. Notre travail vit sur `ava-main` : ils ne l'ont donc JAMAIS
+#   analyse. Une CI qui ne s'execute pas ressemble beaucoup a une CI qui passe.
+#   Y ajouter notre branche marcherait... jusqu'a la prochaine synchronisation amont, ou
+#   chaque fichier modifie deviendrait un conflit a resoudre. Ce fichier-ci n'existe pas
+#   en amont : il ne peut pas entrer en conflit. Meme raisonnement que `ava_extensions/`,
+#   qui a encaisse 353 commits amont sans une seule collision.
+name: ava-ci
+
+on:
+  push:
+    branches: [ava-main, 'ava/**']
+  pull_request:
+    branches: [ava-main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ava-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  extensions:
+    name: Extensions Ava (tests + invariants)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # ⚠ La version vient de `.python-version` (valeur 3.12), PAS du systeme. La VM de
+      #   production suit le meme fichier ; compiler ou tester sur une autre version
+      #   validerait un environnement que personne n'execute.
+      - name: Synchroniser l'environnement
+        run: |
+          uv python install
+          uv sync --extra dev --extra server --extra inference-cloud
+
+      # ⚠ Les tests des extensions AVANT ceux de l'amont : ils sont a nous, ils sont
+      #   rapides, et c'est la zone ou nos regressions apparaissent.
+      - name: Tests des extensions Ava
+        run: uv run pytest ava_extensions/tests/ -q
+
+      # ── Invariants du fork — ce qu'une synchronisation amont peut casser en silence ──
+      - name: "Invariant : le micro reste autorise (microphone=(self))"
+        run: |
+          # ⚠ CONFLIT RECURRENT, ET LE PLUS DANGEREUX DU DEPOT. L'amont pose
+          #   `microphone=()` dans Permissions-Policy, ce qui DESACTIVE la capture vocale
+          #   du navigateur. Sur un assistant VOCAL, le resoudre a la va-vite coupe le
+          #   micro partout — sans erreur : le bouton reagit, `getUserMedia` echoue en
+          #   NotAllowedError, et l'on part chercher une autorisation navigateur.
+          grep -q 'microphone=(self)' src/openjarvis/server/middleware.py || {
+            echo "::error file=src/openjarvis/server/middleware.py::microphone=(self) a disparu — la dictee d'Ava est morte"
+            exit 1
+          }
+
+      - name: "Invariant : boot.py charge toutes les extensions"
+        run: |
+          # ⚠ Un backend ou un outil present sur le disque mais jamais IMPORTE est du
+          #   code mort que rien ne signale : le decorateur d'enregistrement ne s'execute
+          #   pas, le registre reste vide, et aucune erreur n'est levee.
+          for module in kokoro_fr_tts openai_whisper_ava_stt avalon_status home_assistant; do
+            grep -q "$module" ava_extensions/boot.py || {
+              echo "::error file=ava_extensions/boot.py::$module n'est plus importe — il ne s'enregistrera jamais"
+              exit 1
+            }
+          done
+
+      - name: "Invariant : l'outil Home Assistant reste en LECTURE SEULE"
+        run: |
+          # ⚠ INVARIANT DE SECURITE. Le jeton HA autorise l'ECRITURE (allumer, chauffer,
+          #   ouvrir). Ava execute du code tiers : aucun chemin d'ecriture ne doit
+          #   apparaitre ici, meme par inadvertance lors d'un merge.
+          if grep -nE '"POST"|requests\.post|method=.POST' ava_extensions/skills/home_assistant.py; then
+            echo "::error::chemin d'ecriture detecte dans l'outil home_assistant"
+            exit 1
+          fi
+
+      # ⚠ `--select F` (pyflakes) EST BLOQUANT, `E501` NE L'EST PAS — et la distinction
+      #   n'est pas du confort. C'est `F821` qui a trouvé, le 2026-08-04, un
+      #   `CP_V2_URL` inexistant dans le gestionnaire d'erreur d'`avalon_status` : le
+      #   jour où le control plane serait devenu injoignable, l'outil aurait levé un
+      #   `NameError` AU LIEU d'afficher son message. Un gestionnaire d'erreur cassé ne
+      #   se voit jamais tant que l'erreur ne survient pas — donc jamais avant le pire
+      #   moment. Voilà ce qu'on veut bloquer.
+      #   `E501` signale des COMMENTAIRES longs, volontairement denses dans ce dépôt
+      #   (ils portent le « pourquoi », c'est leur travail). Le rendre bloquant
+      #   pousserait à raccourcir des explications pour faire verdir un job — soit
+      #   exactement l'inverse du but. Le code amont lui-même en compte 5.
+      - name: "Lint des extensions (bugs réels — bloquant)"
+        run: uv run ruff check ava_extensions/ --select F,E7,E9
+
+      - name: "Style des extensions (informatif)"
+        run: uv run ruff check ava_extensions/ --select E501 || true
+
+      - name: Formatage
+        run: uv run ruff format --check ava_extensions/
+
+  frontend:
+    name: Frontend (types + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+
+      - name: Verification des types
+        run: npx tsc --noEmit
+
+      - name: Build
+        run: npm run build
+
+      # ⚠ CE CONTROLE EXISTE PARCE QUE LE DEFAUT A ETE VECU (2026-08-03). `index.html`
+      #   etait precache par le service worker : les deploiements n'atteignaient JAMAIS
+      #   les telephones, le serveur servant pourtant le bon bundle. Un deploiement qui
+      #   n'atteint personne se lit exactement comme un deploiement reussi.
+      #   La regle `NetworkFirst` censee l'empecher existait deja — et etait inerte, le
+      #   precache ayant la priorite sur le runtimeCaching.
+      - name: "Invariant PWA : index.html hors du precache"
+        run: |
+          SW=../src/openjarvis/server/static/sw.js
+          test -f "$SW" || { echo "::error::sw.js absent — le build PWA a echoue"; exit 1; }
+          if grep -q 'index\.html' "$SW"; then
+            echo "::error::index.html est precache par le service worker : les deploiements n'atteindront pas les navigateurs deja venus"
+            exit 1
+          fi
+          grep -q 'ava-html' "$SW" || {
+            echo "::error::le cache runtime NetworkFirst des navigations a disparu"
+            exit 1
+          }
