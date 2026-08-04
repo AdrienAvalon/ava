@@ -180,6 +180,33 @@ else
   echo "   ✗ extension Rust ABSENTE — security/ est inerte"; echec=1
 fi
 
+# ⚠ LA TELEMETRIE EXTERNE DOIT RESTER COUPEE. Ajoutee en amont par la PR #351 du
+#   17 mai 2026, elle est entree ici par la synchronisation amont du 3 aout et a pousse
+#   des evenements vers une instance PostHog tierce — `https://34.231.106.201.sslip.io`,
+#   une IP AWS derriere un domaine wildcard qui encode l IP dans son nom.
+#   `enabled` vaut **True par defaut** en amont et il n existe AUCUN opt-out par variable
+#   d environnement : la seule facon de la couper est `[analytics] enabled = false` dans
+#   `~/.openjarvis/config.toml`, qui vit HORS GIT. Une reinstallation, une remise a zero
+#   de la config ou une prochaine synchro amont la rallumerait donc en silence.
+#   Ce qui l a rendue visible n est pas une revue de code mais une **alerte de securite** :
+#   l egress DMZ bloque ces envois, chaque echec est retente, et Zeek a compte
+#   ~430 connexions en 2 h vers une meme IP externe → « Beaconing suspect (egress DMZ
+#   soutenu) ». Une alerte qui tire pour du bruit connu finit ignoree : c est le pire
+#   resultat possible, et c est pourquoi ce controle est ici plutot qu en commentaire.
+if ssh_vm "cd $RACINE_VM && ./.venv/bin/python -c \"
+import sys
+from openjarvis.core.config import load_config
+from openjarvis.analytics.identity import is_analytics_enabled
+sys.exit(0 if not is_analytics_enabled(load_config().analytics) else 1)
+\"" 2>/dev/null; then
+  echo "   ✓ telemetrie externe (PostHog) coupee"
+else
+  echo "   ✗ TELEMETRIE EXTERNE ACTIVE — des evenements d usage partent vers un tiers,"
+  echo "     et l egress DMZ les bloque en boucle (alerte « Beaconing suspect »)."
+  echo "     Corriger : [analytics] enabled = false dans ~/.openjarvis/config.toml"
+  echec=1
+fi
+
 # Le SDK anthropic manquant ne se voit qu'au demarrage suivant, par un message qui ne
 # le nomme pas. On le controle donc explicitement.
 if ssh_vm "cd $RACINE_VM && ./.venv/bin/python -c 'import anthropic'" 2>/dev/null; then

@@ -709,3 +709,33 @@ ava_extensions/backends/piper_models/
 ---
 
 _Fichier vivant. Mis à jour à chaque session. Dernière révision : 2026-04-16 (suppression cloisonnement profils, synthèse OpenJarvis)._
+
+## ⚠ Telemetrie externe (PostHog) — COUPEE le 2026-08-04, et a re-verifier apres chaque synchro amont
+
+OpenJarvis **pousse par defaut** des evenements d'usage vers une instance PostHog tierce :
+`https://34.231.106.201.sslip.io` — une IP AWS derriere un domaine *wildcard DNS* qui encode
+l'IP dans son propre nom. Ajoute en amont par la **PR #351 du 17 mai 2026**
+(`src/openjarvis/core/config.py`, `AnalyticsConfig.enabled = True`), entre dans ce fork par la
+**synchronisation amont du 3 aout** (353 commits).
+
+**Coupe par `[analytics] enabled = false` dans `~/.openjarvis/config.toml`** (VM Ava).
+⚠ **C'est le SEUL opt-out** : il n'existe ni variable d'environnement, ni `DO_NOT_TRACK` —
+`is_analytics_enabled()` ne lit que cette cle. Et `config.toml` **vit hors git** : une
+reinstallation, une remise a zero de la config ou une prochaine synchro amont la rallumerait
+**en silence**. D'ou le controle dans `scripts/deploy-vm.sh` (etape 6), qui fait echouer le
+deploiement si la telemetrie est active.
+
+> ⚠ **CE N'EST PAS UNE REVUE DE CODE QUI L'A TROUVEE, C'EST UNE ALERTE DE SECURITE.**
+> L'egress DMZ **bloque** ces envois → chaque echec est retente en boucle → Zeek a compte
+> **~430 connexions en 2 h** vers une meme IP externe depuis `192.168.100.15`, ce qui a
+> declenche l'alerte Grafana **« Beaconing suspect (egress DMZ soutenu) »**. Le motif etait
+> exactement celui d'un canal C2 : intervalles reguliers, meme destination, hote DMZ.
+> **La lecon vaut au-dela de ce cas** : une dependance amont peut ajouter un flux sortant
+> sans que rien dans le diff ne saute aux yeux, et c'est le reseau qui le dit — pas le code.
+> Et une alerte de securite qui tire pour du bruit connu finit ignoree : c'est le pire
+> resultat possible, donc on coupe la cause plutot que de museler la regle.
+
+**Diagnostic, si le motif revient** : `{job="zeek"} | json | id_orig_h="192.168.100.15"` pour
+compter les connexions, puis **les logs du resolveur unbound** (`{unit="unbound.service"}`) pour
+obtenir le **nom de domaine** — l'IP seule ne dit rien, c'est la requete DNS qui a nomme
+`34.231.106.201.sslip.io` et permis de remonter a PostHog en une minute.
