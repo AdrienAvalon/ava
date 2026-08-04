@@ -327,3 +327,40 @@ def test_charger_attrape_AUSSI_les_erreurs_d_execution() -> None:
         raise ValueError("configuration illisible")
 
     boot._charger("groupe qui explose", _explose)  # ne doit pas lever
+
+
+# ══ Enregistrement dans le registre — transpose du STT le 2026-08-04 ══════════════
+
+
+@pytest.mark.parametrize("cle", ["avalon_status", "home_assistant", "memoire"])
+def test_l_outil_est_REELLEMENT_enregistre(cle: str) -> None:
+    """⚠ AUCUN TEST NE VERIFIAIT CECI, et c'est le seul qui attraperait la panne.
+
+    Tous les tests ci-dessus chargent les outils PAR CHEMIN DE FICHIER, en neutralisant
+    `@ToolRegistry.register` (`_charger`, en haut de ce fichier) pour contourner le
+    nettoyage de registres du conftest amont. Consequence : la suite entiere pouvait
+    etre verte alors que le modele ne voyait AUCUN outil.
+
+    Il suffit que la cle change lors d'une resynchro amont (`home_assistant` →
+    `homeassistant`), ou que le decorateur saute sur un conflit de fusion : Ava repond
+    « je n'ai pas acces a la maison » sur une infra parfaitement saine, et rien ne le
+    signale — le decorateur qui ne s'execute pas ne leve aucune erreur, il laisse juste
+    le registre vide.
+
+    C'est la classe exacte de l'incident du 2026-04-27, pour lequel
+    `test_le_backend_est_enregistre` a ete ecrit cote STT et jamais transpose ici.
+    """
+    from openjarvis.core.registry import ToolRegistry
+
+    assert ToolRegistry.contains(cle), (
+        f"outil {cle!r} absent du ToolRegistry — le decorateur s'est-il execute ?"
+    )
+
+
+def test_la_voix_kokoro_fr_est_REELLEMENT_enregistree() -> None:
+    """Meme raisonnement pour le TTS — et il porte desormais la voix par defaut d'Ava
+    (bascule du 2026-08-04 : `openai_tts` → `kokoro-fr`). Un registre TTS sans
+    `kokoro-fr` rend Ava MUETTE, chaque phrase repondant 404."""
+    from openjarvis.core.registry import TTSRegistry
+
+    assert TTSRegistry.contains("kokoro-fr")

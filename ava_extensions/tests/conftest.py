@@ -24,20 +24,45 @@ import importlib
 import pytest
 
 
+# ⚠ LES TROIS REGISTRES, PAS UN SEUL (étendu le 2026-08-04). Cette fixture ne réarmait
+#   que `SpeechRegistry`, donc **aucun des tests n'observait jamais `ToolRegistry`** —
+#   et `test_skills.py` neutralise volontairement le décorateur `@ToolRegistry.register`
+#   pour charger les outils par chemin de fichier. Résultat : si la clé passait de
+#   `home_assistant` à `homeassistant` lors d'une resynchro amont, ou si le décorateur
+#   sautait sur un conflit de fusion, **le modèle ne verrait plus l'outil** — Ava
+#   répondrait « je n'ai pas accès à la maison » sur une infra parfaitement saine — et
+#   la suite resterait verte, tous les tests `ha_*` chargeant la classe par son chemin.
+#   C'est exactement l'incident du 2026-04-27, pour lequel `test_le_backend_est_enregistre`
+#   a été écrit côté STT et **jamais transposé aux outils ni au TTS**.
+_MODULES_PAR_CLE: tuple[tuple[str, str, str], ...] = (
+    ("SpeechRegistry", "openai_ava", "ava_extensions.backends.openai_whisper_ava_stt"),
+    ("TTSRegistry", "kokoro-fr", "ava_extensions.backends.kokoro_fr_tts"),
+    ("ToolRegistry", "avalon_status", "ava_extensions.skills.avalon_status"),
+    ("ToolRegistry", "home_assistant", "ava_extensions.skills.home_assistant"),
+    ("ToolRegistry", "memoire", "ava_extensions.skills.memoire"),
+)
+
+
 @pytest.fixture(autouse=True)
 def _reenregistrer_les_extensions() -> None:
     """Garantit que les extensions d'Ava sont dans les registres, quel que soit l'ordre.
 
     Se place APRÈS la fixture de nettoyage d'OpenJarvis : pytest applique les fixtures
     du conftest le plus proche en dernier, donc ce rechargement gagne.
-    """
-    from openjarvis.core.registry import SpeechRegistry
 
-    if not SpeechRegistry.contains("openai_ava"):
-        module = importlib.import_module(
-            "ava_extensions.backends.openai_whisper_ava_stt"
-        )
-        importlib.reload(module)
+    ⚠ Réimporter ne suffit PAS : Python met les imports en cache, et un second `import`
+      ne ré-exécute pas le décorateur d'enregistrement. Il faut `importlib.reload()`.
+    """
+    import openjarvis.core.registry as reg
+
+    for nom_registre, cle, module in _MODULES_PAR_CLE:
+        registre = getattr(reg, nom_registre, None)
+        if registre is None or registre.contains(cle):
+            continue
+        try:
+            importlib.reload(importlib.import_module(module))
+        except Exception:  # noqa: BLE001 — un module absent est le sujet du test, pas une erreur de fixture
+            pass
 
 
 @pytest.fixture(scope="session")
