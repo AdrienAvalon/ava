@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { chargerHistoriqueModele, useImmersiveStore } from './immersiveStore';
 import { ajouterConversation, lireConversation } from './memoireServeur';
+import { brancherAnalyseur, relacherAnalyseur } from './voixAmplitude';
 
 interface Message {
   role: 'user' | 'assistant' | 'system';
@@ -118,7 +119,16 @@ function playBuffer(
   const src = ctx.createBufferSource();
   src.buffer = buffer;
   src.connect(ctx.destination);
-  src.onended = onEnded;
+  // ⚠ L'analyseur est branché EN DÉRIVATION : la source va à la fois vers la sortie
+  //   audio ET vers lui. C'est ce qui permet à l'orbe de pulser sur la VRAIE voix
+  //   d'Ava — silences entre les mots, attaques de syllabes, respiration des phrases —
+  //   plutôt que sur une animation fabriquée dont le rythme n'aurait aucun rapport
+  //   avec ce qui est prononcé. L'œil fait très bien la différence.
+  brancherAnalyseur(ctx, src);
+  src.onended = () => {
+    relacherAnalyseur();
+    onEnded();
+  };
   try {
     src.start();
   } catch {

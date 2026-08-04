@@ -1,5 +1,6 @@
 import { useMemo, useRef } from 'react';
 import { Canvas, useFrame } from '@react-three/fiber';
+import { amplitudeVoix, respirationSynthetique } from './voixAmplitude';
 import * as THREE from 'three';
 import { particleVertex, particleFragment, lineVertex, lineFragment } from './shaders/orbShaders';
 import { STATES, type ImmersiveState } from './immersiveStates';
@@ -119,6 +120,9 @@ function OrbGroup({ state, groupScale }: OrbGroupProps) {
     };
   }, [uniforms]);
 
+  // Amplitude de voix lissée entre deux images — `useRef` et non `useState` :
+  // elle change 60 fois par seconde et ne doit JAMAIS déclencher de rendu React.
+  const voixLissee = useRef(0);
   const targetColA = useRef(new THREE.Color(STATES.idle.colorA));
   const targetColB = useRef(new THREE.Color(STATES.idle.colorB));
 
@@ -145,6 +149,41 @@ function OrbGroup({ state, groupScale }: OrbGroupProps) {
       innerMat.opacity += (target.wireOp * 2.5 - innerMat.opacity) * lerp;
       outerMat.color.lerp(targetColA.current, lerp);
       innerMat.color.lerp(targetColB.current, lerp);
+    }
+
+    // ══ L'orbe PARLE ══════════════════════════════════════════════════════════════
+    // ⚠ Sans ce bloc, `speaking` n'était qu'un ÉTAT : l'orbe changeait d'apparence au
+    //   début de la réponse puis restait figée jusqu'à la fin. Elle est maintenant
+    //   pilotée par l'amplitude RÉELLE de la voix (analyseur inséré dans la chaîne
+    //   audio), donc elle articule au lieu de vibrer.
+    // ⚠ Repli synthétique quand aucun audio n'est disponible — voix coupée, TTS en
+    //   échec, lecture bloquée faute de geste utilisateur. Sans lui l'orbe resterait
+    //   parfaitement immobile pendant qu'un texte défile : pire que l'animation
+    //   constante d'avant, parce qu'elle aurait l'air plantée.
+    const parle = state === 'speaking';
+    const brut = parle ? amplitudeVoix() : 0;
+    const voix = parle
+      ? (brut > 0.02 ? brut : respirationSynthetique(uniforms.time.value))
+      : 0;
+    // Lissage supplémentaire côté rendu : l'amplitude audio saute d'une image à
+    // l'autre, et une sphère qui suit chaque pic donne un tremblement, pas une voix.
+    voixLissee.current += (voix - voixLissee.current) * Math.min(8 * dt, 0.35);
+    const v = voixLissee.current;
+
+    if (parle || v > 0.001) {
+      // Trois effets, parce qu'un seul se lit comme un clignotement :
+      //  · le RAYON gonfle       → la sphère « prend de l'air » sur les voyelles ;
+      //  · le BRUIT s'agite      → la surface se déforme, elle n'est pas rigide ;
+      //  · les POINTS grossissent → l'énergie se voit jusque dans la matière.
+      uniforms.radius.value += v * 0.16;
+      uniforms.noiseAmplitude.value += v * 0.35;
+      uniforms.pointSize.value += v * 1.6;
+      if (groupRef.current) {
+        // ⚠ Amplitude volontairement FAIBLE (4 %) : au-delà, la sphère « saute » et
+        //   l'effet devient comique. C'est la somme des trois effets qui donne
+        //   l'impression de parole, pas l'ampleur de l'un d'eux.
+        groupRef.current.scale.multiplyScalar(1 + v * 0.04);
+      }
     }
 
     uniforms.time.value += dt * target.speed * 2.4;

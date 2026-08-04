@@ -4,7 +4,9 @@ import { ArrowLeft, Volume2, VolumeX } from 'lucide-react';
 import { useState } from 'react';
 import { useImmersiveStore } from './immersiveStore';
 import { OrbAura } from './OrbAura';
-import { ConversationCinetic } from './ConversationCinetic';
+// ⚠ Import conservé volontairement en commentaire : le composant existe toujours pour un
+//   futur mode « vitrine » (écran mural, sans terminal). Cf. le bloc explicatif plus bas.
+// import { ConversationCinetic } from './ConversationCinetic';
 import { TranscriptTerminal } from './TranscriptTerminal';
 import { CognitivePanel } from './CognitivePanel';
 import { Waveform } from './Waveform';
@@ -95,13 +97,19 @@ export function ImmersivePage() {
       <StateRings />
       <HudLayers />
       {!vp.hideCognitive && <CognitivePanel />}
-      {/* ⚠ PAS LES DEUX EN MODE CONVERSATION. `ConversationCinetic` affiche le dernier
-          échange en très grand au centre de l'écran ; le terminal affiche le même
-          échange, en bas de sa liste. Sur un téléphone où le terminal occupe désormais
-          toute la hauteur utile, les deux se superposent et disent la même chose deux
-          fois — le texte géant passant PAR-DESSUS l'historique. Sur grand écran ils
-          cohabitent sans se gêner, et le focal garde tout son sens. */}
-      {!vp.chatFirst && <ConversationCinetic />}
+      {/* ⚠ `ConversationCinetic` N'EST PLUS AFFICHÉ NULLE PART — retiré le 2026-08-04 à la
+          demande de l'admin : « enlever la réponse d'Ava en gros au centre de la page,
+          car ça fait doublon avec le terminal ».
+          Il affichait le dernier échange en 34 px au centre — la « présence » de la spec
+          v2, écrite quand la conversation n'était conservée nulle part. Depuis que le
+          terminal existe, le même texte apparaît deux fois : une fois en grand par-dessus,
+          une fois dans l'historique. Lire deux fois la même phrase à deux endroits n'est
+          pas de la présence, c'est du bruit.
+          ⚠ Le composant est CONSERVÉ (non supprimé) : c'est lui qui porterait un futur
+          mode « vitrine » sans terminal, sur un écran mural par exemple. Le supprimer
+          ferait perdre ce travail pour économiser un import.
+          La présence est désormais portée par l'ORBE, qui réagit à la parole — cf.
+          `OrbAura`, où l'animation a été retravaillée le même jour. */}
       <TranscriptTerminal />
       <Waveform />
 
