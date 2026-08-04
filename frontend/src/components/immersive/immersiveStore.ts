@@ -71,6 +71,9 @@ interface ImmersiveStore {
   /** Ferme la ligne d'Ava en cours (fin de réponse). */
   endAvaStream: () => void;
   clearTranscript: () => void;
+  /** Incrémenté à chaque effacement — `useDaemonChat` s'en sert pour vider AUSSI le
+   *  contexte envoyé au modèle, qu'il détient dans une ref hors du store. */
+  effacements: number;
   /** Remplace l'historique par celui du serveur (source de vérité inter-appareils). */
   hydraterDepuisServeur: (lignes: TurnLine[]) => void;
   setCognitive: (c: Partial<CognitiveSignals>) => void;
@@ -121,11 +124,51 @@ const MAX_LIGNES = 400;
  *   ou un quota atteint, fait LEVER ces API. Une conversation ne doit pas casser parce
  *   que son journal ne peut pas être écrit.
  */
-const CLE_STOCKAGE = 'ava.transcript.v1';
+/**
+ * ⚠ LA CLÉ EST NAMESPACÉE PAR UTILISATEUR — corrigé le 2026-08-04 après audit
+ *   multi-agent. Elle valait `'ava.transcript.v1'`, une constante GLOBALE : le
+ *   cloisonnement serveur était donc **court-circuité côté client**.
+ *
+ *   Scénario démontré par l'audit, sur la tablette ou le poste partagé de la maison :
+ *   Adrien converse (présence des personnes, état de l'infra) → l'historique va sur le
+ *   disque du navigateur. Aurélie se connecte dans le même profil ; son historique
+ *   serveur est vide, donc l'hydratation abandonne — et elle voit toute la conversation
+ *   d'Adrien, étiquetée « ⌈ ADRIEN ⌉ ». Pire : sa première question part au modèle avec
+ *   les 40 derniers tours d'Adrien en contexte.
+ *
+ *   ⚠ Aggravant relevé par l'audit : les jetons OIDC vivent en `sessionStorage` (perdus
+ *   à la fermeture de l'onglet) alors que le transcript est en `localStorage`. Les deux
+ *   durées de vie sont asymétriques — fermer l'onglet suffit à perdre l'identité en
+ *   gardant l'historique. Aucune déconnexion explicite n'est même nécessaire.
+ *
+ * ⚠ SANS IDENTITÉ, ON NE PERSISTE RIEN. Écrire dans un seau commun est exactement la
+ *   faute déjà corrigée côté serveur (`conversation.py` rend `None` au lieu d'« anonyme »).
+ */
+function cleStockage(): string | null {
+  try {
+    for (let i = 0; i < sessionStorage.length; i++) {
+      const cle = sessionStorage.key(i);
+      if (!cle || !cle.startsWith('oidc.user:')) continue;
+      const brut = sessionStorage.getItem(cle);
+      if (!brut) continue;
+      const jeton: string = JSON.parse(brut)?.id_token || '';
+      const corps = jeton.split('.')[1];
+      if (!corps) continue;
+      const charge = JSON.parse(atob(corps.replace(/-/g, '+').replace(/_/g, '/')));
+      const sub = charge?.sub || charge?.preferred_username;
+      if (sub) return `ava.transcript.v2:${sub}`;
+    }
+  } catch {
+    /* stockage indisponible ou jeton illisible */
+  }
+  return null;
+}
 
 function chargerTranscript(): TurnLine[] {
   try {
-    const brut = localStorage.getItem(CLE_STOCKAGE);
+    const cle = cleStockage();
+    if (!cle) return [];
+    const brut = localStorage.getItem(cle);
     if (!brut) return [];
     const lignes = JSON.parse(brut);
     if (!Array.isArray(lignes)) return [];
@@ -140,7 +183,9 @@ function chargerTranscript(): TurnLine[] {
 
 function sauverTranscript(lignes: TurnLine[]): void {
   try {
-    localStorage.setItem(CLE_STOCKAGE, JSON.stringify(lignes));
+    const cle = cleStockage();
+    if (!cle) return; // pas d'identité → aucune persistance, jamais de seau commun
+    localStorage.setItem(cle, JSON.stringify(lignes));
   } catch {
     /* quota atteint ou stockage indisponible — la conversation continue sans journal */
   }
@@ -183,6 +228,7 @@ export const useImmersiveStore = create<ImmersiveStore>((set) => ({
   avaMsg: '',
   runtime: { model: null, engine: null, tts: null, stt: null },
   transcript: chargerTranscript(),
+  effacements: 0,
   cognitive: { ...emptyCognitive },
   rippleKey: 0,
 
@@ -232,10 +278,16 @@ export const useImmersiveStore = create<ImmersiveStore>((set) => ({
       return { transcript };
     }),
 
-  clearTranscript: () => {
-    sauverTranscript([]);
-    set({ transcript: [] });
-  },
+  clearTranscript: () =>
+    set((prev) => {
+      sauverTranscript([]);
+      // ⚠ `effacements` existe parce que `history.current` (le contexte réellement
+      //   envoyé au modèle) vit dans une `useRef` de `useDaemonChat`, hors du store.
+      //   Sans ce signal, « vider » n'effaçait que l'AFFICHAGE : Ava continuait de
+      //   renvoyer la conversation effacée au modèle. L'utilisateur croyait avoir
+      //   effacé — la pire forme d'échec pour une commande d'effacement.
+      return { transcript: [], effacements: prev.effacements + 1 };
+    }),
 
   /**
    * Remplace l'historique par celui du SERVEUR.

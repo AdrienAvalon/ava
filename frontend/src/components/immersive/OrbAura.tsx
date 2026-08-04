@@ -175,14 +175,27 @@ function OrbGroup({ state, groupScale }: OrbGroupProps) {
       //  · le RAYON gonfle       → la sphère « prend de l'air » sur les voyelles ;
       //  · le BRUIT s'agite      → la surface se déforme, elle n'est pas rigide ;
       //  · les POINTS grossissent → l'énergie se voit jusque dans la matière.
-      uniforms.radius.value += v * 0.16;
-      uniforms.noiseAmplitude.value += v * 0.35;
-      uniforms.pointSize.value += v * 1.6;
+      //
+      // ⚠ ON POSE LA VALEUR, ON NE L'INCRÉMENTE PAS — corrigé après l'audit du
+      //   2026-08-04, qui a démontré le défaut par simulation de la boucle réelle.
+      //   `uniforms` est un objet `useMemo([])`, donc PERSISTANT entre les images : un
+      //   `+=` s'ajoutait à la valeur déjà interpolée quelques lignes plus haut, image
+      //   après image. Les deux forces finissaient par s'équilibrer, mais à un point
+      //   dépendant de la fréquence d'affichage — l'orbe respirait donc plus fort sur un
+      //   écran 144 Hz que sur un 60 Hz, et dérivait pendant les longues réponses.
+      //   `target.*` est la cible de l'état courant : la modulation s'y applique
+      //   proprement, sans mémoire d'une image à l'autre.
+      uniforms.radius.value = target.radius + v * 0.16;
+      uniforms.noiseAmplitude.value = target.noiseAmp + v * 0.35;
+      uniforms.pointSize.value = target.pointSize + v * 1.6;
       if (groupRef.current) {
         // ⚠ Amplitude volontairement FAIBLE (4 %) : au-delà, la sphère « saute » et
         //   l'effet devient comique. C'est la somme des trois effets qui donne
         //   l'impression de parole, pas l'ampleur de l'un d'eux.
-        groupRef.current.scale.multiplyScalar(1 + v * 0.04);
+        //   ⚠ `setScalar` et non `multiplyScalar` : ce dernier multipliait l'échelle
+        //     DÉJÀ modulée de l'image précédente — la sphère enflait sans fin pendant
+        //     une longue réponse.
+        groupRef.current.scale.setScalar(groupScale * (1 + v * 0.04));
       }
     }
 

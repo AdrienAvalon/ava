@@ -100,7 +100,12 @@ CLAUDE.md
 
 # Research output
 research_mining_*
-.python-version
+# ⚠ `.python-version` EST VOLONTAIREMENT SUIVI depuis le 2026-08-04 (audit multi-agent).
+#   Il était ignoré, donc absent du dépôt — alors que la CI l'invoque (`uv python
+#   install`) et que la VM de production s'y aligne. Un clone neuf ou un runner CI
+#   choisissait donc une version de Python AU HASARD, et la wheel Rust compilée pour
+#   `cp312` n'y aurait pas été chargée. Le défaut ne se voit qu'au moment où l'on
+#   reconstruit — c'est-à-dire au pire moment.
 src/openjarvis/channels/whatsapp_baileys_bridge/node_modules/
 
 # SQLite in-memory artifacts

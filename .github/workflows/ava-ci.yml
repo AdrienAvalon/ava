@@ -80,7 +80,14 @@ jobs:
           # ⚠ Un backend ou un outil present sur le disque mais jamais IMPORTE est du
           #   code mort que rien ne signale : le decorateur d'enregistrement ne s'execute
           #   pas, le registre reste vide, et aucune erreur n'est levee.
-          for module in kokoro_fr_tts openai_whisper_ava_stt avalon_status home_assistant; do
+          # ⚠ LES HUIT MODULES, pas quatre — l'audit du 2026-08-04 a relevé que ce pas
+          #   s'intitule « boot.py charge TOUTES les extensions » alors qu'il n'en
+          #   vérifiait que la moitié. Un contrôle qui affirme couvrir un ensemble et n'en
+          #   couvre qu'une partie est pire qu'un contrôle absent : on cesse de vérifier
+          #   à la main ce qu'on le croit vérifier.
+          for module in kokoro_fr_tts openai_whisper_ava_stt anthropic_enhancements \
+                        system_prompt_loader avalon_status home_assistant memoire \
+                        routing_probe; do
             grep -q "$module" ava_extensions/boot.py || {
               echo "::error file=ava_extensions/boot.py::$module n'est plus importe — il ne s'enregistrera jamais"
               exit 1

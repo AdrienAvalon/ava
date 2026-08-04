@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useImmersiveStore } from './immersiveStore';
+import { effacerConversation } from './memoireServeur';
 import { useViewportScale } from './useViewportScale';
 
 /**
@@ -129,8 +130,16 @@ export function TranscriptTerminal() {
         <span style={{ display: 'flex', gap: 10 }}>
           {transcript.length > 0 && (
             <button
-              onClick={clear}
-              title="Effacer l'historique affiché (la session serveur n'est pas touchée)"
+              onClick={() => {
+                // ⚠ EFFACER DOIT EFFACER PARTOUT — l'audit du 2026-08-04 a montré que ce
+                //   bouton ne vidait que l'AFFICHAGE : la conversation restait en base
+                //   côté serveur et dans `history.current`, donc Ava continuait de s'en
+                //   souvenir et de la renvoyer au modèle. L'utilisateur croyait avoir
+                //   effacé — c'est la pire forme d'échec pour une commande d'effacement.
+                clear();
+                void effacerConversation();
+              }}
+              title="Effacer définitivement cette conversation — affichage, serveur et mémoire d'Ava"
               style={btnDiscret}
             >
               vider

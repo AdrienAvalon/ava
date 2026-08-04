@@ -202,10 +202,20 @@ export function useDaemonChat() {
    *   local — deux mémoires divergentes, et une IA qui se contredit sans qu'aucune
    *   erreur n'apparaisse.
    */
+  // ⚠ Vider l'affichage doit vider le CONTEXTE MODÈLE. Sans cet effet, `history.current`
+  //   gardait la conversation effacée et la renvoyait au modèle à la question suivante.
+  const effacements = useImmersiveStore((s) => s.effacements);
+  useEffect(() => {
+    if (effacements > 0) history.current = [];
+  }, [effacements]);
+
   useEffect(() => {
     let annule = false;
     lireConversation().then((lignes) => {
-      if (annule || !lignes.length) return;
+      // ⚠ `null` = serveur muet → on garde le cache. `[]` = le serveur AFFIRME qu'il n'y
+      //   a pas d'historique → on vide, y compris le contexte modèle. Confondre les deux
+      //   faisait hériter un nouvel utilisateur de la conversation du précédent.
+      if (annule || lignes === null) return;
       const s = useImmersiveStore.getState();
       s.hydraterDepuisServeur(
         lignes.map((l, i) => ({

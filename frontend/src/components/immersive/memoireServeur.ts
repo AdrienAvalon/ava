@@ -56,17 +56,27 @@ export interface LigneServeur {
   horodatage: number;
 }
 
-/** Historique de l'utilisateur courant. Rend `[]` si le serveur est muet. */
-export async function lireConversation(): Promise<LigneServeur[]> {
+/**
+ * Historique de l'utilisateur courant.
+ *
+ * ⚠ REND `null` QUAND LE SERVEUR EST MUET, ET `[]` QUAND IL RÉPOND VIDE — la distinction
+ *   est load-bearing, et son absence était une FUITE (audit du 2026-08-04).
+ *   Les deux cas rendaient `[]`, et l'appelant abandonnait l'hydratation dans les deux.
+ *   Or « le serveur dit que tu n'as pas d'historique » doit VIDER le cache local, tandis
+ *   que « le serveur est injoignable » doit le CONSERVER. Confondus, un utilisateur qui
+ *   se connecte pour la première fois sur un navigateur partagé héritait de l'historique
+ *   du précédent.
+ */
+export async function lireConversation(): Promise<LigneServeur[] | null> {
   try {
     const r = await fetch('/v1/ava/conversation', { headers: entetes() });
-    if (!r.ok) return [];
+    if (!r.ok) return null; // 401/500 : on ne sait rien, on garde ce qu'on a
     const d = await r.json();
     return Array.isArray(d?.lignes) ? d.lignes : [];
   } catch {
-    // ⚠ Un serveur injoignable ne doit pas empêcher de CONVERSER — on perd la mémoire
-    //   de cette session, pas l'usage d'Ava.
-    return [];
+    // ⚠ Un serveur injoignable ne doit pas empêcher de CONVERSER — on perd la mise à
+    //   jour de la mémoire, pas l'usage d'Ava.
+    return null;
   }
 }
 

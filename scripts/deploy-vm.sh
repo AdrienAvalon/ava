@@ -83,7 +83,14 @@ else
 fi
 
 titre "4/6  Frontend"
-ssh_vm "cd $RACINE_VM/frontend && npm ci --silent && npm run build 2>&1 | grep -E 'built in|precache|error'"
+# ⚠ LE `grep` MASQUAIT L'ÉCHEC DU BUILD — trouvé par l'audit du 2026-08-04. En shell, le
+#   pipe lie plus fort que `&&` : le code de retour de la liste est celui de `grep`, pas
+#   celui de `npm run build`. Un build qui échoue mais dont la sortie contient le mot
+#   « error » faisait donc RÉUSSIR l'étape, et le déploiement continuait sur un frontend
+#   non reconstruit. `set -e` ne rattrapait rien : il ne voyait qu'un succès.
+#   On teste donc le build SÉPARÉMENT, puis on affiche.
+ssh_vm "cd $RACINE_VM/frontend && npm ci --silent && npm run build > /tmp/ava-build.log 2>&1"
+ssh_vm "grep -E 'built in|precache' /tmp/ava-build.log || true"
 
 titre "5/6  Redemarrage"
 ssh_vm "sudo systemctl restart openjarvis"
