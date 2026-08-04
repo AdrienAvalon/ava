@@ -62,7 +62,32 @@ verifier() { # <libellé> <valeur obtenue> <valeur attendue>
 }
 
 titre "1/6  Code — fast-forward depuis $BRANCHE"
+
+# ⚠ LE COMMIT ATTENDU EST CELUI DU DEPOT LOCAL, ET ON LE VERIFIE APRES LE PULL.
+#   Defaut vecu le 2026-08-04 : deux commits ont ete pousses sur la mauvaise branche
+#   (`git push origin main` alors que la branche de travail est `ava-main` — `main` etant
+#   la branche AMONT d'OpenJarvis, 433 commits en arriere). Le push a REUSSI, le pull sur
+#   la VM a REUSSI, et ce script a affiche « Deploiement complet et verifie » en ayant
+#   deploye… le code de la veille. Un outil ajoute manquait a l'appel sans que rien ne le
+#   signale.
+#   Les verifications d'outils plus bas ne pouvaient pas l'attraper : elles sont ECRITES
+#   EN DUR (avalon_status, home_assistant, memoire) et ne connaissent pas les outils
+#   ajoutes depuis. Comparer les commits, si.
+ATTENDU=$(git -C "$(dirname "$0")/.." rev-parse HEAD 2>/dev/null || echo "")
 ssh_vm "cd $RACINE_VM && git pull --ff-only origin $BRANCHE"
+OBTENU=$(ssh_vm "cd $RACINE_VM && git rev-parse HEAD" | tr -d '\r')
+if [ -n "$ATTENDU" ] && [ "$ATTENDU" != "$OBTENU" ]; then
+  echo
+  echo "   ✗ LA VM N'A PAS LE CODE ATTENDU."
+  echo "     local  : $ATTENDU"
+  echo "     sur VM : $OBTENU"
+  echo
+  echo "   Cause la plus frequente : commits pousses sur une AUTRE branche que $BRANCHE."
+  echo "   Verifier : git log --oneline -1 origin/$BRANCHE   puis   git push origin $BRANCHE"
+  echo "   ⚠ Poursuivre deploierait du code ancien EN AFFICHANT UN SUCCES."
+  exit 1
+fi
+echo "   ✓ commit deploye = commit local (${OBTENU:0:8})"
 
 titre "2/6  Dependances Python (liste COMPLETE des extras)"
 EXTRA_ARGS=""
