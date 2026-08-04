@@ -545,3 +545,17 @@ def test_camera_RACONTE_les_alertes_quand_il_y_en_a(cam: Any, monkeypatch: Any) 
     monkeypatch.setattr(cam, "_dashboard", lambda: dash)
     s = cam.CameraTool().execute().content
     assert "1 alerte" in s and "le portail" in s
+
+
+def test_camera_dit_la_PHRASE_COMPLETE_avec_sa_preposition(cam: Any) -> None:
+    """⚠ SORTIE REELLE, non retouchee, avant correction : « EN CE MOMENT : voiture la
+    cour. » Les libelles du control plane portent l'article mais pas la preposition —
+    corrects pour un decompte (« la cour (8) »), fautifs des qu'on les concatene.
+    Ava DIT ces phrases a voix haute.
+    ⚠ Ce test assere la PHRASE ENTIERE et non un fragment : c'est le controle par
+    sous-chaine qui avait laisse passer « 3 voiture » PUIS « voiture la cour »."""
+    sortie = cam.CameraTool().execute().content
+    assert "personne au portail" in sortie
+    assert "voiture dans la cour" in sortie
+    assert "voiture la cour" not in sortie
+    assert "personne le portail" not in sortie

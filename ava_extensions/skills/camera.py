@@ -65,6 +65,28 @@ def _quand(horodatage: Any) -> str:
     return f"hier à {h.strftime('%H:%M')}" if ecart < 172800 else h.strftime("%d/%m à %H:%M")
 
 
+# ⚠ LES LIBELLÉS DE ZONE PORTENT L'ARTICLE, PAS LA PRÉPOSITION. Le control plane rend
+#   « la cour », « le portail » — corrects pour un décompte (« la cour (8) ») et faux dès
+#   qu'on les concatène à une phrase : Ava disait « voiture la cour », à voix haute.
+#   ⚠ On corrige ICI et non dans `ZONES` du collecteur : ces mêmes libellés alimentent
+#   `evenements_24h.par_zone`, où « dans la cour (8) » serait fautif à son tour.
+_PREPOSITION = {
+    "la cour": "dans la cour",
+    "le portail": "au portail",
+    "le jardin": "dans le jardin",
+    "le mur ouest": "le long du mur ouest",
+    "le passage est": "dans le passage est",
+}
+
+
+def _ou(zones: Any) -> str:
+    """Le lieu, dit comme on le dirait — préposition comprise."""
+    noms = [str(z) for z in (zones or []) if z]
+    if not noms:
+        return "dans le champ de la caméra"
+    return " et ".join(_PREPOSITION.get(n, f"dans {n}") for n in noms)
+
+
 def _sante(d: dict[str, Any]) -> list[str]:
     """Ce qui empêcherait de croire le reste."""
     lignes = []
@@ -88,8 +110,7 @@ def _resume(d: dict[str, Any]) -> str:
     if en_cours:
         # ⚠ « Encore là » et « est venu » ne demandent pas la même chose de l'auditeur.
         for x in en_cours:
-            ou = " et ".join(x.get("zones") or []) or "dans le champ"
-            lignes.append(f"  EN CE MOMENT : {x['objet']} {ou}.")
+            lignes.append(f"  EN CE MOMENT : {x['objet']} {_ou(x.get('zones'))}.")
 
     # ⚠ LES ALERTES D'ABORD, ET SEPAREMENT DU RESTE. Mesure du 2026-08-04 : 5 evenements
     #   « voiture » en 40 minutes de nuit, tous produits par les voitures GAREES
@@ -102,8 +123,7 @@ def _resume(d: dict[str, Any]) -> str:
             lignes.append(f"  ⚠ {r['alertes']} alerte(s) sur 24 h :")
             for a in r.get("dernieres_alertes") or []:
                 quoi = " et ".join(a.get("objets") or ["quelque chose"])
-                ou = " et ".join(a.get("zones") or []) or "dans le champ"
-                lignes.append(f"    · {_quand(a.get('debut'))} — {quoi} {ou}")
+                lignes.append(f"    · {_quand(a.get('debut'))} — {quoi} {_ou(a.get('zones'))}")
         else:
             lignes.append("  Aucune alerte sur les dernières 24 h.")
 
@@ -134,8 +154,7 @@ def _resume(d: dict[str, Any]) -> str:
     if passes:
         lignes.append("  Derniers passages :")
         for x in passes[:4]:
-            ou = " et ".join(x.get("zones") or []) or "dans le champ"
-            lignes.append(f"    · {_quand(x.get('debut'))} — {x['objet']} {ou}")
+            lignes.append(f"    · {_quand(x.get('debut'))} — {x['objet']} {_ou(x.get('zones'))}")
 
     if not lignes:
         return "Je n'ai pas de relevé exploitable de la caméra."
