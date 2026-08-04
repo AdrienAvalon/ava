@@ -101,11 +101,19 @@ const MAX_LIGNES = 400;
  * une critique juste : un terminal qui perd tout au moindre rechargement ne remplit pas
  * la fonction qu'on lui demandait, à savoir « voir tout l'historique ».
  *
- * ⚠ `sessionStorage` ET NON `localStorage` : la conversation avec Ava porte des données
- *   personnelles (présence des gens dans la maison, état de l'infrastructure). Elle
- *   disparaît donc à la fermeture de l'onglet, ce qui reste conforme à l'esprit d'une
- *   « session ». `localStorage` la garderait indéfiniment sur le disque du navigateur,
- *   y compris sur un poste partagé — un compromis que personne n'a demandé.
+ * ⚠ `localStorage` — CHOIX EXPLICITE DE L'ADMIN (2026-08-04) : « il faudrait que
+ *   l'historique survive et Ava s'en serve évidemment ». J'avais d'abord pris
+ *   `sessionStorage`, qui perd tout à la fermeture du navigateur ; c'était trop prudent
+ *   pour le besoin réel. La contrepartie est réelle et assumée : la conversation porte
+ *   des données personnelles (présence des gens dans la maison, état de
+ *   l'infrastructure) et reste donc sur le disque du navigateur jusqu'à effacement
+ *   explicite. Le bouton « vider » du terminal l'efface pour de bon.
+ *
+ * ⚠ CE STOCKAGE SERT AUSSI À AVA, PAS SEULEMENT À L'AFFICHAGE — et c'est la moitié
+ *   qu'on oublie. Restaurer les lignes à l'écran sans restaurer le contexte envoyé au
+ *   modèle donne le pire des deux : l'utilisateur VOIT la conversation d'hier, Ava n'en
+ *   a aucun souvenir et se contredit. `useDaemonChat` reconstruit donc son historique
+ *   d'échanges à partir d'ici (cf. `chargerHistoriqueModele`).
  *
  * ⚠ Toute lecture/écriture est protégée : un navigateur en navigation privée stricte,
  *   ou un quota atteint, fait LEVER ces API. Une conversation ne doit pas casser parce
@@ -115,7 +123,7 @@ const CLE_STOCKAGE = 'ava.transcript.v1';
 
 function chargerTranscript(): TurnLine[] {
   try {
-    const brut = sessionStorage.getItem(CLE_STOCKAGE);
+    const brut = localStorage.getItem(CLE_STOCKAGE);
     if (!brut) return [];
     const lignes = JSON.parse(brut);
     if (!Array.isArray(lignes)) return [];
@@ -130,10 +138,37 @@ function chargerTranscript(): TurnLine[] {
 
 function sauverTranscript(lignes: TurnLine[]): void {
   try {
-    sessionStorage.setItem(CLE_STOCKAGE, JSON.stringify(lignes));
+    localStorage.setItem(CLE_STOCKAGE, JSON.stringify(lignes));
   } catch {
     /* quota atteint ou stockage indisponible — la conversation continue sans journal */
   }
+}
+
+/**
+ * Reconstruit le contexte à envoyer au modèle à partir du transcript persisté.
+ *
+ * ⚠ SANS ÇA, LA PERSISTANCE EST UN DÉCOR. L'utilisateur reverrait sa conversation à
+ *   l'écran pendant qu'Ava, elle, repartirait de zéro — et se contredirait au premier
+ *   message. C'est la moitié invisible de la demande « que l'historique survive et
+ *   qu'Ava s'en serve ».
+ *
+ * ⚠ Les lignes `system` sont ÉCARTÉES : ce sont des messages d'erreur affichés à
+ *   l'utilisateur (« Erreur réseau… »), pas des tours de conversation. Les renvoyer au
+ *   modèle lui ferait croire qu'il a produit ces phrases.
+ *
+ * ⚠ Plafond à 40 tours : au-delà, le contexte renvoyé à chaque requête coûterait plus
+ *   cher que la conversation elle-même — et les tours anciens n'aident plus. Le
+ *   terminal, lui, garde ses 400 lignes à l'écran : afficher est gratuit, réexpédier
+ *   ne l'est pas.
+ */
+export function chargerHistoriqueModele(): { role: 'user' | 'assistant'; content: string }[] {
+  return chargerTranscript()
+    .filter((l) => l.role === 'user' || l.role === 'ava')
+    .slice(-40)
+    .map((l) => ({
+      role: l.role === 'ava' ? ('assistant' as const) : ('user' as const),
+      content: l.text,
+    }));
 }
 
 let compteur = 0;

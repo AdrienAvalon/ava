@@ -1,5 +1,5 @@
 import { useRef } from 'react';
-import { useImmersiveStore } from './immersiveStore';
+import { chargerHistoriqueModele, useImmersiveStore } from './immersiveStore';
 
 interface Message {
   role: 'user' | 'assistant' | 'system';
@@ -168,7 +168,17 @@ function extractNewSentences(
  * - Plays audio segments in order, no overlap
  */
 export function useDaemonChat() {
-  const history = useRef<Message[]>([]);
+  /**
+   * ⚠ INITIALISÉ DEPUIS LE STOCKAGE, PAS À VIDE — c'est ce qui donne sa mémoire à Ava
+   *   d'une session à l'autre (demande de l'admin, 2026-08-04).
+   *
+   *   Persister l'affichage sans persister CECI donnerait le pire des deux mondes :
+   *   l'utilisateur reverrait sa conversation d'hier à l'écran, et Ava n'en aurait
+   *   aucun souvenir — elle se contredirait dès le premier message, sans qu'aucune
+   *   erreur n'apparaisse. Le défaut se présenterait comme « l'IA est incohérente »
+   *   plutôt que comme « il manque un chargement ».
+   */
+  const history = useRef<Message[]>(chargerHistoriqueModele() as Message[]);
   const abortCtrl = useRef<AbortController | null>(null);
   const inFlight = useRef(false);
   const currentSource = useRef<AudioBufferSourceNode | null>(null);
@@ -286,10 +296,34 @@ export function useDaemonChat() {
     }
 
     let assembled = '';
-    let lastSentenceEnd = 0;
-    let firstToken = true;
 
     try {
+      /**
+       * ⚠ `stream: false` EST CE QUI DONNE SES OUTILS À AVA — c'est la décision la plus
+       *   importante de ce fichier, et elle n'est pas évidente.
+       *
+       *   Le serveur route ainsi (`server/routes.py`) :
+       *     · `stream: true`  → flux direct du moteur, **l'agent est contourné** ;
+       *     · `stream: false` + pas de `tools` → **`_handle_agent`**, qui exécute la
+       *       boucle d'outils de l'agent.
+       *
+       *   En streaming, Ava répondait donc « je n'ai pas accès à ton infrastructure » —
+       *   ce qui était exact : le modèle ne recevait aucun outil. Les outils existaient,
+       *   étaient enregistrés, répondaient parfaitement quand on les appelait
+       *   directement… et n'étaient jamais proposés au modèle.
+       *   Mesuré après bascule : « 97/100, deux points qui grattent : ansible… grafana… »
+       *   et « il fait 26,7 °C dehors, Adrien et Aurélie sont présents ».
+       *
+       * ⚠ CE QUE ÇA COÛTE, ASSUMÉ : plus d'affichage token par token. La réponse arrive
+       *   d'un bloc, après ~19 s quand un outil est appelé. C'est le bon compromis : une
+       *   Ava qui écrit joliment mais ignore l'état réel de la maison n'est pas le
+       *   produit qu'on construit. L'attente est signalée par l'état `thinking` (l'orbe
+       *   change) plutôt que par du texte qui défile.
+       *
+       * ⚠ NE PAS « rétablir le streaming » sans vérifier les outils : le symptôme du
+       *   retour en arrière serait une Ava redevenue amnésique sur son environnement,
+       *   sans qu'aucune erreur n'apparaisse nulle part.
+       */
       const resp = await fetch('/v1/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -297,74 +331,41 @@ export function useDaemonChat() {
         body: JSON.stringify({
           model: MODEL,
           messages,
-          stream: true,
+          stream: false,
           max_tokens: MAX_TOKENS,
         }),
       });
 
-      if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
 
-      const reader = resp.body.getReader();
-      const decoder = new TextDecoder('utf-8');
-      let buffer = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        let lineEnd: number;
-        while ((lineEnd = buffer.indexOf('\n')) >= 0) {
-          const line = buffer.slice(0, lineEnd).trim();
-          buffer = buffer.slice(lineEnd + 1);
-          if (!line.startsWith('data:')) continue;
-          const payload = line.slice(5).trim();
-          if (payload === '[DONE]' || payload === '') continue;
-          try {
-            const data = JSON.parse(payload);
-            const delta: string = data?.choices?.[0]?.delta?.content ?? '';
-            if (delta) {
-              if (firstToken) {
-                s.setState('speaking');
-                s.setUserMsg('');
-                firstToken = false;
-              }
-              assembled += delta;
-              s.setAvaMsg(assembled);
-              s.streamAva(assembled);
-
-              // Extract newly-finished sentences and dispatch them to TTS.
-              const { sentences, newEnd } = extractNewSentences(assembled, lastSentenceEnd);
-              lastSentenceEnd = newEnd;
-              for (const sentence of sentences) {
-                enqueueSentence(sentence);
-              }
-            }
-            const toolCalls = data?.choices?.[0]?.delta?.tool_calls;
-            if (Array.isArray(toolCalls) && toolCalls.length > 0 && toolCalls[0]?.function?.name) {
-              s.setCognitive({ tool: toolCalls[0].function.name });
-            }
-          } catch {
-            // ignore malformed SSE chunk
-          }
-        }
+      // ── Réponse non-streamée : un seul objet JSON ────────────────────────────────
+      const data = await resp.json();
+      const contenu: string = data?.choices?.[0]?.message?.content ?? '';
+      if (contenu) {
+        s.setState('speaking');
+        s.setUserMsg('');
+        assembled = contenu;
+        s.setAvaMsg(assembled);
+        s.streamAva(assembled);
+        // Le texte arrive d'un bloc : on découpe pour que le TTS parle par phrases
+        // plutôt que d'attaquer 300 mots d'une traite.
+        const { sentences } = extractNewSentences(assembled, 0);
+        for (const sentence of sentences) enqueueSentence(sentence);
+        const reste = assembled.slice(sentences.join(' ').length).trim();
+        if (reste) enqueueSentence(reste);
       }
-
-      // Tail: any remaining partial sentence (no terminator at the end)
-      if (assembled.length > lastSentenceEnd) {
-        const tail = assembled.slice(lastSentenceEnd).trim();
-        if (tail) enqueueSentence(tail);
-      }
-
       if (assembled) {
         history.current.push({ role: 'assistant', content: assembled });
-        s.endAvaStream();
-      } else if (firstToken) {
+      } else {
+        // ⚠ Une réponse vide doit se VOIR. Sans ce cas, l'interface resterait figée sur
+        //   « réfléchit » sans rien afficher, et l'on croirait à un blocage réseau.
         s.setState('speaking');
         s.setUserMsg('');
         s.setAvaMsg('(réponse vide)');
         s.pushLine('system', '(réponse vide)');
       }
+      s.endAvaStream();
+      s.setState('idle');
     } catch (e: unknown) {
       const name = (e as Error)?.name;
       if (name !== 'AbortError') {
