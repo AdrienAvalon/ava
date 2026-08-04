@@ -97,7 +97,15 @@ def _sur_debut_outil(evenement: Any) -> None:
 
 
 def _sur_fin_inference(evenement: Any) -> None:
-    d = getattr(evenement, "data", {}) or {}
+    brut = getattr(evenement, "data", {}) or {}
+    # ⚠ LES JETONS SONT DANS UN SOUS-OBJET `usage`, PAS À PLAT — la sonde écrivait
+    #   `jetons_entree: null` à chaque échange alors que l'événement les portait. Elle
+    #   cherchait `prompt_tokens` à la racine ; l'amont publie
+    #   `{"model": …, "usage": {"prompt_tokens": …}}` (`agents/_stubs.py`).
+    #   Une sonde qui lit la mauvaise clé rend « rien » sans erreur — le défaut récurrent
+    #   de ce projet, sous une forme de plus.
+    usage = brut.get("usage") if isinstance(brut.get("usage"), dict) else {}
+    d = {**usage, **{k: v for k, v in brut.items() if k != "usage"}}
     for cle, champs in (
         ("jetons_entree", ("prompt_tokens", "input_tokens", "tokens_in")),
         ("jetons_sortie", ("completion_tokens", "output_tokens", "tokens_out")),
@@ -118,7 +126,20 @@ def _sur_fin_inference(evenement: Any) -> None:
 
 def _sur_echange_termine(evenement: Any) -> None:
     d = getattr(evenement, "data", {}) or {}
-    question = str(d.get("user_message") or d.get("query") or d.get("prompt") or "")
+    # ⚠ LE CHAMP S'APPELLE `user_text` — `publish_completed_exchange` (memory/service.py)
+    #   publie `{"user_text": …, "assistant_text": …, "source": …}`. La sonde cherchait
+    #   `user_message`, donc écrivait `longueur_question: 0` sur CHAQUE échange : la
+    #   corrélation entre longueur de question et appel d'outil, seule raison d'être de
+    #   cette mesure, était nulle par construction.
+    #   Les autres noms sont conservés en repli : une montée amont peut renommer le champ,
+    #   et une sonde muette ne se signale pas.
+    question = str(
+        d.get("user_text")
+        or d.get("user_message")
+        or d.get("query")
+        or d.get("prompt")
+        or ""
+    )
     outils = _courant.get("outils") or []
 
     _ecrire(

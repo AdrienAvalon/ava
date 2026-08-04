@@ -168,3 +168,68 @@ def test_brancher_s_abonne_aux_trois_evenements() -> None:
 
     assert routing_probe.brancher(_Bus()) is True
     assert set(vus) == {"tool_call_start", "inference_end", "chat_exchange_completed"}
+
+
+# ══ Champs REELS de l'amont — corriges apres l'audit du 2026-08-04 ════════════════
+# ⚠ Ces trois tests utilisent les noms de champs EXACTS que publie OpenJarvis, relevés
+#   dans son code (`memory/service.py` et `agents/_stubs.py`). La sonde en cherchait
+#   d'autres : elle tournait, s'annonçait active, et n'enregistrait que des `null`.
+#   Une mesure fausse est pire qu'une mesure absente — on regle des seuils dessus.
+
+
+def test_la_question_est_lue_dans_user_text(_journal_temporaire: Path) -> None:
+    """⚠ `publish_completed_exchange` publie `user_text`, pas `user_message`.
+
+    La sonde ecrivait `longueur_question: 0` sur CHAQUE echange : la correlation entre
+    longueur de question et appel d'outil — sa seule raison d'etre — etait nulle par
+    construction.
+    """
+    routing_probe._sur_echange_termine(
+        _Evenement({"user_text": "Il fait quoi dehors ?"})
+    )
+    assert _lignes(_journal_temporaire)[0]["longueur_question"] == 21
+
+
+def test_les_jetons_sont_lus_dans_le_sous_objet_usage(
+    _journal_temporaire: Path,
+) -> None:
+    """⚠ L'amont publie `{"model": …, "usage": {"prompt_tokens": …}}` — la sonde lisait
+    `prompt_tokens` a la RACINE, donc toujours `null`."""
+    routing_probe._sur_fin_inference(
+        _Evenement(
+            {
+                "model": "claude-sonnet-5",
+                "usage": {"prompt_tokens": 97, "completion_tokens": 24},
+            }
+        )
+    )
+    routing_probe._sur_echange_termine(_Evenement({"user_text": "x"}))
+    ligne = _lignes(_journal_temporaire)[0]
+    assert ligne["jetons_entree"] == 97
+    assert ligne["jetons_sortie"] == 24
+    assert ligne["modele"] == "claude-sonnet-5"
+
+
+def test_les_anciens_noms_restent_acceptes(_journal_temporaire: Path) -> None:
+    """Repli volontaire : une montee amont peut renommer ces champs, et une sonde muette
+    ne se signale pas. On accepte donc les deux formes."""
+    routing_probe._sur_fin_inference(
+        _Evenement({"prompt_tokens": 10, "completion_tokens": 2})
+    )
+    routing_probe._sur_echange_termine(_Evenement({"user_message": "ancienne forme"}))
+    ligne = _lignes(_journal_temporaire)[0]
+    assert ligne["jetons_entree"] == 10
+    assert ligne["longueur_question"] == 14
+
+
+def test_le_branchement_au_bus_serveur_est_idempotent() -> None:
+    """⚠ `brancher_bus_serveur()` patche `EventBus.__init__`. Appele deux fois sans
+    marqueur, il empilerait les abonnements — chaque echange serait alors enregistre en
+    double, et toute statistique tiree du journal serait fausse d'un facteur 2."""
+    assert routing_probe.brancher_bus_serveur() is True
+    assert routing_probe.brancher_bus_serveur() is True
+    from openjarvis.core.events import EventBus
+
+    bus = EventBus()
+    abonnes = {getattr(t, "value", str(t)): len(c) for t, c in bus._subscribers.items()}
+    assert abonnes.get("chat_exchange_completed") == 1, abonnes
