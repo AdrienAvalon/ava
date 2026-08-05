@@ -213,3 +213,50 @@ def test_le_dedoublonnage_ne_FUSIONNE_PAS_deux_faits_distincts(tmp_path):
     assert store.add("Utilise Ansible pour l'automatisation") is True
     assert store.add("Utilise Grafana pour la supervision") is True
     assert store.count() == 2
+
+
+# ── Curation a l'ecriture : paraphrases et faits devenus redondants (2026-08-05) ─
+
+
+def test_un_fait_qui_n_APPORTE_RIEN_n_entre_pas(tmp_path):
+    """⚠ Le dedoublonnage par empreinte ne voit que les reformulations de SUJET. Mesure du
+    2026-08-05 : 7 faits sur 119 etaient strictement inclus dans un autre — des
+    paraphrases qu'il laissait passer, et chacune est injectee dans l'invite systeme."""
+    store = LocalFactStore(path=tmp_path / "f.jsonl")
+    assert store.add("Utilise Ansible pour l'automatisation et Grafana pour la supervision")
+    assert store.add("Utilise Ansible pour l'automatisation") is False
+    assert store.count() == 1
+
+
+def test_un_fait_ANCIEN_devenu_redondant_SORT(tmp_path):
+    """Le second sens, et il compte autant : quand un fait plus complet arrive, l'ancien
+    n'a plus de raison d'occuper l'invite."""
+    store = LocalFactStore(path=tmp_path / "f.jsonl")
+    assert store.add("Utilise Ansible pour l'automatisation")
+    assert store.add("Utilise Ansible pour l'automatisation et Grafana pour la supervision")
+    restants = [f.text for f in store.list()]
+    assert restants == ["Utilise Ansible pour l'automatisation et Grafana pour la supervision"]
+
+
+def test_deux_faits_PROCHES_mais_DISTINCTS_survivent(tmp_path):
+    """⚠ LE CONTRE-TEST QUI PORTE TOUT LE RISQUE. On ne fusionne pas des faits « proches »,
+    on retire des faits INCLUS. « Radiateur salon » et « Radiateur salle a manger » se
+    recouvrent fortement et ne s'incluent PAS : les fusionner perdrait une piece de la
+    maison — exactement le genre d'erreur qui envoie une consigne de chauffage au mauvais
+    endroit."""
+    store = LocalFactStore(path=tmp_path / "f.jsonl")
+    assert store.add("Le radiateur du salon est en mode hors-gel")
+    assert store.add("Le radiateur de la salle a manger est en mode hors-gel")
+    assert store.count() == 2
+
+
+def test_a_information_egale_le_FRANCAIS_l_emporte(tmp_path):
+    """⚠ Cas mesure : « L'utilisateur vit avec Annie, Jean-Pierre… » est strictement inclus
+    dans « User has family members: Adrien, Aurelie… ». Garder « le plus informatif »
+    garderait l'ANGLAIS, contre la regle d'ecriture en francais. A information equivalente,
+    la langue tranche."""
+    store = LocalFactStore(path=tmp_path / "f.jsonl")
+    assert store.add("User has family members Adrien Aurelie Annie and Jean Pierre")
+    assert store.add("Vit avec Annie Jean Pierre Adrien Aurelie")
+    restants = [f.text for f in store.list()]
+    assert restants == ["Vit avec Annie Jean Pierre Adrien Aurelie"], restants

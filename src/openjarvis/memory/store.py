@@ -72,6 +72,55 @@ def _empreinte(texte: str) -> str:
     return " ".join(t.split())
 
 
+#: Mots vides des deux langues — ils gonflent artificiellement les recouvrements.
+_VIDES = frozenset(
+    {
+        "utilisateur", "user", "avec", "pour", "dans", "leur", "cette", "sont", "avoir",
+        "elle", "the", "has", "and", "with", "that", "this", "their", "have", "les",
+        "des", "une", "son", "ses", "est", "aux", "que", "qui", "plus", "tout",
+    }
+)
+
+#: Marqueurs d'anglais. Grossier, et suffisant : on ne s'en sert QUE pour departager deux
+#: faits redondants, jamais pour rejeter un fait.
+_ANGLAIS = re.compile(r"\b(the|user|has|with|and|of|is|are|their|monitors|speaks|manages)\b", re.I)
+
+
+def _mots_significatifs(texte: str) -> frozenset[str]:
+    t = unicodedata.normalize("NFKD", texte.lower())
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    return frozenset(m for m in re.findall(r"[a-z]{4,}", t) if m not in _VIDES)
+
+
+def _est_anglais(texte: str) -> bool:
+    return len(_ANGLAIS.findall(texte)) >= 2
+
+
+def _redondant(nouveau: str, ancien: str) -> str | None:
+    """Lequel des deux ne dit rien de plus ? Rend le texte a retirer, ou None.
+
+    ⚠ INCLUSION STRICTE, pas recouvrement. Un fait n'est retire que si TOUS ses mots
+      significatifs figurent deja dans l'autre — donc s'il n'apporte rien.
+    ⚠ CAS MIXTE : quand un fait francais est inclus dans un fait anglais, garder « le plus
+      informatif » garderait l'ANGLAIS, contre la regle d'ecriture en francais posee le
+      2026-08-05. Mesure : le cas existe (« L'utilisateur vit avec Annie… » ⊂ « User has
+      family members: Adrien… »). A information equivalente, la langue tranche.
+    """
+    mn, ma = _mots_significatifs(nouveau), _mots_significatifs(ancien)
+    if not mn or not ma:
+        return None
+    if mn == ma:
+        # Egalite de contenu : la langue tranche, sinon on garde l'existant.
+        if _est_anglais(ancien) and not _est_anglais(nouveau):
+            return ancien
+        return nouveau
+    if mn < ma:  # le nouveau n'apporte rien
+        return ancien if (_est_anglais(ancien) and not _est_anglais(nouveau)) else nouveau
+    if ma < mn:  # l'ancien est devenu redondant
+        return nouveau if (_est_anglais(nouveau) and not _est_anglais(ancien)) else ancien
+    return None
+
+
 @dataclass(slots=True)
 class Fact:
     """A single durable memory entry."""
@@ -198,6 +247,23 @@ class LocalFactStore(FactStore):
             empreinte = _empreinte(text)
             if any(_empreinte(f.text) == empreinte for f in self._facts):
                 return False  # dedupe
+            # ⚠ CURATION A L'ECRITURE — le dedoublonnage par empreinte ne voit que les
+            #   reformulations de SUJET ; il laisse passer les PARAPHRASES. Mesure du
+            #   2026-08-05 : 7 faits sur 119 etaient strictement inclus dans un autre.
+            #   Deux sens, et le second compte autant : un fait nouveau qui n'apporte rien
+            #   n'entre pas ; un fait ANCIEN devenu redondant SORT.
+            a_retirer: list[str] = []
+            for f in self._facts:
+                perdant = _redondant(text, f.text)
+                if perdant is None:
+                    continue
+                if perdant == text:
+                    logger.debug("fait redondant refuse: %s", text[:80])
+                    return False
+                a_retirer.append(f.text)
+            if a_retirer:
+                logger.debug("faits devenus redondants retires: %d", len(a_retirer))
+                self._facts = [f for f in self._facts if f.text not in a_retirer]
             self._facts.append(Fact(text=text, source=source, created_at=time.time()))
             # Enforce the cap by evicting the oldest entries.
             if self._max_facts and len(self._facts) > self._max_facts:
