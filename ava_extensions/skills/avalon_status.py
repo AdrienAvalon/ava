@@ -57,6 +57,41 @@ def _fetch_hosts() -> list[dict[str, Any]]:
     return d if isinstance(d, list) else (d.get("hosts") or [])
 
 
+def _resume_sauvegardes(data: dict[str, Any]) -> str:
+    """Une ligne sur l'etat des sauvegardes, construite depuis `module_data.backups`.
+
+    Champs REELS mesures le 2026-08-05 sur `/api/v1/dashboard` (pas devines) :
+    `restic.age_hours`, `restic.status`, `restic.check_age_days`, `restic.restore_test`
+    (un dict destination -> 1/0), et `nfs_mounted`.
+    ⚠ Rendre la chaine vide plutot qu'une phrase creuse si le module est absent : dire
+      « sauvegardes inconnues » quand on n'a pas regarde est un mensonge de plus.
+    """
+    b = (data.get("module_data") or {}).get("backups") or {}
+    r = b.get("restic") or {}
+    if not r:
+        return ""
+    bouts = []
+    age = r.get("age_hours")
+    if age is not None:
+        bouts.append(f"dernier backup il y a {age:.0f} h ({r.get('status', '?')})")
+    controle = r.get("check_age_days")
+    if controle is not None:
+        bouts.append(f"controle d'integrite il y a {controle:.1f} j")
+    tests = r.get("restore_test") or {}
+    if tests:
+        # ⚠ Le test de RESTAURATION est le seul qui prouve qu'une sauvegarde sert a
+        #   quelque chose. Une sauvegarde qui s'ecrit et ne se relit pas est une
+        #   sauvegarde qui n'existe pas — on nomme donc les destinations en echec.
+        rates = sorted(d for d, ok in tests.items() if not ok)
+        if rates:
+            bouts.append(f"test de restauration EN ECHEC sur : {', '.join(rates)}")
+        else:
+            bouts.append(f"test de restauration OK sur les {len(tests)} copies")
+    if b.get("nfs_mounted") is False:
+        bouts.append("montage NFS du NAS ABSENT")
+    return "Sauvegardes: " + " ; ".join(bouts) if bouts else ""
+
+
 def _format_summary(data: dict[str, Any]) -> str:
     score_info = data.get("score", {}) or {}
     global_score = score_info.get("global", "?")
@@ -142,6 +177,18 @@ def _format_summary(data: dict[str, Any]) -> str:
         # ⚠ On dit qu'on ne sait pas, plutôt que d'écrire « 0 hôte » — c'est exactement
         #   l'erreur qu'on corrige ici.
         lines.append("Hôtes: information indisponible (endpoint /hosts injoignable)")
+
+    # ⚠ LES SAUVEGARDES SE DISENT MEME QUAND TOUT VA BIEN — et c'est tout l'interet.
+    #   Ce resume ne listait que les modules EN DEGRADATION : un module au maximum n'y
+    #   figure nulle part. Le 2026-08-05, a la question « est-ce que je peux dormir
+    #   tranquille », Ava a donc repondu « pas de module backup dans le Control Plane »,
+    #   alors qu'il expose l'age du dernier backup, celui du controle d'integrite et le
+    #   resultat des tests de RESTAURATION sur les trois copies du 3-2-1.
+    # ⚠ La lecon depasse ce module : certaines questions demandent une preuve POSITIVE,
+    #   pas l'absence de plainte. « Rien ne va mal » ne repond pas a « est-ce protege ».
+    sauvegardes = _resume_sauvegardes(data)
+    if sauvegardes:
+        lines.append(sauvegardes)
 
     return "\n".join(lines)
 

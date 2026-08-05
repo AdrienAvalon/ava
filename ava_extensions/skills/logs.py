@@ -168,9 +168,23 @@ class LogsTool(BaseTool):
             )
 
         n = d.get("occurrences", 0)
-        # ⚠ « au moins » quand c'est tronque : sans cette nuance, « 200 » se lirait comme
-        #   un total exact et l'on croirait avoir tout vu.
-        prefixe = "au moins " if d.get("tronque") else ""
+        # ⚠ LE COMPTE EST DESORMAIS EXACT (control plane, 2026-08-05) : il ne vient plus
+        #   du nombre de lignes rendues, donc il n'est plus plafonne par la limite
+        #   d'affichage. Avant ce correctif, la reponse a « combien de deploiements sur
+        #   7 jours » etait « au moins 50 » — il y en avait 74.
+        # ⚠ ON GARDE LA NUANCE POUR LE CAS DE REPLI. Si le comptage exact echoue, le
+        #   control plane retombe sur le plancher et le DIT dans `comptage`. Lire ce champ
+        #   plutot que de supposer l'exactitude : c'est precisement en supposant qu'une
+        #   cle porte ce qu'on croit qu'on fabrique des zeros faux.
+        # ⚠ Le repli sur `tronque` couvre un control plane plus ancien que cet outil —
+        #   sans lui, un CP non deploye rendrait un plancher presente comme un total.
+        comptage = d.get("comptage")
+        plancher = (
+            comptage.startswith("plancher")
+            if isinstance(comptage, str)
+            else bool(d.get("tronque"))
+        )
+        prefixe = "au moins " if plancher else ""
         entete = f"{d.get('libelle', question)} — {prefixe}{n} sur {d.get('fenetre')}"
         if not n:
             return ToolResult(
