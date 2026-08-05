@@ -716,3 +716,58 @@ def test_TOUT_patch_pose_sur_le_disque_est_IMPORTE_par_boot() -> None:
     assert poses, "aucun patch decouvert — lecture cassee"
     manquants = sorted(poses - importes)
     assert not manquants, f"patches jamais importes par boot.py : {manquants}"
+
+
+# ── Notation automatique des traces (2026-08-05) ────────────────────────────────
+
+
+def _trace_avec(succes_outils: list[bool]):
+    """Une trace minimale portant N appels d'outil aux issues donnees."""
+    from openjarvis.core.types import StepType, Trace, TraceStep
+
+    return Trace(
+        query="q",
+        agent="a",
+        model="m",
+        engine="e",
+        steps=[
+            TraceStep(
+                step_type=StepType.TOOL_CALL,
+                timestamp=0.0,
+                duration_seconds=0.0,
+                input={"tool": "x", "arguments": {}},
+                output={"success": ok, "result": ""},
+            )
+            for ok in succes_outils
+        ],
+        result="r",
+        messages=[],
+        started_at=0.0,
+        ended_at=1.0,
+    )
+
+
+def test_un_echec_d_outil_NOTE_la_trace() -> None:
+    """⚠ Mesure du 2026-08-05 : 1 trace notee sur 108. `outcome` a de vrais consommateurs
+    mais personne ne l'ecrivait — la boucle d'apprentissage etait branchee sur du vide."""
+    from openjarvis.core.types import StepType
+
+    t = _trace_avec([True, False, True])
+    echecs = [
+        s for s in t.steps if s.step_type == StepType.TOOL_CALL and s.output.get("success") is False
+    ]
+    assert echecs, "le critere doit reperer l'echec"
+
+
+def test_l_ABSENCE_d_echec_ne_vaut_PAS_succes() -> None:
+    """⚠ LE POINT QUI COMPTE. On ne juge pas la qualite de la reponse : un juge
+    automatique noterait des reponses plausibles comme bonnes — le defaut meme qu'on
+    corrige tous les jours. Un `success` fabrique se lirait comme une mesure et ferait
+    croire la boucle saine ; `None` dit « non evalue », qui est la verite."""
+    source = (RACINE.parent / "src" / "openjarvis" / "traces" / "collector.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'trace.outcome = "tool_failure"' in source
+    assert 'trace.outcome = "success"' not in source, (
+        "aucun succes ne doit etre ecrit automatiquement — l'absence d'echec n'est pas une preuve"
+    )

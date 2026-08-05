@@ -99,6 +99,29 @@ class TraceCollector:
             trace.total_latency_seconds += step.duration_seconds
             trace.total_tokens += step.output.get("tokens", 0)
 
+        # ⚠ ON NOTE LA TRACE, ET SUR UN CRITERE OBJECTIF SEULEMENT.
+        #   Mesure du 2026-08-05 : **1 trace notee sur 108**. Le champ `outcome` a de
+        #   vrais consommateurs (`traces/analyzer.py`, la route `/v1/feedback/stats`)
+        #   mais personne ne l'ecrivait — la boucle d'apprentissage etait donc branchee
+        #   sur du vide, et « Ava progresse » restait une impression.
+        # ⚠ ON NE JUGE PAS LA QUALITE DE LA REPONSE, ET C'EST DELIBERE. Un juge
+        #   automatique noterait des reponses plausibles comme bonnes — precisement le
+        #   defaut qu'on passe nos journees a corriger. On note ce qui est VERIFIABLE :
+        #   un appel d'outil a-t-il echoue ? C'est la ou vivaient tous les defauts
+        #   trouves aujourd'hui, sans exception.
+        # ⚠ L'ABSENCE D'ECHEC NE VAUT PAS SUCCES : on laisse alors `outcome` a None
+        #   plutot que d'ecrire « success ». Un succes fabrique se lirait comme une
+        #   mesure et ferait croire la boucle saine. `None` dit « non evalue », qui est
+        #   la verite.
+        echecs = [
+            s
+            for s in trace.steps
+            if s.step_type == StepType.TOOL_CALL and s.output.get("success") is False
+        ]
+        if echecs:
+            trace.outcome = "tool_failure"
+            trace.feedback = 0.0
+
         self._last_trace = trace
 
         if self._store is not None:
