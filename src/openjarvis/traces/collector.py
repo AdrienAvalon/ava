@@ -40,6 +40,8 @@ class TraceCollector:
         self._agent = agent
         self._store = store
         self._bus = bus
+        # Departs d'appels d'outil en attente, PAR NOM D'OUTIL (cf. `_on_tool_start`).
+        self._tool_starts: dict[str, list[tuple[float, Any]]] = {}
         self._current_steps: list[TraceStep] = []
         self._current_model: str = ""
         self._current_engine: str = ""
@@ -181,12 +183,32 @@ class TraceCollector:
         )
 
     def _on_tool_start(self, event: Any) -> None:
-        self._tool_start_time = event.timestamp
-        self._tool_start_data = event.data
+        # ⚠ UNE FILE PAR OUTIL, ET NON UN EMPLACEMENT UNIQUE. Le code precedent gardait
+        #   `self._tool_start_data = event.data` : un SEUL emplacement, ecrase a chaque
+        #   depart. Or le modele appelle plusieurs outils EN PARALLELE — les departs
+        #   s'ecrasent, puis toutes les arrivees lisent les arguments du DERNIER.
+        #   Constate le 2026-08-05 sur la trace 0edd79a6cbd847c3 : quatre appels
+        #   (`journal`, `avalon_status`, `logs`, `logs`) portaient TOUS
+        #   `{"question": "redemarrages", "fenetre": "24h"}` — alors que ni `journal` ni
+        #   `avalon_status` n'ont le moindre parametre de ce nom.
+        #   Consequence : le nom de l'outil restait juste (donc les taux de reussite sont
+        #   valides), mais on ne pouvait plus savoir CE QUI AVAIT ETE DEMANDE — donc plus
+        #   diagnostiquer un echec. Et `duration_seconds` etait fausse de la meme facon,
+        #   mesuree depuis le dernier depart.
+        # ⚠ LIMITE ASSUMEE : les evenements ne portent AUCUN identifiant d'appel (verifie :
+        #   `{"tool": nom, "arguments": params}` et rien d'autre). Deux appels au MEME outil
+        #   dans un meme lot restent donc apparies dans l'ordre d'arrivee — heuristique, mais
+        #   sans commune mesure avec un emplacement global partage par tous les outils.
+        file = self._tool_starts.setdefault(str(event.data.get("tool", "")), [])
+        file.append((event.timestamp, event.data))
 
     def _on_tool_end(self, event: Any) -> None:
-        start = getattr(self, "_tool_start_time", event.timestamp)
-        start_data = getattr(self, "_tool_start_data", {})
+        file = self._tool_starts.get(str(event.data.get("tool", "")))
+        if file:
+            start, start_data = file.pop(0)
+        else:
+            # Fin sans depart connu : on ne fabrique pas d'arguments, on rend le vide.
+            start, start_data = event.timestamp, {}
         # Pull through any metadata the tool attached to its ToolResult
         # (e.g. SkillTool's skill/skill_source/skill_kind tags) so the
         # SkillOptimizer can bucket traces by skill name.
