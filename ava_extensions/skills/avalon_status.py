@@ -57,6 +57,115 @@ def _fetch_hosts() -> list[dict[str, Any]]:
     return d if isinstance(d, list) else (d.get("hosts") or [])
 
 
+def _rendre_proxmox(px: dict[str, Any]) -> str:
+    """Vue par machine virtuelle et par noeud — ce qu'Ava disait ne pas avoir."""
+    lignes = []
+    for n in px.get("nodes") or []:
+        etat = n.get("status")
+        detail = (
+            f"CPU {float(n.get('cpu', 0)) * 100:.0f} %, RAM {n.get('mem_percent')} %"
+            if etat == "online"
+            else "hors ligne"
+        )
+        lignes.append(f"  noeud {n.get('name')} : {etat} — {detail}")
+    vms = px.get("vms") or []
+    actives = [v for v in vms if v.get("status") == "running"]
+    arretees = [v for v in vms if v.get("status") != "running"]
+    lignes.append(f"  {len(actives)} VM en marche sur {len(vms)} declarees")
+    for v in actives:
+        lignes.append(f"    - {v.get('vmid')} {v.get('name')} ({v.get('node')})")
+    if arretees:
+        lignes.append(
+            "  arretees : "
+            + ", ".join(f"{v.get('vmid')} {v.get('name')}" for v in arretees)
+        )
+    ha = px.get("ha") or {}
+    # ⚠ `expectation` est une PHRASE ECRITE PAR LE CONTROL PLANE qui explique pourquoi le
+    #   HA est desarme. La relayer telle quelle evite qu'Ava reconstruise un raisonnement
+    #   a partir d'un booleen — et se trompe.
+    if ha.get("expectation"):
+        lignes.append(f"  haute disponibilite : {ha['expectation']}")
+    elif "enabled" in ha:
+        lignes.append(f"  haute disponibilite : {'armee' if ha['enabled'] else 'desarmee'}")
+    rep = px.get("replication") or {}
+    jobs = rep.get("status") or []
+    if jobs:
+        en_panne = [j for j in jobs if j.get("fail_count")]
+        suspendus = [j for j in jobs if j.get("disabled")]
+        lignes.append(
+            f"  replication : {len(jobs)} taches, {len(suspendus)} suspendues, "
+            f"{len(en_panne)} en echec"
+        )
+    return "\n".join(lignes)
+
+
+def _rendre_generique(donnees: Any) -> str:
+    """Repli pour tout module sans rendu dedie.
+
+    ⚠ C'EST CE REPLI QUI CASSE LA CHAINE DES HUIT OCCURRENCES : un module ajoute au
+      control plane demain devient joignable sans modifier ce fichier. Un rendu soigne
+      par domaine serait plus lisible et laisserait le neuvieme cas se reproduire.
+    """
+    if isinstance(donnees, dict):
+        lignes = []
+        for cle, val in donnees.items():
+            if cle.startswith("_"):
+                continue
+            lignes.append(f"  {cle} : {_abreger(val)}")
+        reste = len(lignes) - 25
+        lignes = lignes[:25]
+        if reste > 0:
+            lignes.append(f"  (… et {reste} autres champs non affiches)")
+        return "\n".join(lignes)
+    return f"  {_abreger(donnees, budget=800)}"
+
+
+def _abreger(val: Any, budget: int = 300) -> str:
+    """Rend une valeur en DISANT ce qui manque.
+
+    ⚠ UNE TRONCATURE QUI NE S'ANNONCE PAS SE LIT COMME UNE REPONSE COMPLETE — c'est la
+      meme lecon que le comptage plafonne cote control plane, qui faisait repondre
+      « au moins 50 » pour 74. Mesure du 2026-08-05 : interrogee sur les certificats TLS,
+      Ava a vu la liste coupee a 300 caracteres et a repondu « le cert le plus proche est
+      a 51 jours, pas identifie nommement dans l'extrait ». Elle s'en est bien tiree parce
+      qu'elle a REMARQUE la coupure — mais rien ne la lui signalait, et sur une liste ou
+      l'element important n'est pas le premier, elle aurait conclu a tort.
+    """
+    if isinstance(val, list):
+        rendu, gardes = [], 0
+        for element in val:
+            texte = json.dumps(element, ensure_ascii=False)
+            if sum(len(x) for x in rendu) + len(texte) > budget:
+                break
+            rendu.append(texte)
+            gardes += 1
+        restants = len(val) - gardes
+        suffixe = f" … et {restants} autres sur {len(val)}" if restants > 0 else ""
+        return "[" + ", ".join(rendu) + "]" + suffixe
+    texte = json.dumps(val, ensure_ascii=False) if isinstance(val, dict) else str(val)
+    if len(texte) <= budget:
+        return texte
+    return texte[:budget] + f" … (tronque, {len(texte)} caracteres au total)"
+
+
+def _format_domaine(data: dict[str, Any], domaine: str) -> str:
+    """Le detail d'UN module, a la demande."""
+    modules = data.get("module_data") or {}
+    cle = domaine.strip().lower()
+    if cle not in modules:
+        # ⚠ On NOMME les domaines disponibles au lieu de dire « inconnu » : sans cette
+        #   liste, le modele reessaie au hasard ou conclut que la donnee n'existe pas.
+        return (
+            f"Domaine « {domaine} » inconnu. Domaines disponibles : "
+            + ", ".join(sorted(k for k in modules if not k.startswith("_")))
+        )
+    donnees = modules[cle] or {}
+    sante = donnees.get("_health") if isinstance(donnees, dict) else None
+    entete = f"{cle} — sante : {sante or 'inconnue'}"
+    corps = _rendre_proxmox(donnees) if cle == "proxmox" else _rendre_generique(donnees)
+    return f"{entete}\n{corps}"
+
+
 def _resume_sauvegardes(data: dict[str, Any]) -> str:
     """Une ligne sur l'etat des sauvegardes, construite depuis `module_data.backups`.
 
@@ -205,15 +314,31 @@ class AvalonStatusTool(BaseTool):
         return ToolSpec(
             name="avalon_status",
             description=(
-                "Récupère létat global de linfrastructure Avalon depuis le "
-                "Control Plane v2 (score 0-100, modules en dégradation, "
-                "alertes actives, hosts down). À utiliser quand Adrien "
-                "demande comment va linfra, quel est le score, sil y a des "
-                "problèmes."
+                "Etat de l'infrastructure Avalon depuis le Control Plane v2. "
+                "Sans argument : score 0-100, modules en degradation, hotes "
+                "inactifs avec le motif et l'anciennete, etat des sauvegardes. "
+                "Avec `domaine` : le DETAIL d'un module — machines virtuelles et "
+                "noeuds Proxmox, evenements de la camera, securite reseau, "
+                "sauvegardes, certificats, conteneurs... "
+                "A utiliser des qu'une question porte sur l'infra, y compris sur "
+                "un point precis : le detail par domaine EXISTE, ne reponds jamais "
+                "que tu ne l'as pas sans avoir essaye."
             ),
             parameters={
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "domaine": {
+                        "type": "string",
+                        "description": (
+                            "Optionnel. Nom du module du control plane dont on veut le "
+                            "DETAIL : proxmox (machines virtuelles, noeuds, haute "
+                            "disponibilite, replication), frigate (camera et evenements), "
+                            "nsm (securite reseau), backups, wazuh, tls, docker, "
+                            "home_assistant, gitlab, http_health... Sans ce parametre, "
+                            "rend le resume global."
+                        ),
+                    }
+                },
                 "required": [],
             },
             category="infra",
@@ -243,7 +368,8 @@ class AvalonStatusTool(BaseTool):
                 content=f"Erreur inattendue: {exc}",
                 success=False,
             )
-        summary = _format_summary(data)
+        domaine = str(params.get("domaine") or "").strip()
+        summary = _format_domaine(data, domaine) if domaine else _format_summary(data)
         return ToolResult(
             tool_name=self.tool_id,
             content=summary,
