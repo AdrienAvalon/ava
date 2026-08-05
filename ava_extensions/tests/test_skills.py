@@ -659,3 +659,60 @@ def test_la_garde_consulte_les_DEUX_implementations() -> None:
     assert "return _is_sensitive_file_py" in source, (
         "le repli Python doit etre atteint MEME quand Rust est disponible"
     )
+
+
+# ── file_read oriente vers lire_doc (2026-08-05) ────────────────────────────────
+
+
+def test_un_echec_DOCUMENTAIRE_oriente_vers_lire_doc() -> None:
+    """⚠ MESURE : 12 appels a `file_read`, 11 echecs, dont NEUF sur le meme fichier
+    essaye en sept orthographes. Aucune ne pouvait aboutir — le depot d'infrastructure
+    n'est pas sur cette machine. « File not found » est exact et sans issue : il invite a
+    reessayer un chemin de plus, ce qu'elle a fait sept fois."""
+    import ava_extensions.patches.file_read_oriente  # noqa: F401
+    from openjarvis.tools.file_read import FileReadTool
+
+    r = FileReadTool().execute(path="docs/ava-perimetre.md")
+    assert r.success is False
+    assert "lire_doc" in r.content, "l'echec doit NOMMER l'outil qui, lui, fonctionne"
+
+
+def test_un_echec_ORDINAIRE_n_est_PAS_pollue() -> None:
+    """Le jumeau : ajouter cette phrase a TOUT echec la rendrait du bruit, et le modele
+    cesserait de la lire — le sort de toute alerte qui crie trop."""
+    import ava_extensions.patches.file_read_oriente  # noqa: F401
+    from openjarvis.tools.file_read import FileReadTool
+
+    r = FileReadTool().execute(path="/tmp/inexistant-quelconque.bin")
+    assert r.success is False
+    assert "lire_doc" not in r.content
+
+
+def test_une_lecture_REUSSIE_reste_intacte() -> None:
+    """Un patch d'orientation ne doit rien changer au chemin nominal."""
+    import ava_extensions.patches.file_read_oriente  # noqa: F401
+    from openjarvis.tools.file_read import FileReadTool
+
+    r = FileReadTool().execute(path="/etc/hostname")
+    assert r.success is True
+    assert "lire_doc" not in r.content
+
+
+def test_TOUT_patch_pose_sur_le_disque_est_IMPORTE_par_boot() -> None:
+    """Meme garde-fou que pour les outils, etendu aux patches : un module pose et jamais
+    importe ne s'execute pas, et rien ne le signale. C'est ainsi que `proposer` est reste
+    invisible au modele le 2026-08-05 alors que tout semblait en place."""
+    poses = {f.stem for f in (RACINE / "patches").glob("*.py") if not f.stem.startswith("_")}
+    arbre = ast.parse((RACINE / "boot.py").read_text(encoding="utf-8"))
+    importes: set[str] = set()
+    for noeud in ast.walk(arbre):
+        if isinstance(noeud, ast.FunctionDef) and noeud.name == "_patches":
+            importes = {
+                alias.name
+                for sous in ast.walk(noeud)
+                if isinstance(sous, ast.ImportFrom)
+                for alias in sous.names
+            }
+    assert poses, "aucun patch decouvert — lecture cassee"
+    manquants = sorted(poses - importes)
+    assert not manquants, f"patches jamais importes par boot.py : {manquants}"

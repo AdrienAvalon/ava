@@ -60,6 +60,7 @@ def _patches() -> None:
     #   `inference-cloud`. C'est celui qui a sauté le 2026-08-03.
     from ava_extensions.patches import (  # noqa: F401
         anthropic_enhancements,
+        file_read_oriente,
         system_prompt_loader,
         traces_observabilite,
     )
