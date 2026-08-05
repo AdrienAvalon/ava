@@ -145,3 +145,71 @@ def test_create_fact_store_default_path_uses_openjarvis_home(tmp_path, monkeypat
 def test_create_fact_store_unknown_backend(tmp_path):
     with pytest.raises(ValueError):
         create_fact_store("cloud", path=tmp_path / "f.jsonl")
+
+
+# ── Faits perissables et dedoublonnage normalise (2026-08-05) ──────────────────
+#
+# ⚠ Ces tests portent sur des faits REELLEMENT ECRITS dans `memory_facts.jsonl`, pas sur
+#   des exemples inventes. C'est ce qui les rend difficiles a affaiblir par accident.
+
+
+def test_un_ETAT_MESURABLE_n_est_pas_memorise(tmp_path):
+    """⚠ LE DEFAUT LE PLUS COUTEUX : une memoire qui stocke de l'etat finit par
+    CONTREDIRE les outils qui le mesurent. Observe le 2026-08-05 — Ava a ouvert une
+    reponse par « j'avais en memoire une info comme quoi il n'y aurait que 2 copies »,
+    sur un fait faux issu d'une premisse de test."""
+    store = LocalFactStore(path=tmp_path / "f.jsonl")
+    perissables = [
+        "Actuellement seulement 2 copies des sauvegardes sont disponibles",
+        "Dernier backup effectue il y a 14 heures",
+        "Infrastructure Avalon : score global 98/100",
+        "Deploie regulierement des stacks (au moins 50 deploiements en 7 jours)",
+        "Adrien et Aurelie ont quitte la maison a 11:59 cet apres-midi",
+        "openjarvis.service en crash-loop : plus de 50 redemarrages en 24h",
+    ]
+    for t in perissables:
+        assert store.add(t, source="auto") is False, f"aurait du etre refuse : {t}"
+    assert store.count() == 0
+
+
+def test_un_fait_DURABLE_passe(tmp_path):
+    """Le jumeau, et il est indispensable : un filtre qui refuse tout serait pire que
+    pas de filtre — la memoire cesserait d'exister sans que rien ne le signale."""
+    store = LocalFactStore(path=tmp_path / "f.jsonl")
+    durables = [
+        "Disjoncteur de la chaufferie des parents : derriere la porte verte",
+        "Vit avec Annie, Jean-Pierre, Adrien et Aurelie",
+        "Utilise Ansible pour l'automatisation",
+        "A configure pve-02 pour s'eteindre volontairement pour economiser l'electricite",
+    ]
+    for t in durables:
+        assert store.add(t, source="auto") is True, f"aurait du passer : {t}"
+    assert store.count() == len(durables)
+
+
+def test_une_demande_EXPLICITE_prime_sur_le_filtre(tmp_path):
+    """⚠ Le filtre ne vise que l'extraction AUTOMATIQUE. Si l'utilisateur demande
+    expressement de retenir quelque chose, c'est son choix — casser la memoire volontaire
+    pour reparer la memoire subie serait un mauvais echange."""
+    store = LocalFactStore(path=tmp_path / "f.jsonl")
+    assert store.add("Le backup a tourne il y a 2 heures", source="utilisateur") is True
+
+
+def test_le_dedoublonnage_ignore_le_sujet_et_les_accents(tmp_path):
+    """⚠ La comparaison de chaines EXACTES ne dedoublonnait rien : « Parle francais » et
+    « L'utilisateur parle francais » coexistaient. Mesure du 2026-08-05 : ce seul fait
+    etait present SEPT fois sur 105, et chacun est injecte dans l'invite systeme."""
+    store = LocalFactStore(path=tmp_path / "f.jsonl")
+    assert store.add("Parle francais") is True
+    assert store.add("L'utilisateur parle français") is False
+    assert store.add("Utilisateur parle francais.") is False
+    assert store.count() == 1
+
+
+def test_le_dedoublonnage_ne_FUSIONNE_PAS_deux_faits_distincts(tmp_path):
+    """Contre-test : une normalisation trop agressive ferait disparaitre de vrais faits,
+    ce qui est bien pire qu'un doublon."""
+    store = LocalFactStore(path=tmp_path / "f.jsonl")
+    assert store.add("Utilise Ansible pour l'automatisation") is True
+    assert store.add("Utilise Grafana pour la supervision") is True
+    assert store.count() == 2

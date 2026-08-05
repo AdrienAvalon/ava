@@ -35,6 +35,23 @@ logger = logging.getLogger(__name__)
 #   3. LANGUE MÉLANGÉE. La moitié des faits étaient en anglais sur une installation
 #      entièrement francophone — ce qui fragmente la recherche par similarité et fait
 #      manquer des rappels pertinents.
+#   4. LA MEMOIRE STOCKAIT DE L'ETAT MESURABLE — le defaut le plus couteux des quatre,
+#      parce qu'il fabrique un desaccord entre la memoire et les outils. Mesure du
+#      2026-08-05 sur les 105 faits reels : « Actuellement seulement 2 copies des
+#      sauvegardes sont disponibles » (faux, premisse d'un test), « dernier backup il y a
+#      14 heures », « score global 98/100 », « au moins 50 deploiements en 7 jours »
+#      (l'artefact de plafond corrige le meme jour), et meme « openjarvis en crash-loop :
+#      50 redemarrages en 24h » — qui etaient MES redemarrages de debogage, memorises
+#      comme une propriete de l'infrastructure de l'utilisateur.
+#      Consequence observee : Ava a ouvert une reponse par « j'avais en memoire une info
+#      comme quoi il n'y aurait que 2 copies ». Elle a prefere la mesure, mais une memoire
+#      qui contredit les outils fait le contraire de son travail.
+# ⚠ L'ANCIENNE REGLE 5 (« ne redis pas un fait deja connu ») A ETE RETIREE, PAS OUBLIEE :
+#   elle etait INAPPLICABLE PAR CONSTRUCTION. L'extracteur ne voit qu'un echange et ignore
+#   le magasin — on lui demandait un controle dont il n'a pas l'information. Le
+#   dedoublonnage vit desormais dans `memory/store.py`, ou le magasin est lisible, et
+#   compare des EMPREINTES normalisees : la comparaison de chaines exactes laissait
+#   coexister « Parle francais » et « L'utilisateur parle francais » — sept fois sur 105.
 # ⚠ Ce prompt est la SEULE divergence de ce fichier avec l'amont : une resynchronisation
 #   produira un conflit visible sur cette constante, ce qui est le comportement voulu.
 _DEFAULT_SYSTEM_PROMPT = (
@@ -52,7 +69,16 @@ _DEFAULT_SYSTEM_PROMPT = (
     "3. Ecris les faits EN FRANCAIS, meme si l'echange melange les langues.\n"
     "4. Ignore les details ponctuels, les banalites, tout ce que l'assistant a dit de "
     "lui-meme, et tout ce qui est deja evident dans l'echange en cours.\n"
-    "5. N'ecris pas un fait qui redit un fait deja connu sous une autre forme.\n\n"
+    "5. N'ecris JAMAIS un ETAT MESURABLE : une valeur, un compte, un score, un horaire, "
+    "un delai, un statut d'appareil ou de service. Ces choses se lisent en direct par les "
+    "outils, et une copie en memoire finit par les CONTREDIRE. Exemples a rejeter : "
+    "« dernier backup il y a 14 heures », « score 98/100 », « le switch tourne a 1 Gbps », "
+    "« 50 deploiements en 7 jours », « untel est parti a 11:59 ». Exemples a retenir : "
+    "« utilise Ansible », « le disjoncteur est derriere la porte verte », « vit avec "
+    "Annie et Jean-Pierre ».\n"
+    "6. Une affirmation que l'assistant n'a PAS CONFIRMEE ne se memorise pas — pas plus "
+    "qu'une affirmation qu'il contredit. « Je ne peux pas confirmer » n'est pas un "
+    "acquiescement.\n\n"
     "Reponds UNIQUEMENT par un tableau JSON de chaines courtes (moins de 200 caracteres "
     "chacune). Si rien ne merite d'etre retenu, reponds []."
 )

@@ -10,7 +10,10 @@ caps the total number of facts, and is safe to call from multiple threads.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import unicodedata
+import re
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -25,6 +28,48 @@ from openjarvis.core.registry import FactStoreRegistry
 def _default_fact_path() -> Path:
     """Return the env-aware default JSONL path for automatic memory facts."""
     return get_config_dir() / "memory_facts.jsonl"
+
+
+logger = logging.getLogger(__name__)
+
+
+#: Marqueurs de PERISSABILITE. Un fait qui en contient un decrit un ETAT a un instant,
+#: pas une propriete durable — et cet etat se lit en direct par les outils.
+#: ⚠ Liste DERIVEE DES FAITS REELLEMENT ECRITS le 2026-08-05, pas imaginee : chacun de ces
+#:   motifs attrape au moins un fait perime observe dans `memory_facts.jsonl`.
+#: ⚠ Volontairement CONSERVATRICE — elle ne vise que des formulations sans ambiguite. Un
+#:   fait durable formule avec « actuellement » n'est, par definition, pas durable.
+_PERISSABLE = re.compile(
+    r"""
+    \bactuellement\b | \ben\s+ce\s+moment\b | \baujourd'?hui\b
+    | \bhier\b | \bce\s+(?:matin|soir)\b | \bcet\s+apres[-\s]?midi\b
+    | \bil\s+y\s+a\s+\d+ | \bderni(?:er|ere)\s+\w+\s+(?:effectue|realise)
+    | \ben\s+\d+\s*(?:h|heures?|jours?|j)\b
+    | \b\d+\s*/\s*100\b
+    | \b\d{1,2}:\d{2}\b
+    | \bcrash-?loop\b | \bredemarrages?\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+#: Sujets grammaticaux que l'extracteur ajoute ou omet au hasard. Les retirer avant de
+#: comparer fait converger « Parle francais » et « L'utilisateur parle francais ».
+_SUJETS = re.compile(
+    r"^(?:l'utilisateur|l utilisateur|utilisateur|the\s+user|user|il|elle|on)\s+", re.IGNORECASE
+)
+
+
+def _empreinte(texte: str) -> str:
+    """Forme normalisee servant AU SEUL dedoublonnage.
+
+    ⚠ On ne modifie JAMAIS le texte stocke : un fait doit rester lisible tel qu'il a ete
+      formule. Cette empreinte ne sert qu'a repondre « est-ce que je sais deja ca ? ».
+    """
+    t = unicodedata.normalize("NFKD", texte.lower())
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    t = _SUJETS.sub("", t.strip())
+    t = re.sub(r"[^a-z0-9 ]+", " ", t)
+    return " ".join(t.split())
 
 
 @dataclass(slots=True)
@@ -137,10 +182,21 @@ class LocalFactStore(FactStore):
         text = (text or "").strip()
         if not text:
             return False
+        # ⚠ ON REFUSE L'ETAT MESURABLE — mais SEULEMENT quand l'extraction est automatique.
+        #   Si l'utilisateur demande explicitement de retenir quelque chose, c'est son
+        #   choix et il prime : `source="auto"` distingue les deux. Sans cette nuance, on
+        #   casserait la memoire volontaire pour reparer la memoire subie.
+        if source == "auto" and _PERISSABLE.search(text):
+            logger.debug("fait perissable refuse: %s", text[:80])
+            return False
         with self._lock:
             self._sync_from_disk_locked()
-            lowered = text.lower()
-            if any(f.text.lower() == lowered for f in self._facts):
+            # ⚠ COMPARAISON SUR L'EMPREINTE, pas sur la chaine exacte. Le dedoublonnage
+            #   d'origine testait l'egalite stricte en minuscules : « Parle francais » et
+            #   « L'utilisateur parle francais » passaient tous les deux. Mesure du
+            #   2026-08-05 : ce seul fait etait present SEPT fois sur 105.
+            empreinte = _empreinte(text)
+            if any(_empreinte(f.text) == empreinte for f in self._facts):
                 return False  # dedupe
             self._facts.append(Fact(text=text, source=source, created_at=time.time()))
             # Enforce the cap by evicting the oldest entries.
