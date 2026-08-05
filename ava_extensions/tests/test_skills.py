@@ -612,3 +612,50 @@ def test_le_garde_fou_precedent_examine_VRAIMENT_quelque_chose() -> None:
     importes = _outils_importes_par_boot()
     assert len(poses) >= 5, f"la decouverte des outils ne rend que {poses}"
     assert len(importes) >= 5, f"la lecture de boot.py ne rend que {importes}"
+
+
+# ── Garde des fichiers sensibles (2026-08-05) ───────────────────────────────────
+
+
+def test_un_JETON_est_traite_comme_un_fichier_SENSIBLE() -> None:
+    """⚠ TROU MESURE, PAS THEORIQUE. `file_read` refusait bien `.env`, `*.pem`, `id_rsa`
+    — mais AUCUN motif ne couvrait un fichier de jeton, qui n'a ni extension ni nom en
+    « credentials ». Le 2026-08-05, `~/.openjarvis/cp_voice_token` etait rendu EN CLAIR
+    au modele : c'est le jeton qui autorise `logs` et `proposer`. Le vecteur n'est pas
+    theorique — `web_search` ramene du texte ecrit par des tiers.
+    """
+    from openjarvis.security.file_policy import is_sensitive_file
+
+    for chemin in (
+        "/home/avalon/.openjarvis/cp_voice_token",
+        "/tmp/gitlab.token",
+        "/tmp/un_api_key_quelconque",
+        "/tmp/machin_secret",
+    ):
+        assert is_sensitive_file(chemin), f"devrait etre refuse : {chemin}"
+
+
+def test_un_fichier_ORDINAIRE_reste_lisible() -> None:
+    """Le jumeau : une garde qui refuse tout serait pire qu'aucune garde — l'outil
+    cesserait de servir sans que rien ne le signale."""
+    from openjarvis.security.file_policy import is_sensitive_file
+
+    for chemin in ("/etc/hostname", "/tmp/README.md", "/tmp/config.toml"):
+        assert not is_sensitive_file(chemin), f"ne devrait pas etre refuse : {chemin}"
+
+
+def test_la_garde_consulte_les_DEUX_implementations() -> None:
+    """⚠ LE PIEGE QUI A COUTE UNE PASSE. `is_sensitive_file` rendait la reponse RUST des
+    qu'elle etait disponible et ne consultait Python qu'en `ImportError` : un motif ajoute
+    a `DEFAULT_SENSITIVE_PATTERNS` etait DU CODE MORT en production. On croit durcir, rien
+    ne change, aucune erreur ne le signale.
+    L'union doit aller dans le sens du REFUS — un desaccord entre deux gardes doit fermer,
+    jamais ouvrir."""
+    import inspect
+
+    from openjarvis.security import file_policy
+
+    source = inspect.getsource(file_policy.is_sensitive_file)
+    assert "return _is_sensitive_file_py" in source, (
+        "le repli Python doit etre atteint MEME quand Rust est disponible"
+    )
