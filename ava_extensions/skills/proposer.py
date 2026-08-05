@@ -181,3 +181,110 @@ class ProposerTool(BaseTool):
             success=True,
             metadata=d,
         )
+
+
+@ToolRegistry.register("lire_doc")
+class LireDocTool(BaseTool):
+    """Lit un document du depot — le MEME perimetre que ce qu'elle peut proposer.
+
+    ⚠ IL VIT DANS LE MEME FICHIER QUE `proposer`, DELIBEREMENT. Lire et proposer sont
+      bornes par la meme fonction cote control plane (`chemin_valide`) ; les separer ici
+      inviterait a les faire diverger la-bas. Ce qu'on peut lire est exactement ce qu'on
+      peut reproposer, ni plus ni moins.
+    ⚠ SANS LUI, `proposer` N'ETAIT QU'A MOITIE UN OUTIL : Ava pouvait CREER une page, pas
+      en AMENDER une. Invitee a corriger sa propre page le 2026-08-05, elle a refuse
+      d'improviser un contenu qu'elle n'avait pas vu — bonne reaction, et cul-de-sac.
+    """
+
+    tool_id = "lire_doc"
+    is_local = True
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="lire_doc",
+            description=(
+                "Lit un document de la documentation du depot Avalon (docs/*.md), ou "
+                "LISTE les documents disponibles si aucun chemin n'est donne. "
+                "A utiliser AVANT `proposer` des que tu modifies une page existante : "
+                "le contenu que tu enverras REMPLACE le fichier entier, donc il faut "
+                "partir du texte reel, jamais de ton souvenir. "
+                "Meme perimetre que `proposer` : la documentation, et rien d'autre."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "chemin": {
+                        "type": "string",
+                        "description": (
+                            "Chemin du document, sous docs/ et en .md. Omettre pour "
+                            "obtenir la liste des documents disponibles."
+                        ),
+                    }
+                },
+                "required": [],
+            },
+            category="infra",
+            latency_estimate=1.0,
+            timeout_seconds=20.0,
+        )
+
+    def execute(self, **params: Any) -> ToolResult:
+        jeton = _jeton()
+        if not jeton:
+            return ToolResult(
+                tool_name=self.tool_id,
+                content="Je ne peux pas lire la documentation : jeton absent.",
+                success=False,
+            )
+        chemin = str(params.get("chemin") or "").strip()
+        if chemin:
+            url = f"{CP_BASE}/api/v1/propositions/fichier?" + urllib.parse.urlencode(
+                {"chemin": chemin}
+            )
+        else:
+            url = f"{CP_BASE}/api/v1/propositions/fichiers"
+        requete = urllib.request.Request(url, headers={"X-CP-Voice-Token": jeton})
+        try:
+            with urllib.request.urlopen(requete, timeout=_TIMEOUT_S) as reponse:
+                d = json.loads(reponse.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            # ⚠ ON REND LE MOTIF DU CONTROL PLANE. Un 404 (« faute de frappe ») et un 403
+            #   (« hors perimetre ») demandent deux reactions opposees ; un message
+            #   generique ferait reessayer au hasard.
+            try:
+                detail = json.loads(exc.read().decode("utf-8")).get("detail", "")
+            except Exception:  # noqa: BLE001
+                detail = ""
+            return ToolResult(
+                tool_name=self.tool_id,
+                content=f"Lecture refusee ({exc.code}) : {detail or 'sans detail'}.",
+                success=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("lire_doc: control plane injoignable (%s)", type(exc).__name__)
+            return ToolResult(
+                tool_name=self.tool_id,
+                content="Le control plane ne repond pas — je n'ai rien pu lire.",
+                success=False,
+            )
+
+        if not chemin:
+            fichiers = d.get("fichiers") or []
+            return ToolResult(
+                tool_name=self.tool_id,
+                content=(
+                    f"{len(fichiers)} document(s) lisibles et proposables :\n"
+                    + "\n".join(f"  - {f}" for f in fichiers)
+                ),
+                success=True,
+                metadata=d,
+            )
+        return ToolResult(
+            tool_name=self.tool_id,
+            content=(
+                f"{d.get('chemin')} ({d.get('octets')} octets) :\n\n{d.get('contenu', '')}"
+            ),
+            success=True,
+            metadata={"chemin": d.get("chemin"), "octets": d.get("octets")},
+        )
