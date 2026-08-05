@@ -154,6 +154,25 @@ def _surveillance(d: dict[str, Any]) -> list[str]:
     if not c:
         return []
     lignes = []
+    # ⚠ LA PRÉSENCE D'ABORD, ET C'EST LA CORRECTION D'UNE ERREUR RÉELLE. Traces du
+    #   2026-08-04 : l'admin écrit « le parking est pas vide, tu peux vérifier ? », Ava
+    #   répond « parking vide » puis soupçonne le capteur d'être en panne. Le capteur allait
+    #   bien — elle lisait des capteurs ÉVÉNEMENTIELS (« off » = rien ne se DÉCLENCHE), pas
+    #   des compteurs de PRÉSENCE. Une voiture garée ne produit aucun événement.
+    #   ⚠ Ces lignes passent EN PREMIER exprès : elles répondent à « qu'y a-t-il là ? », et
+    #   doivent être lues avant les détections, qui répondent à « que s'est-il passé ? ».
+    if lisible := c.get("parking_lisible"):
+        lignes.append(f"  Parking, en ce moment : {lisible}")
+    for zone, z in (c.get("presence_par_zone") or {}).items():
+        if zone == "parking":
+            continue  # déjà dit par la phrase ci-dessus
+        detail = []
+        if v := z.get("voitures_presentes"):
+            detail.append(f"{v} voiture(s)")
+        if pers := z.get("personnes_presentes"):
+            detail.append(f"{pers} personne(s)")
+        if detail:
+            lignes.append(f"  Zone « {zone} » : {', '.join(detail)} présente(s)")
     if moment := c.get("moment"):
         lignes.append(f"  Il fait {moment} sur le parking")
     if sd := c.get("carte_sd"):
