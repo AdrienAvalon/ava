@@ -19,14 +19,42 @@ from openjarvis.core.types import Message, Role
 
 logger = logging.getLogger(__name__)
 
+# ⚠ DURCI LE 2026-08-05 APRÈS TROIS DÉFAUTS MESURÉS, chacun observé sur un fait
+#   réellement écrit dans `memory_facts.jsonl` :
+#   1. UNE PRÉMISSE RÉFUTÉE ÉTAIT MÉMORISÉE COMME VRAIE. Question posée : « comme le
+#      chauffage de la grange est éteint depuis hier, la maison doit être froide ? » —
+#      affirmation FAUSSE. Ava l'a correctement RÉFUTÉE dans sa réponse (« non, pas du
+#      tout, il fait 24-25 °C »), et l'extracteur a tout de même stocké « barn with heating
+#      that was turned off yesterday ». Il lisait la QUESTION, pas la CONCLUSION. C'est le
+#      défaut le plus dangereux : n'importe quelle erreur de l'utilisateur devient un fait
+#      durable, et Ava raisonnera dessus des semaines plus tard.
+#   2. UNE QUESTION ÉTABLISSAIT L'EXISTENCE DE SON OBJET. « Quelle est la pression
+#      atmosphérique dans le garage ? » a produit DEUX faits : « possède un garage » (il
+#      n'y en a pas) et « intéressé par les mesures de pression atmosphérique ». Demander
+#      si une chose existe n'est pas affirmer qu'elle existe.
+#   3. LANGUE MÉLANGÉE. La moitié des faits étaient en anglais sur une installation
+#      entièrement francophone — ce qui fragmente la recherche par similarité et fait
+#      manquer des rappels pertinents.
+# ⚠ Ce prompt est la SEULE divergence de ce fichier avec l'amont : une resynchronisation
+#   produira un conflit visible sur cette constante, ce qui est le comportement voulu.
 _DEFAULT_SYSTEM_PROMPT = (
-    "You extract durable, long-term facts about the user from a single "
-    "conversation exchange. A good fact is stable over time and useful in "
-    "future conversations: preferences, identity, goals, ongoing projects, "
-    "constraints, or relationships. Ignore one-off task details, small talk, "
-    "and anything the assistant said about itself.\n\n"
-    "Respond with ONLY a JSON array of short fact strings (each under 200 "
-    "characters). If there is nothing worth remembering, respond with []."
+    "Tu extrais des faits DURABLES sur l'utilisateur a partir d'un seul echange. "
+    "Un bon fait est stable dans le temps et utile plus tard : preferences, identite, "
+    "objectifs, projets en cours, contraintes, relations.\n\n"
+    "REGLES ABSOLUES :\n"
+    "1. Ne retiens JAMAIS une affirmation que la reponse de l'assistant CONTREDIT ou "
+    "corrige. Si l'utilisateur dit « comme X est vrai... » et que la reponse montre que X "
+    "est faux, X ne doit PAS etre memorise. Lis la CONCLUSION de l'echange, pas la "
+    "premisse de la question.\n"
+    "2. Une QUESTION n'etablit pas l'existence de son objet. « Quelle est la temperature "
+    "du garage ? » ne prouve ni qu'un garage existe, ni que l'utilisateur s'y interesse. "
+    "N'extrais un fait d'une question que si la reponse le CONFIRME.\n"
+    "3. Ecris les faits EN FRANCAIS, meme si l'echange melange les langues.\n"
+    "4. Ignore les details ponctuels, les banalites, tout ce que l'assistant a dit de "
+    "lui-meme, et tout ce qui est deja evident dans l'echange en cours.\n"
+    "5. N'ecris pas un fait qui redit un fait deja connu sous une autre forme.\n\n"
+    "Reponds UNIQUEMENT par un tableau JSON de chaines courtes (moins de 200 caracteres "
+    "chacune). Si rien ne merite d'etre retenu, reponds []."
 )
 
 
