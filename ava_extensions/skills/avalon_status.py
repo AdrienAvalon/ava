@@ -110,10 +110,33 @@ def _format_summary(data: dict[str, Any]) -> str:
         ]
         detail = ""
         if inactifs:
-            noms = ", ".join(
-                str(h.get("display_name") or h.get("id")) for h in inactifs[:4]
-            )
-            detail = f" — hors service ou en maintenance : {noms}"
+            # ⚠ LE MOTIF ET L'ANCIENNETÉ, PAS SEULEMENT LE NOM. Le control plane les expose
+            #   (`maintenance: {mode, reason, age_days}`) et cet outil n'en gardait que le
+            #   nom, en écrivant « hors service OU en maintenance ». Ava reprenait cette
+            #   ambiguïté et la renvoyait à l'admin en question — « tu l'as mis
+            #   volontairement ou c'est une surprise ? » — alors que la réponse est écrite
+            #   dans le registre. Mesuré le 2026-08-05 sur pve-02.
+            # ⚠ `age_days` compte AUTANT que le motif : ce champ existe pour rendre visible
+            #   un arrêt « temporaire » qui dure depuis des semaines. Le taire vide le champ
+            #   de sa raison d'être.
+            morceaux = []
+            for h in inactifs[:4]:
+                nom = str(h.get("display_name") or h.get("id"))
+                m = h.get("maintenance") or {}
+                motif = str(m.get("reason") or "").strip()
+                jours = m.get("age_days")
+                if motif and jours is not None:
+                    morceaux.append(f"{nom} ({motif}, depuis {jours:.0f} j)")
+                elif motif:
+                    morceaux.append(f"{nom} ({motif})")
+                elif m.get("mode"):
+                    morceaux.append(f"{nom} ({m['mode']})")
+                else:
+                    # ⚠ Sans entrée de maintenance, l'hôte est inactif SANS raison déclarée
+                    #   — ce qui n'est pas la même chose qu'un arrêt volontaire, et mérite
+                    #   d'être dit tel quel plutôt que fondu dans un « ou ».
+                    morceaux.append(f"{nom} (inactif, aucune maintenance déclarée)")
+            detail = " — " + " ; ".join(morceaux)
         lines.append(f"Hôtes: {len(hosts)} déclarés, {len(inactifs)} inactifs{detail}")
     else:
         # ⚠ On dit qu'on ne sait pas, plutôt que d'écrire « 0 hôte » — c'est exactement
