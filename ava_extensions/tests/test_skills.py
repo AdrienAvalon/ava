@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 from pathlib import Path
 from typing import Any
@@ -559,3 +560,55 @@ def test_camera_dit_la_PHRASE_COMPLETE_avec_sa_preposition(cam: Any) -> None:
     assert "voiture dans la cour" in sortie
     assert "voiture la cour" not in sortie
     assert "personne le portail" not in sortie
+
+
+def _outils_importes_par_boot() -> set[str]:
+    """Les modules que `_skills()` importe reellement, lus par PARCOURS D'AST.
+
+    ⚠ La premiere version de ce test decoupait le fichier a la chaine et cherchait la
+      parenthese fermante apres « def _skills() » — elle tombait sur celle de la
+      SIGNATURE, donc lisait un bloc vide et declarait les sept outils manquants. Un test
+      faux qui echoue est moins couteux qu'un test faux qui passe, mais c'est le meme
+      defaut : on lit une source qui ne porte pas la donnee.
+    """
+    arbre = ast.parse((RACINE / "boot.py").read_text(encoding="utf-8"))
+    for noeud in ast.walk(arbre):
+        if isinstance(noeud, ast.FunctionDef) and noeud.name == "_skills":
+            return {
+                alias.name
+                for sous in ast.walk(noeud)
+                if isinstance(sous, ast.ImportFrom)
+                for alias in sous.names
+            }
+    raise AssertionError("`_skills()` introuvable dans boot.py")
+
+
+def test_TOUT_outil_pose_sur_le_disque_est_IMPORTE_par_boot() -> None:
+    """⚠ LE GARDE-FOU QUE `boot.py` ANNONCAIT SANS QU'IL EXISTE.
+
+    Son commentaire dit « TOUT NOUVEL OUTIL DOIT ETRE AJOUTE ICI (et la CI le verifie) ».
+    La CI ne verifiait rien. Paye le 2026-08-05 avec l'outil `proposer` : le fichier etait
+    depose, la liste blanche Ansible le nommait, le service redemarrait sans la moindre
+    erreur — et Ava repondait « je n'ai pas d'outil `proposer` dans ma liste ». Rien
+    n'etait casse ; personne n'importait le module, donc le decorateur
+    `@ToolRegistry.register` ne s'executait jamais.
+
+    C'est le defaut recurrent de ce projet sous une forme de plus : *une source qui ne
+    porte pas la donnee repond « rien » sans erreur.* Ici la source est la liste d'imports.
+    """
+    poses = {f.stem for f in (RACINE / "skills").glob("*.py") if not f.stem.startswith("_")}
+    manquants = sorted(poses - _outils_importes_par_boot())
+    assert not manquants, (
+        "Outils presents sur le disque mais JAMAIS importes par `boot.py` — ils "
+        f"n'existeront pas pour le modele, en silence : {manquants}"
+    )
+
+
+def test_le_garde_fou_precedent_examine_VRAIMENT_quelque_chose() -> None:
+    """Contre-test indispensable : un test dont la lecture echoue silencieusement reste
+    vert pour toujours. On verifie donc que les DEUX cotes de la comparaison sont peuples.
+    """
+    poses = {f.stem for f in (RACINE / "skills").glob("*.py") if not f.stem.startswith("_")}
+    importes = _outils_importes_par_boot()
+    assert len(poses) >= 5, f"la decouverte des outils ne rend que {poses}"
+    assert len(importes) >= 5, f"la lecture de boot.py ne rend que {importes}"

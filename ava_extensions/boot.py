@@ -74,6 +74,7 @@ def _skills() -> None:
         camera,
         home_assistant,
         memoire,
+        proposer,
     )
 
 
