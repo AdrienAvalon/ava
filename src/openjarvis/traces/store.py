@@ -248,9 +248,20 @@ class TraceStore:
 
         Returns True if the trace was found and updated, False otherwise.
         """
+        # ⚠ ON DERIVE AUSSI `outcome`, ET C'EST TOUT L'INTERET DE CE CORRECTIF.
+        #   Mesure du 2026-08-05 : sur 65 traces, **0 avaient un `feedback`, 0 un
+        #   `outcome`**. Or `outcome` a de VRAIS consommateurs — `traces/analyzer.py`
+        #   filtre dessus pour calculer les taux de reussite par outil et par route,
+        #   `learning/agents/skill_discovery.py` le lit aussi — mais AUCUN producteur.
+        #   Un champ avec des lecteurs et pas d'ecrivain fait croire a une boucle
+        #   d'apprentissage qui n'a jamais tourne.
+        # ⚠ Seuil a 0,5 sur une note normalisee 0-1. Une note EXACTEMENT a 0,5 compte
+        #   comme un succes : en cas de doute on ne penalise pas, sinon les analyses
+        #   deviennent pessimistes par construction.
+        resultat = "success" if score >= 0.5 else "failure"
         cursor = self._conn.execute(
-            "UPDATE traces SET feedback = ? WHERE trace_id = ?",
-            (score, trace_id),
+            "UPDATE traces SET feedback = ?, outcome = ? WHERE trace_id = ?",
+            (score, resultat, trace_id),
         )
         self._conn.commit()
         return cursor.rowcount > 0

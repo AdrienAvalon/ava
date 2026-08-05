@@ -981,8 +981,57 @@ async def submit_feedback(req: FeedbackScoreRequest, request: Request):
 
 @feedback_router.get("/stats")
 async def feedback_stats(request: Request):
-    """Get feedback statistics."""
-    return {"total": 0, "mean_score": 0.0}
+    """Statistiques REELLES des retours, et taux de reussite par outil.
+
+    ⚠ CETTE ROUTE RENVOYAIT `{"total": 0, "mean_score": 0.0}` EN DUR, quoi qu'il y ait en
+      base. Une API qui repond « aucun retour » alors qu'il y en a est pire qu'une API
+      absente : on en conclut que le mecanisme ne sert a rien, et on cesse de l'alimenter.
+      Defaut trouve le 2026-08-05 en cherchant pourquoi la boucle d'apprentissage
+      n'apprenait rien — reponse : elle n'avait jamais tourne (0 note, 0 outcome sur 65
+      traces), et ce point de mesure ne pouvait pas le montrer.
+    ⚠ Elle expose aussi `per_tool`, que `TraceAnalyzer` calculait DEJA sans qu'aucune route
+      ne le rende lisible. C'est ce chiffre-la qui dit ou porter l'effort d'entrainement.
+    """
+    try:
+        from openjarvis.core.config import DEFAULT_CONFIG_DIR
+        from openjarvis.traces.analyzer import TraceAnalyzer
+        from openjarvis.traces.store import TraceStore
+
+        db_path = DEFAULT_CONFIG_DIR / "traces.db"
+        if not db_path.exists():
+            # ⚠ On DIT qu'on ne sait pas plutot que de rendre des zeros : « pas de base »
+            #   et « aucun retour » ne sont pas la meme chose.
+            raise HTTPException(status_code=404, detail="No trace database")
+
+        store = TraceStore(db_path)
+        try:
+            notes = [
+                t.feedback
+                for t in store.list_traces(limit=10000)
+                if getattr(t, "feedback", None) is not None
+            ]
+            analyseur = TraceAnalyzer(store)
+            resume = analyseur.summary()
+            par_outil = analyseur.per_tool_stats()
+        finally:
+            store.close()
+
+        return {
+            "total": len(notes),
+            "mean_score": (sum(notes) / len(notes)) if notes else None,
+            # ⚠ `total_traces`, PAS un `evaluated` que j'avais DEVINE : `TraceSummary`
+            #   ne porte pas ce champ, donc le `getattr` rendait `null` — un chiffre
+            #   creux dans la route ecrite justement pour denoncer les chiffres creux.
+            #   Champs reels : total_traces, total_steps, avg_latency, avg_tokens,
+            #   success_rate, total_energy_joules.
+            "traces_totales": getattr(resume, "total_traces", None),
+            "taux_reussite": getattr(resume, "success_rate", None),
+            "per_tool": par_outil,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ---- Optimize routes ----
