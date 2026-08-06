@@ -238,3 +238,53 @@ def test_l_infra_SEULE_suffit_a_rendre_un_resultat(_git, monkeypatch) -> None:
     r = evolutions.EvolutionsTool().execute()
     assert "[infrastructure] feat(ava_app)" in r.content
     assert r.metadata["depuis_moi"] == 0
+
+
+# ══ La troisième amputation — trouvée par un agent d'évaluation le 2026-08-07 ═══════
+
+
+def test_une_liste_TRONQUEE_le_DIT(_git, monkeypatch) -> None:
+    """⚠ LE DÉFAUT MESURÉ. Interrogée sur les changements du 5 août, Ava a répondu « un
+    seul changement » là où il y en avait des dizaines : elle rendait les N plus récents
+    sans qu'un mot ne signale les autres. Ce fichier corrigeait déjà l'amputation
+    silencieuse sur l'axe INFRASTRUCTURE, en écrivant qu'« il serait absurde de reproduire
+    ce défaut ici » — et le reproduisait sur l'axe du NOMBRE, vingt lignes plus haut."""
+    _git("".join(_bloc("2026-08-05", f"feat: capacite {i}") for i in range(40)))
+    _infra(monkeypatch, [])
+    r = evolutions.EvolutionsTool().execute(nombre=5)
+    assert "au moins" in r.content
+    assert "PAS la liste complète" in r.content
+    assert r.metadata["tronque"] is True
+
+
+def test_une_liste_COMPLETE_n_avertit_de_RIEN(_git, monkeypatch) -> None:
+    """⚠ LE CONTRE-TEST QUI PORTE LE RISQUE DE LA CORRECTION. Un avertissement permanent
+    est un avertissement qu'on cesse de lire — et il ferait douter d'une réponse exhaustive
+    et juste. Le remède ne doit pas coûter la confiance dans le cas normal."""
+    _git(_bloc("2026-08-06", "feat: une seule capacite"))
+    _infra(monkeypatch, [])
+    r = evolutions.EvolutionsTool().execute(nombre=10)
+    assert "au moins" not in r.content
+    assert r.metadata["tronque"] is False
+
+
+def test_la_troncature_cote_INFRASTRUCTURE_compte_aussi(_git, monkeypatch) -> None:
+    """⚠ Les deux sources peuvent déborder indépendamment. Ne compter que la sienne
+    laisserait la moitié du défaut en place — c'est la faute d'origine, déplacée d'un cran
+    pour la troisième fois."""
+    _git(_bloc("2026-08-06", "feat: une capacite"))
+    _infra(monkeypatch, [("2026-08-06", f"feat(cp): outil {i}", "") for i in range(30)])
+    r = evolutions.EvolutionsTool().execute(nombre=3)
+    assert r.metadata["tronque"] is True
+    assert "au moins" in r.content
+
+
+def test_le_total_annonce_n_est_JAMAIS_presente_comme_EXACT(_git, monkeypatch) -> None:
+    """⚠ `git log` est lui-même borné en amont : on ne CONNAÎT pas le total. Annoncer un
+    chiffre sec serait remplacer une omission par une affirmation fausse — le contraire
+    d'une correction. « au moins N » est la seule formulation vraie."""
+    _git("".join(_bloc("2026-08-05", f"feat: capacite {i}") for i in range(40)))
+    _infra(monkeypatch, [])
+    r = evolutions.EvolutionsTool().execute(nombre=5)
+    assert "au moins" in r.content
+    assert "exactement" not in r.content

@@ -219,14 +219,35 @@ class EvolutionsTool(BaseTool):
                 metadata={"trouves": 0},
             )
 
-        resumes = [r for r in (_resumer(b) for b in blocs) if r][:nombre]
+        # ⚠ LA TROISIÈME AMPUTATION SILENCIEUSE, ET C'EST CE FICHIER QUI LA PORTAIT.
+        #   Mesuré le 2026-08-07 par un agent d'évaluation : interrogée sur ce qui avait
+        #   changé le 5 août, Ava a répondu « un seul changement » là où il y en avait des
+        #   dizaines. Elle n'a pas mal lu — elle a rendu les `nombre` plus récents, sans
+        #   qu'un mot ne dise qu'il y en avait d'autres. Le paragraphe vingt lignes plus bas
+        #   déclare qu'« il serait absurde de reproduire ce défaut ici » à propos de l'axe
+        #   infrastructure : il était reproduit sur l'axe du NOMBRE, dans le même fichier.
+        #   ⚠ Le coût n'est pas cosmétique : « un seul changement le 5 août » est FAUX, alors
+        #   que « voici 8 changements sur au moins 69 » est vrai et utile. Une vue partielle
+        #   annoncée reste une réponse ; une vue partielle muette est une erreur.
+        tous = [r for r in (_resumer(b) for b in blocs) if r]
+        resumes = tous[:nombre]
+        # ⚠ On ne peut PAS annoncer un total exact : `git log` a lui-même été borné à
+        #   `nombre * 4` commits. Dire « au moins » est la seule formulation vraie — un
+        #   total inventé serait un mensonge de plus, pas une correction.
+        _coupes = len(tous) - len(resumes)
+        _borne_git = len(blocs) >= nombre * 4
 
         # ⚠ LA SECONDE MOITIÉ. Sans elle, ce journal était juste sur ce qu'il voyait et
         #   amputé de moitié — sans le dire. Les deux sources sont FUSIONNÉES et chaque
         #   ligne porte sa provenance : « on m'a changée » et « on a changé mes outils
         #   côté infrastructure » ne se diagnostiquent pas au même endroit.
         fenetre = str(params.get("depuis") or "7j")
-        infra = _cote_infra(fenetre, nombre)
+        # ⚠ On demande LARGE puis on coupe ICI, pour pouvoir compter ce qu'on écarte.
+        #   Couper côté serveur rendrait la troncature invisible à cet endroit — c'est
+        #   exactement la mécanique qui a produit « un seul changement le 5 août ».
+        infra_tout = _cote_infra(fenetre, nombre * 4)
+        infra = infra_tout[:nombre] if infra_tout is not None else None
+        _coupes_infra = len(infra_tout) - len(infra) if infra_tout is not None else 0
 
         if not resumes and not infra:
             return ToolResult(
@@ -259,6 +280,16 @@ class EvolutionsTool(BaseTool):
             else "\n⚠ Je n'ai PAS pu lire les changements côté infrastructure : cette liste "
             "est donc incomplète, et une absence n'y prouve rien.\n"
         )
+        # ⚠ La troncature se DIT, avec le mot « au moins » : on ne connaît pas le total.
+        reste = _coupes + _coupes_infra
+        if reste or _borne_git:
+            combien = f"au moins {len(resumes) + len(infra or []) + reste}"
+            avertissement += (
+                f"\n⚠ Je n'affiche que les {len(resumes) + len(infra or [])} plus récents "
+                f"sur {combien} sur la période. Ce n'est PAS la liste complète : pour en "
+                f"voir davantage, redemande avec un `nombre` plus grand ou une fenêtre plus "
+                f"courte. Ne conclus pas d'ici qu'il n'y a eu que ça.\n"
+            )
         return ToolResult(
             tool_name=self.tool_id,
             content=(
@@ -277,5 +308,6 @@ class EvolutionsTool(BaseTool):
                 "depuis_moi": len(resumes),
                 "depuis_infra": len(infra or []),
                 "infra_lue": infra is not None,
+                "tronque": bool(_coupes + _coupes_infra) or _borne_git,
             },
         )
