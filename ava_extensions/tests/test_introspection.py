@@ -71,7 +71,8 @@ def test_un_echec_d_OUTIL_n_est_PAS_presente_comme_une_mauvaise_reponse(_base) -
     bien refusé."""
     _base([_t(outcome="tool_failure")])
     r = introspection.IntrospectionTool().execute(vue="echecs")
-    assert "pas forcément une mauvaise réponse" in r.content
+    assert "aucune réponse n'est sortie" in r.content
+    assert "recovered" in r.content
 
 
 def test_AUCUN_echec_le_dit_franchement(_base) -> None:

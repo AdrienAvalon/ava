@@ -119,26 +119,56 @@ class TraceCollector:
             if s.step_type == StepType.TOOL_CALL and s.output.get("success") is False
         ]
         # ⚠ CE QUI SUIT CORRIGE UN DEFAUT DE MA PROPRE MESURE, et il etait pire que le
-        #   silence qu'il pretendait eviter. En ne notant QUE les echecs, 154 traces sur 171
+        # silence qu'il pretendait eviter. En ne notant QUE les echecs, 154 traces sur
+        #   171
         #   restaient a `outcome = None` — et `analyzer.py` calcule
         #   `successes / evaluated` en ne comptant QUE les traces notees. L'API publiait
         #   donc `taux_reussite: 0.0588` : **5,9 %**, alors que la quasi-totalite des
-        #   traces avait abouti sans le moindre echec. Un chiffre catastrophique fabrique
+        # traces avait abouti sans le moindre echec. Un chiffre catastrophique
+        #   fabrique
         #   par l'absence de mesure, pas par la realite.
-        # ⚠ ON NE FABRIQUE TOUJOURS PAS DE « success » : ce mot reste reserve a un jugement
-        #   de QUALITE, que seul un humain peut porter. `completed` est un fait verifiable —
+        # ⚠ ON NE FABRIQUE TOUJOURS PAS DE « success » : ce mot reste reserve a un
+        #   jugement
+        # de QUALITE, que seul un humain peut porter. `completed` est un fait
+        #   verifiable —
         #   la tache est allee au bout sans echec d'outil et sans troncature. C'est la
-        #   distinction entre « ca a marche » et « c'etait bien », et elle est load-bearing.
+        # distinction entre « ca a marche » et « c'etait bien », et elle est load-
+        #   bearing.
         # ⚠ `incomplete` couvre les deux facons OBJECTIVES de ne pas aboutir : budget de
         #   tours epuise, ou reponse vide. Les laisser a `None` les rendait invisibles.
+        # ⚠ UN OUTIL QUI ECHOUE N'EST PAS UN TOUR QUI ECHOUE — et confondre les deux
+        #   etait
+        #   MON defaut, ecrit le matin meme du 2026-08-06. La regle disait « s'il y a un
+        #   echec d'outil, c'est `tool_failure` », SANS regarder si la reponse avait ete
+        #   livree. Un agent qui se heurte a un outil, se reprend et rend une reponse
+        #   complete etait donc note comme un echec, avec `feedback = 0.0`.
+        # ⚠ MESURE, PAS IMPRESSION : sur 210 traces, **19 des 21 `tool_failure` avaient
+        #   livre une reponse** (mediane 978 caracteres, jusqu'a 7537). Deux seulement
+        #   etaient de vrais echecs. Le taux publie tombait a 89 % quand le reel est
+        #   98,1 % — et c'est ELLE qui lit ce chiffre sur elle-meme via `introspection`.
+        #   Un systeme qui note ses propres reussites comme des echecs n'apprend pas :
+        #   il apprend a se croire mauvais.
+        # ⚠ POURQUOI UN VERDICT SEPARE PLUTOT QUE `completed` : la friction est une
+        #   information. `recovered` dit « c'est allé au bout, mais un outil a lache en
+        #   chemin » — utile pour trouver les outils fragiles, et perdu si on fusionne.
+        # C'est la meme distinction que `completed` contre `success` : on nomme un
+        #   FAIT,
+        #   on ne juge pas la qualite.
         contenu = (result.content or "").strip() if hasattr(result, "content") else ""
-        tronquee = bool(getattr(result, "metadata", {}).get("max_turns_exceeded")) or not contenu
-        if echecs:
+        tronquee = (
+            bool(getattr(result, "metadata", {}).get("max_turns_exceeded"))
+            or not contenu
+        )
+        if echecs and not contenu:
             trace.outcome = "tool_failure"
             trace.feedback = 0.0
         elif tronquee:
             trace.outcome = "incomplete"
             trace.feedback = 0.0
+        elif echecs:
+            # ⚠ Pas de `feedback = 0.0` ici : le tour a abouti. Une note nulle sur une
+            #   reussite est exactement ce que le correctif supprime.
+            trace.outcome = "recovered"
         else:
             trace.outcome = "completed"
 
@@ -234,13 +264,18 @@ class TraceCollector:
         #   (`journal`, `avalon_status`, `logs`, `logs`) portaient TOUS
         #   `{"question": "redemarrages", "fenetre": "24h"}` — alors que ni `journal` ni
         #   `avalon_status` n'ont le moindre parametre de ce nom.
-        #   Consequence : le nom de l'outil restait juste (donc les taux de reussite sont
-        #   valides), mais on ne pouvait plus savoir CE QUI AVAIT ETE DEMANDE — donc plus
+        # Consequence : le nom de l'outil restait juste (donc les taux de reussite
+        #   sont
+        # valides), mais on ne pouvait plus savoir CE QUI AVAIT ETE DEMANDE — donc
+        #   plus
         #   diagnostiquer un echec. Et `duration_seconds` etait fausse de la meme facon,
         #   mesuree depuis le dernier depart.
-        # ⚠ LIMITE ASSUMEE : les evenements ne portent AUCUN identifiant d'appel (verifie :
-        #   `{"tool": nom, "arguments": params}` et rien d'autre). Deux appels au MEME outil
-        #   dans un meme lot restent donc apparies dans l'ordre d'arrivee — heuristique, mais
+        # ⚠ LIMITE ASSUMEE : les evenements ne portent AUCUN identifiant d'appel
+        #   (verifie :
+        # `{"tool": nom, "arguments": params}` et rien d'autre). Deux appels au MEME
+        #   outil
+        # dans un meme lot restent donc apparies dans l'ordre d'arrivee — heuristique,
+        #   mais
         #   sans commune mesure avec un emplacement global partage par tous les outils.
         file = self._tool_starts.setdefault(str(event.data.get("tool", "")), [])
         file.append((event.timestamp, event.data))

@@ -19,7 +19,10 @@ from openjarvis.traces.store import TraceStore
 #: seul peut porter via le retour explicite. Les compter ensemble corrige le taux de 5,9 %
 #: que publiait l'API quand SEULS les echecs etaient notes -- un chiffre catastrophique
 #: fabrique par l'absence de mesure, pas par la realite.
-_ABOUTIES = frozenset({"success", "completed"})
+#: ⚠ `recovered` EN FAIT PARTIE (2026-08-06) : un outil qui echoue pendant un tour
+#: qui aboutit n'est pas un tour rate. Sur 210 traces, 19 des 21 `tool_failure`
+#: avaient livre une reponse — le taux tombait a 89 % contre 98,1 % de reel.
+_ABOUTIES = frozenset({"success", "completed", "recovered"})
 
 
 @dataclass(slots=True)

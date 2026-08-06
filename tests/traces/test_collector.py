@@ -416,3 +416,61 @@ class TestRichTraceCollector:
         assert trace.query == "What is 2+2?"
         assert len(trace.messages) == 4
         store.close()
+
+
+# ══ `recovered` — un outil qui échoue n'est pas un tour qui échoue ════════════════
+
+
+class _AgentOutilCasse:
+    """Un agent dont l'outil échoue ; le contenu rendu est paramétrable."""
+
+    agent_id = "agent_casse"
+
+    def __init__(self, bus: EventBus, contenu: str) -> None:
+        self._bus, self._contenu = bus, contenu
+
+    def run(self, input: str, context: Any = None, **kwargs: Any) -> AgentResult:  # noqa: A002
+        inf = {"model": "qwen3:8b", "engine": "ollama"}
+        self._bus.publish(EventType.INFERENCE_START, inf)
+        self._bus.publish(EventType.INFERENCE_END, {"total_tokens": 30})
+        self._bus.publish(EventType.TOOL_CALL_START, {"tool": "logs", "arguments": {}})
+        self._bus.publish(
+            EventType.TOOL_CALL_END, {"tool": "logs", "success": False, "latency": 0.01}
+        )
+        return AgentResult(content=self._contenu, turns=1)
+
+
+def _trace_avec_outil_casse(tmp_path: Path, contenu: str):
+    bus = EventBus()
+    store = TraceStore(tmp_path / "t.db")
+    collector = TraceCollector(_AgentOutilCasse(bus, contenu), store=store, bus=bus)
+    collector.run("question")
+    trace = store.list_traces()[0]
+    store.close()
+    return trace
+
+
+def test_un_ECHEC_D_OUTIL_SUIVI_D_UNE_REPONSE_est_RECOVERED(tmp_path: Path) -> None:
+    """⚠ MON DÉFAUT, écrit le matin même du 2026-08-06. La règle disait « s'il y a un
+    échec d'outil, c'est `tool_failure` », SANS regarder si la réponse avait été livrée.
+    Un agent qui se heurte à un outil, se reprend et rend une réponse complète était noté
+    comme un échec, avec `feedback = 0.0`.
+    ⚠ Mesure sur 210 traces : **19 des 21 `tool_failure` avaient livré une réponse**
+    (médiane 978 caractères, jusqu'à 7537). Le taux publié tombait à 89 % quand le réel
+    est 98,1 % — et c'est Ava qui lit ce chiffre sur elle-même via `introspection`. Un
+    système qui note ses propres réussites comme des échecs n'apprend pas : il apprend à
+    se croire mauvais."""
+    trace = _trace_avec_outil_casse(tmp_path, "Une réponse complète et utile.")
+    assert trace.outcome == "recovered"
+    assert trace.feedback is None, (
+        "une note nulle sur une réussite est le défaut corrigé"
+    )
+
+
+def test_un_ECHEC_D_OUTIL_SANS_REPONSE_reste_TOOL_FAILURE(tmp_path: Path) -> None:
+    """⚠ LE CONTRE-TEST. Élargir `recovered` à tous les cas masquerait les vrais échecs —
+    on remplacerait un chiffre pessimiste par un chiffre flatteur, ce qui est pire : le
+    premier fait chercher, le second fait dormir."""
+    trace = _trace_avec_outil_casse(tmp_path, "")
+    assert trace.outcome == "tool_failure"
+    assert trace.feedback == 0.0

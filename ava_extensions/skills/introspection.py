@@ -55,7 +55,7 @@ _FENETRES = {"24h": 86400.0, "7j": 604800.0, "30j": 2592000.0}
 #: Verdicts qui comptent comme un aboutissement. `success` est l'ancien libellé, conservé
 #: parce que d'anciennes traces le portent encore — l'ignorer ferait chuter le taux sans
 #: qu'aucune dégradation réelle ne se soit produite.
-_ABOUTIS = frozenset({"completed", "success"})
+_ABOUTIS = frozenset({"completed", "success", "recovered"})
 
 _MAX_LIGNES = 12
 
@@ -114,8 +114,9 @@ def _echecs(traces: list[dict[str, Any]]) -> list[str]:
     if not rates:
         return ["  Aucun échec sur la période."]
     lignes = [
-        "  ⚠ « tool_failure » = un OUTIL a refusé, pas forcément une mauvaise réponse :",
-        "    refuser d'inventer un chiffre quand l'outil dit non EST le bon réflexe.",
+        "  ⚠ « tool_failure » = un outil a refusé ET aucune réponse n'est sortie.",
+        "    Si un outil lâche mais que je réponds quand même, c'est « recovered »,",
+        "    et ça compte comme abouti — refuser d'inventer un chiffre est le bon réflexe.",
     ]
     for t in rates[:_MAX_LIGNES]:
         quand = time.strftime(
