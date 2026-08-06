@@ -29,8 +29,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +47,23 @@ logger = logging.getLogger(__name__)
 
 #: Racine de son propre dépôt, dérivée de l'emplacement de ce fichier. Jamais un paramètre.
 RACINE = Path(__file__).resolve().parents[2]
+
+#: ⚠ LA MOITIÉ DE CE QUI CHANGE CHEZ ELLE N'EST PAS DANS SON DÉPÔT. Ses outils côté control
+#: plane, le relais de conversation, sa veille et sa liste blanche d'outils vivent dans
+#: `infra_avalon`. Angle mort trouvé EN LUI PARLANT le 2026-08-06 : interrogée sur ses
+#: propres échecs, elle a classé « inexpliqué » un refus dont la cause était un correctif
+#: livré une heure plus tôt dans l'AUTRE dépôt. Huit commits du jour lui étaient invisibles,
+#: et rien ne le lui disait — sa vue de sa propre évolution était juste sur ce qu'elle
+#: voyait, et amputée de moitié.
+#: ⚠ Elle n'a PAS ce dépôt sur sa machine, et il n'a rien à y faire. C'est le control plane,
+#: dual-homé et déjà porteur d'un jeton GitLab, qui le lit pour elle. Même doctrine que
+#: pour Home Assistant, la parole et les journaux.
+CP_BASE = os.environ.get("AVA_CP_BASE", "http://192.168.100.31:8100")
+CHEMIN_JETON = Path(
+    os.environ.get(
+        "AVA_VOICE_TOKEN_FILE", str(Path.home() / ".openjarvis" / "cp_voice_token")
+    )
+).expanduser()
 
 #: Fenêtres offertes. `enum` fermé : aucune expression de date ne vient du modèle.
 _FENETRES = {"7j": "7 days ago", "30j": "30 days ago", "toujours": ""}
@@ -102,6 +124,39 @@ def _resumer(bloc: str) -> tuple[str, str, str] | None:
         "",
     )
     return date, sujet, premiere[:200]
+
+
+#: Correspondance fenêtre → jours, pour l'appel au control plane.
+_JOURS = {"7j": 7, "30j": 30, "toujours": 30}
+
+
+def _cote_infra(fenetre: str, nombre: int) -> list[tuple[str, str, str]] | None:
+    """Les changements d'infrastructure qui la concernent, via le control plane.
+
+    ⚠ Rend `None` si le control plane est muet — « je n'ai pas pu regarder » n'est pas
+      « rien n'a changé », et c'est le rendu qui doit porter la différence.
+    ⚠ NE FAIT PAS ÉCHOUER L'OUTIL : si cette moitié manque, on rend quand même le journal
+      local en DISANT qu'il est partiel. Une vue amputée annoncée vaut mieux qu'aucune vue,
+      et infiniment mieux qu'une vue amputée SILENCIEUSE — c'est précisément le défaut que
+      cet ajout corrige.
+    """
+    try:
+        jeton = CHEMIN_JETON.read_text(encoding="utf-8").strip()
+    except Exception:  # noqa: BLE001
+        return None
+    jours = _JOURS.get(fenetre, 7)
+    url = f"{CP_BASE}/api/v1/evolutions?jours={jours}&limite={nombre}"
+    req = urllib.request.Request(url, headers={"X-CP-Voice-Token": jeton})
+    try:
+        with urllib.request.urlopen(req, timeout=12) as rep:  # noqa: S310
+            d = json.loads(rep.read().decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("evolutions: control plane muet (%s)", type(exc).__name__)
+        return None
+    lignes = d.get("changements")
+    if lignes is None:
+        return None
+    return [(str(x.get("date", "")), str(x.get("titre", "")), "") for x in lignes]
 
 
 @ToolRegistry.register("evolutions")
@@ -165,25 +220,62 @@ class EvolutionsTool(BaseTool):
             )
 
         resumes = [r for r in (_resumer(b) for b in blocs) if r][:nombre]
-        if not resumes:
+
+        # ⚠ LA SECONDE MOITIÉ. Sans elle, ce journal était juste sur ce qu'il voyait et
+        #   amputé de moitié — sans le dire. Les deux sources sont FUSIONNÉES et chaque
+        #   ligne porte sa provenance : « on m'a changée » et « on a changé mes outils
+        #   côté infrastructure » ne se diagnostiquent pas au même endroit.
+        fenetre = str(params.get("depuis") or "7j")
+        infra = _cote_infra(fenetre, nombre)
+
+        if not resumes and not infra:
             return ToolResult(
                 tool_name=self.tool_id,
-                content="Aucun changement de capacité sur cette période.",
+                content=(
+                    "Aucun changement de capacité sur cette période."
+                    if infra is not None
+                    else "Aucun changement dans mon dépôt, et je n'ai pas pu consulter "
+                    "l'infrastructure — je ne peux donc pas dire que rien n'a changé."
+                ),
                 success=True,
-                metadata={"trouves": 0},
+                metadata={"trouves": 0, "infra_lue": infra is not None},
             )
+
         lignes = [
-            f"  · {date} — {sujet}" + (f"\n      {corps}" if corps else "")
+            f"  · {date} — [moi] {sujet}" + (f"\n      {corps}" if corps else "")
             for date, sujet, corps in resumes
         ]
+        lignes += [
+            f"  · {date} — [infrastructure] {sujet}" for date, sujet, _ in (infra or [])
+        ]
+        lignes.sort(reverse=True)
+
+        # ⚠ ON DIT QUAND LA VUE EST PARTIELLE. Une vue amputée annoncée vaut mieux qu'aucune
+        #   vue, et infiniment mieux qu'une vue amputée SILENCIEUSE — c'est exactement le
+        #   défaut que cet ajout corrige, il serait absurde de le reproduire ici.
+        avertissement = (
+            ""
+            if infra is not None
+            else "\n⚠ Je n'ai PAS pu lire les changements côté infrastructure : cette liste "
+            "est donc incomplète, et une absence n'y prouve rien.\n"
+        )
         return ToolResult(
             tool_name=self.tool_id,
             content=(
                 "<mes_evolutions>\n"
-                "Changements apportés à mon propre code, du plus récent au plus ancien. "
-                "Si l'un d'eux contredit ce que je crois savoir de moi, c'est lui qui a "
-                "raison.\n" + "\n".join(lignes) + "\n</mes_evolutions>"
+                "Changements me concernant, du plus récent au plus ancien. [moi] = mon "
+                "propre code ; [infrastructure] = mes outils côté control plane, ma liste "
+                "d'outils, le relais de conversation. Si l'un d'eux contredit ce que je "
+                "crois savoir de moi, c'est lui qui a raison.\n"
+                + avertissement
+                + "\n".join(lignes)
+                + "\n</mes_evolutions>"
             ),
             success=True,
-            metadata={"trouves": len(resumes)},
+            metadata={
+                "trouves": len(resumes) + len(infra or []),
+                "depuis_moi": len(resumes),
+                "depuis_infra": len(infra or []),
+                "infra_lue": infra is not None,
+            },
         )

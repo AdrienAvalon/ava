@@ -173,3 +173,68 @@ def test_contre_le_VRAI_depot_git() -> None:
     if not eligibles:
         pytest.skip("clone sans commit de capacite (superficiel) — rien a analyser")
     assert r.metadata["trouves"] >= 1
+
+
+# ══ La seconde moitié — l'angle mort trouvé en lui parlant ════════════════════════
+
+
+def _infra(monkeypatch, valeur):
+    monkeypatch.setattr(evolutions, "_cote_infra", lambda *_a, **_k: valeur)
+
+
+def test_les_DEUX_sources_sont_fusionnees_et_ETIQUETEES(_git, monkeypatch) -> None:
+    """⚠ L'ANGLE MORT TROUVÉ EN LUI PARLANT le 2026-08-06. Son journal ne lisait que SON
+    dépôt, alors que la moitié de ce qui la change vit dans `infra_avalon` : ses outils
+    côté control plane, le relais, sa veille, sa liste blanche. Interrogée sur ses propres
+    échecs, elle a classé « inexpliqué » un refus dont la cause était un correctif livré
+    une heure plus tôt dans l'autre dépôt.
+    ⚠ L'étiquette compte autant que la fusion : « on m'a changée » et « on a changé mes
+    outils » ne se diagnostiquent pas au même endroit."""
+    _git(_bloc("2026-08-06", "feat(memoire): peremption"))
+    _infra(monkeypatch, [("2026-08-06", "fix(logs): enum sur hote", "")])
+    r = evolutions.EvolutionsTool().execute()
+    assert "[moi] feat(memoire)" in r.content
+    assert "[infrastructure] fix(logs)" in r.content
+    assert r.metadata["depuis_moi"] == 1
+    assert r.metadata["depuis_infra"] == 1
+
+
+def test_une_vue_PARTIELLE_est_ANNONCEE(_git, monkeypatch) -> None:
+    """⚠ LE CONTRE-TEST QUI PORTE TOUT. Ce correctif existe parce qu'une vue amputée
+    SILENCIEUSE lui faisait conclure « inexpliqué » à tort. Reproduire ce défaut ici — en
+    rendant la moitié locale sans dire que l'autre manque — serait exactement la même
+    faute, une couche plus bas."""
+    _git(_bloc("2026-08-06", "feat(memoire): peremption"))
+    _infra(monkeypatch, None)
+    r = evolutions.EvolutionsTool().execute()
+    assert "n'ai PAS pu lire les changements côté infrastructure" in r.content
+    assert r.metadata["infra_lue"] is False
+
+
+def test_une_vue_COMPLETE_n_avertit_de_RIEN(_git, monkeypatch) -> None:
+    """Un avertissement permanent est un avertissement qu'on cesse de lire."""
+    _git(_bloc("2026-08-06", "feat(memoire): peremption"))
+    _infra(monkeypatch, [])
+    r = evolutions.EvolutionsTool().execute()
+    assert "n'ai PAS pu lire" not in r.content
+    assert r.metadata["infra_lue"] is True
+
+
+def test_RIEN_des_deux_cotes_avec_infra_MUETTE_ne_conclut_PAS_a_l_absence(
+    _git, monkeypatch
+) -> None:
+    """⚠ Le pire cas : aucun changement local ET l'infrastructure illisible. Répondre
+    « aucun changement » serait affirmer ce qu'on n'a pas pu vérifier."""
+    _git(_bloc("2026-08-06", "chore: rien qui la concerne"))
+    _infra(monkeypatch, None)
+    r = evolutions.EvolutionsTool().execute()
+    assert "je ne peux donc pas dire que rien n'a changé" in r.content
+
+
+def test_l_infra_SEULE_suffit_a_rendre_un_resultat(_git, monkeypatch) -> None:
+    """Si rien n'a bougé dans son dépôt mais que ses outils ont changé, elle doit le voir."""
+    _git(_bloc("2026-08-06", "chore: rien qui la concerne"))
+    _infra(monkeypatch, [("2026-08-06", "feat(ava_app): nouvel outil", "")])
+    r = evolutions.EvolutionsTool().execute()
+    assert "[infrastructure] feat(ava_app)" in r.content
+    assert r.metadata["depuis_moi"] == 0
