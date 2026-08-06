@@ -144,9 +144,32 @@ def test_le_rendu_dit_au_modele_de_PREFERER_le_journal(_git) -> None:
     assert "c'est lui qui a raison" in r.content
 
 
-def test_contre_le_VRAI_depot_git(tmp_path) -> None:  # noqa: ARG001
+def test_contre_le_VRAI_depot_git() -> None:
     """⚠ Les tests ci-dessus simulent git. Celui-ci l'appelle POUR DE VRAI sur le dépôt
-    d'Ava : un format `--pretty` invalide ou un chemin faux ne se verrait pas autrement."""
+    d'Ava : un format `--pretty` invalide ou un chemin faux ne se verrait pas autrement.
+
+    ⚠ IL NE DOIT PAS DÉPENDRE DE L'HISTORIQUE — leçon payée le 2026-08-06 : écrit avec un
+      `trouves >= 1` sec, il passait en local (clone complet) et échouait sur le runner,
+      qui fait un clone SUPERFICIEL d'un seul commit. Un test vert chez soi et rouge en
+      intégration est le pire des deux : il fait douter du code au lieu du test.
+      On mesure donc d'abord ce que le dépôt CONTIENT, et on n'affirme que ce qui en
+      découle. Le `skip` est explicite : mieux vaut un test franchement sauté qu'un test
+      affaibli en silence jusqu'à ne plus rien vérifier.
+    """
     r = evolutions.EvolutionsTool().execute(depuis="toujours", nombre=3)
-    assert r.success is True, r.content
+    assert r.success is True, r.content  # git joignable, sortie exploitable
+
+    brut = subprocess.run(  # noqa: S603
+        ["git", "-C", str(evolutions.RACINE), "log", "--pretty=format:%s"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    eligibles = [
+        ligne
+        for ligne in brut.stdout.splitlines()
+        if any(ligne.startswith(t) for t in evolutions._TYPES)
+    ]
+    if not eligibles:
+        pytest.skip("clone sans commit de capacite (superficiel) — rien a analyser")
     assert r.metadata["trouves"] >= 1
