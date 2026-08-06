@@ -14,6 +14,14 @@ from openjarvis.core.types import StepType, Trace, TraceStep
 from openjarvis.traces.store import TraceStore
 
 
+#: Issues qui comptent comme ABOUTIES. `completed` est un FAIT (la tache est allee au bout
+#: sans echec d'outil ni troncature) ; `success` reste un jugement de QUALITE, qu'un humain
+#: seul peut porter via le retour explicite. Les compter ensemble corrige le taux de 5,9 %
+#: que publiait l'API quand SEULS les echecs etaient notes -- un chiffre catastrophique
+#: fabrique par l'absence de mesure, pas par la realite.
+_ABOUTIES = frozenset({"success", "completed"})
+
+
 @dataclass(slots=True)
 class RouteStats:
     """Aggregated statistics for a specific routing decision (model+agent)."""
@@ -99,7 +107,7 @@ class TraceAnalyzer:
 
         total_steps = sum(len(t.steps) for t in traces)
         evaluated = [t for t in traces if t.outcome is not None]
-        successes = [t for t in evaluated if t.outcome == "success"]
+        successes = [t for t in evaluated if t.outcome in _ABOUTIES]
 
         step_dist: Dict[str, int] = {}
         total_energy = 0.0
@@ -184,7 +192,7 @@ class TraceAnalyzer:
         results = []
         for (model, agent), group in sorted(groups.items()):
             evaluated = [t for t in group if t.outcome is not None]
-            successes = [t for t in evaluated if t.outcome == "success"]
+            successes = [t for t in evaluated if t.outcome in _ABOUTIES]
             feedbacks = [t.feedback for t in group if t.feedback is not None]
             results.append(
                 RouteStats(

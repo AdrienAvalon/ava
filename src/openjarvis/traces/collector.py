@@ -118,9 +118,29 @@ class TraceCollector:
             for s in trace.steps
             if s.step_type == StepType.TOOL_CALL and s.output.get("success") is False
         ]
+        # ⚠ CE QUI SUIT CORRIGE UN DEFAUT DE MA PROPRE MESURE, et il etait pire que le
+        #   silence qu'il pretendait eviter. En ne notant QUE les echecs, 154 traces sur 171
+        #   restaient a `outcome = None` — et `analyzer.py` calcule
+        #   `successes / evaluated` en ne comptant QUE les traces notees. L'API publiait
+        #   donc `taux_reussite: 0.0588` : **5,9 %**, alors que la quasi-totalite des
+        #   traces avait abouti sans le moindre echec. Un chiffre catastrophique fabrique
+        #   par l'absence de mesure, pas par la realite.
+        # ⚠ ON NE FABRIQUE TOUJOURS PAS DE « success » : ce mot reste reserve a un jugement
+        #   de QUALITE, que seul un humain peut porter. `completed` est un fait verifiable —
+        #   la tache est allee au bout sans echec d'outil et sans troncature. C'est la
+        #   distinction entre « ca a marche » et « c'etait bien », et elle est load-bearing.
+        # ⚠ `incomplete` couvre les deux facons OBJECTIVES de ne pas aboutir : budget de
+        #   tours epuise, ou reponse vide. Les laisser a `None` les rendait invisibles.
+        contenu = (result.content or "").strip() if hasattr(result, "content") else ""
+        tronquee = bool(getattr(result, "metadata", {}).get("max_turns_exceeded")) or not contenu
         if echecs:
             trace.outcome = "tool_failure"
             trace.feedback = 0.0
+        elif tronquee:
+            trace.outcome = "incomplete"
+            trace.feedback = 0.0
+        else:
+            trace.outcome = "completed"
 
         self._last_trace = trace
 
