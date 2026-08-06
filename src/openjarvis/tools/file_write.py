@@ -13,6 +13,12 @@ from openjarvis.tools._stubs import BaseTool, ToolSpec
 _MAX_SIZE_BYTES = 10_485_760
 
 
+#: Perimetre par defaut de `file_write` : la racine du depot d'Ava. Ce fichier vit dans
+#: `<racine>/src/openjarvis/tools/`, d'ou les trois remontees. Symetrique de celui de
+#: `file_read` — on n'ecrit pas hors du depot.
+_DEFAUT_AUTORISE = [Path(__file__).resolve().parents[3]]
+
+
 @ToolRegistry.register("file_write")
 class FileWriteTool(BaseTool):
     """Write content to files with optional directory restrictions."""
@@ -64,13 +70,22 @@ class FileWriteTool(BaseTool):
         )
 
     def _is_path_allowed(self, path: Path) -> bool:
-        """Check if path is within allowed directories."""
-        if not self._allowed_dirs:
-            return True
+        """Le chemin est-il dans un repertoire autorise ? FERME par defaut.
+
+        ⚠ MEME DEFAUT QUE `file_read`, corrige le 2026-08-06 : `allowed_dirs` n'est
+          renseigne nulle part, donc `if not self._allowed_dirs: return True` autorisait
+          l'ECRITURE partout ou le compte a le droit. Sur `file_read` cela exposait
+          `/proc/self/environ` et ses trois cles d'API ; ici l'enjeu est symetrique et
+          pire — ecrire, c'est modifier.
+        ⚠ CE DEFAUT N'EST PAS ATTEIGNABLE AUJOURD'HUI : `file_write` n'est PAS dans la
+          liste blanche `ava_app_tools` (12 outils, verifiee identique en GitOps et sur la
+          machine). La correction est donc de la defense en profondeur — la liste blanche
+          reste la frontiere reelle. Mais une liste blanche peut evoluer, et un defaut
+          latent devient un defaut le jour ou l'on coche une case.
+        """
+        autorises = self._allowed_dirs or _DEFAUT_AUTORISE
         resolved = path.resolve()
-        return any(
-            resolved == d or resolved.is_relative_to(d) for d in self._allowed_dirs
-        )
+        return any(resolved == d or resolved.is_relative_to(d) for d in autorises)
 
     def execute(self, **params: Any) -> ToolResult:
         file_path = params.get("path", "")

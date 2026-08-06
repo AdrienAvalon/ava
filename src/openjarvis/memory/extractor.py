@@ -84,13 +84,24 @@ _DEFAULT_SYSTEM_PROMPT = (
 )
 
 
-#: Ce qui n'est JAMAIS un fait sur l'utilisateur, meme rendu dans un tableau JSON bien
-#: forme. Releve sur la memoire reelle du 2026-08-06, pas imagine : titres markdown,
-#: appels d'outil, et phrases ou l'agent parle de lui-meme.
+#: Ce qui n'est JAMAIS un fait SUR L'UTILISATEUR. Un fait s'ecrit a la TROISIEME personne ;
+#: toute marque de dialogue -- 1re ou 2e personne, question, titre markdown, appel d'outil --
+#: trahit un fragment de la sortie du modele plutot qu'une observation.
+#: ⚠ RELEVE SUR LA MEMOIRE REELLE, pas imagine : 15 faits sur 172 etaient de ce genre APRES
+#:   une premiere purge, dont « Partagez-moi : », « Ensuite je comparerai avec : » et
+#:   « Me confirmer que vous avez un outil d'acces aux fichiers active ».
+#: ⚠ LES BORNES DE FIN SONT OBLIGATOIRES, et leur oubli coute cher. Une premiere version
+#:   ecrivait `\bje` sans `\b` final : elle matchait « **Je**an-Pierre » et « **je**ton »,
+#:   donc elle aurait detruit la composition du foyer ET deux constats de securite reels
+#:   (`cp_voice_token lisible en clair via file_read`). Le controle a blanc sur les faits
+#:   REELS l'a montre avant application — un filtre de purge se simule TOUJOURS d'abord.
 _NON_FAIT = re.compile(
-    r"^\s*\*{1,2}\w"                      # « *Verification 1 : ... » (titre markdown)
+    r"\*\*"                                    # titre / gras markdown
+    r"|\?\s*$"                                  # une question n'est pas un fait
+    r"|\b(?:je|me|moi|ma|mon|mes)\b"            # 1re personne
+    r"|\bj[\'\u2019]\w"                          # elision : j'ai, j'extrairai, j'analyse
+    r"|\b(?:vous|votre|vos|tu|te|toi|ton|ta|tes)\b"   # 2e personne / dialogue
     r"|^(?:lire_doc|avalon_status|proposer|memoire|journal|logs|camera)\b"  # appel d'outil
-    r"|^\s*(?:Je (?:vais|dois|suis|ne peux|comparerai)|En attente de)\b"   # l'agent parle de lui
     r"|^RAS\s*$",
     re.IGNORECASE,
 )
