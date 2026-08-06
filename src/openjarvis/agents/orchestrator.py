@@ -82,6 +82,25 @@ class OrchestratorAgent(ToolUsingAgent):
         context: Optional[AgentContext] = None,
         **kwargs: Any,
     ) -> AgentResult:
+        # ⚠ LE GARDE-FOU ANTI-BOUCLE DOIT REPARTIR DE ZÉRO À CHAQUE REQUÊTE.
+        #   Il vit sur l'instance d'agent, elle-même partagée par tout le service : sans cette
+        #   remise à zéro, ses compteurs s'accumulent sur la VIE DU PROCESSUS. Une conversation
+        #   NEUVE hérite alors des compteurs de la précédente, et un outil déjà sollicité se
+        #   retrouve refusé dès son premier appel.
+        # ⚠ CE DÉFAUT A ÉTÉ « CORRIGÉ » LE 2026-08-06 DANS native_react.py — QUI N'EST PAS
+        #   L'AGENT QUI TOURNE. La configuration dit default_agent = "orchestrator" : le
+        #   correctif était donc du CODE MORT, et le défaut intact.
+        #   Mesure : deux questions identiques posées à 16 s d'intervalle. La première
+        #   interroge proxmox/backups/pbs/nas correctement ; la seconde voit TOUS ses appels à
+        #   avalon_status refusés et erre sur huit domaines sans rapport pour, selon ses
+        #   propres mots, « casser la détection ». Une boucle est un phénomène INTERNE À UNE
+        #   TÂCHE : relire le même document demain est légitime, dix fois dans la même
+        #   réponse ne l'est pas.
+        # ⚠ C'EST ICI ET PAS DANS LES DEUX BRANCHES : `run` aiguille vers `_run_structured`
+        #   ou `_run_function_calling`. Poser la remise à zéro dans chacune la dupliquerait
+        #   et laisserait le prochain mode ajouté sans protection.
+        if self._loop_guard:
+            self._loop_guard.reinitialiser()
         if self._mode == "structured":
             return self._run_structured(input, context, **kwargs)
         return self._run_function_calling(input, context, **kwargs)
