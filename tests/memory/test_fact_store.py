@@ -223,7 +223,9 @@ def test_un_fait_qui_n_APPORTE_RIEN_n_entre_pas(tmp_path):
     2026-08-05 : 7 faits sur 119 etaient strictement inclus dans un autre — des
     paraphrases qu'il laissait passer, et chacune est injectee dans l'invite systeme."""
     store = LocalFactStore(path=tmp_path / "f.jsonl")
-    assert store.add("Utilise Ansible pour l'automatisation et Grafana pour la supervision")
+    assert store.add(
+        "Utilise Ansible pour l'automatisation et Grafana pour la supervision"
+    )
     assert store.add("Utilise Ansible pour l'automatisation") is False
     assert store.count() == 1
 
@@ -233,9 +235,13 @@ def test_un_fait_ANCIEN_devenu_redondant_SORT(tmp_path):
     n'a plus de raison d'occuper l'invite."""
     store = LocalFactStore(path=tmp_path / "f.jsonl")
     assert store.add("Utilise Ansible pour l'automatisation")
-    assert store.add("Utilise Ansible pour l'automatisation et Grafana pour la supervision")
+    assert store.add(
+        "Utilise Ansible pour l'automatisation et Grafana pour la supervision"
+    )
     restants = [f.text for f in store.list()]
-    assert restants == ["Utilise Ansible pour l'automatisation et Grafana pour la supervision"]
+    assert restants == [
+        "Utilise Ansible pour l'automatisation et Grafana pour la supervision"
+    ]
 
 
 def test_deux_faits_PROCHES_mais_DISTINCTS_survivent(tmp_path):
@@ -260,3 +266,119 @@ def test_a_information_egale_le_FRANCAIS_l_emporte(tmp_path):
     assert store.add("Vit avec Annie Jean Pierre Adrien Aurelie")
     restants = [f.text for f in store.list()]
     assert restants == ["Vit avec Annie Jean Pierre Adrien Aurelie"], restants
+
+
+# ══ Peremption : marquer, jamais supprimer (decision admin 2026-08-06) ═════════════
+
+
+def test_un_fait_perime_est_MARQUE_et_CONSERVE(tmp_path):
+    """⚠ LA DEMANDE DE L'ADMIN, mot pour mot : « qu'elle sache que certains faits ne sont
+    plus d'actualite mais garder quand meme en memoire ». Un fait perime dit ce qui ETAIT
+    vrai, donc ce qui a change — le supprimer efface cette information."""
+    store = LocalFactStore(tmp_path / "facts.jsonl")
+    store.add("La camera du salon est une Imilab")
+    assert store.mark_stale(
+        "La camera du salon est une Imilab", "remplacee par une Reolink"
+    )
+    faits = store.list()
+    assert len(faits) == 1, "le fait doit rester en memoire"
+    assert faits[0].perime is True
+    assert faits[0].perime_par == "remplacee par une Reolink"
+
+
+def test_le_marquage_SURVIT_au_rechargement(tmp_path):
+    """Le marquage ne vaut rien s'il ne franchit pas un redemarrage : il vit dans le
+    JSONL, aux cotes du texte."""
+    chemin = tmp_path / "facts.jsonl"
+    store = LocalFactStore(chemin)
+    store.add("Le NAS off-site est en append-only")
+    store.mark_stale("Le NAS off-site est en append-only", "purge desormais possible")
+    relu = LocalFactStore(chemin).list()
+    assert relu[0].perime is True and relu[0].perime_par == "purge desormais possible"
+
+
+def test_marquer_un_fait_INTROUVABLE_rend_False(tmp_path):
+    store = LocalFactStore(tmp_path / "facts.jsonl")
+    store.add("Un fait quelconque")
+    assert store.mark_stale("un fait qui n'existe pas") is False
+
+
+def test_le_marquage_atteint_une_REFORMULATION(tmp_path):
+    """⚠ Exiger la chaine exacte rendrait la fonction inutilisable a la main : on compare
+    sur la meme empreinte que le dedoublonnage."""
+    store = LocalFactStore(tmp_path / "facts.jsonl")
+    store.add("L'utilisateur parle francais")
+    assert store.mark_stale("parle francais") is True
+
+
+def test_un_ancien_fichier_SANS_les_champs_se_relit(tmp_path):
+    """Retrocompatibilite : les 168 lignes deja ecrites n'ont ni `perime_le` ni
+    `perime_par`. Le defaut vaut « courant », donc aucune migration n'est requise."""
+    chemin = tmp_path / "facts.jsonl"
+    chemin.write_text(
+        json.dumps({"text": "fait ancien", "source": "auto", "created_at": 1.0}) + "\n",
+        encoding="utf-8",
+    )
+    faits = LocalFactStore(chemin).list()
+    assert len(faits) == 1 and faits[0].perime is False
+
+
+# ══ Eviction : ce qui part quand la memoire est pleine ════════════════════════════
+
+
+def test_l_eviction_sacrifie_les_PERIMES_avant_les_courants(tmp_path):
+    """⚠ L'ancienne regle gardait les plus RECENTS, donc jetait les plus ANCIENS —
+    c'est-a-dire ceux qui ont survecu le plus longtemps a la curation, donc les plus
+    durables. Mesure du 2026-08-06 : ~75 faits/jour pour un plafond de 1000, premiere
+    suppression vers le 17 aout. Onze jours."""
+    store = LocalFactStore(tmp_path / "facts.jsonl", max_facts=3)
+    store.add("le disjoncteur est derriere la porte verte")  # durable, le plus ancien
+    store.add("ancienne camera du salon Imilab")
+    store.mark_stale("ancienne camera du salon Imilab", "remplacee")
+    store.add("les parents habitent en face")
+    store.add("le chat s appelle Ficelle")  # depasse le plafond
+    textes = [f.text for f in store.list()]
+    assert "le disjoncteur est derriere la porte verte" in textes, (
+        "le fait le plus ancien est aussi le plus durable : il ne doit pas partir en premier"
+    )
+    assert "ancienne camera du salon Imilab" not in textes
+
+
+def test_supprimer_un_fait_COURANT_laisse_une_TRACE(tmp_path, caplog):
+    """⚠ Une memoire qui se vide sans rien dire est un angle mort. Quand il ne reste plus
+    de perime a sacrifier, la suppression d'un fait courant est journalisee en WARNING."""
+    import logging
+
+    store = LocalFactStore(tmp_path / "facts.jsonl", max_facts=2)
+    store.add("premier fait durable")
+    store.add("deuxieme fait sans rapport")
+    with caplog.at_level(logging.WARNING, logger="openjarvis.memory.store"):
+        store.add("troisieme sujet totalement different")
+    assert any("COURANT" in r.message for r in caplog.records)
+
+
+# ══ Accents : le motif est ecrit sans, le francais en porte ═══════════════════════
+
+
+def test_un_etat_ACCENTUE_est_refuse_comme_son_equivalent_sans_accent(tmp_path):
+    """⚠ LE DEFAUT MESURE LE 2026-08-06. `_PERISSABLE` est ecrit sans accents
+    (`apres-midi`, `derniere`, `redemarrages`) et etait applique au texte BRUT, qui est du
+    francais accentue. Trois motifs sur treize ne pouvaient donc jamais declencher.
+    ⚠ Le mesurer sur les faits STOCKES est un piege : le filtre refuse a l'ecriture, donc
+    les faits stockes sont les SURVIVANTS. Ce qui prouve le defaut, c'est le survivant
+    accentue trouve en memoire : « ... etaient presents a la maison cet apres-midi »."""
+    store = LocalFactStore(tmp_path / "facts.jsonl")
+    assert (
+        store.add(
+            "Annie et Jean-Pierre étaient présents à la maison cet après-midi",
+            source="auto",
+        )
+        is False
+    )
+    assert (
+        store.add(
+            "Annie et Jean-Pierre etaient presents a la maison cet apres-midi",
+            source="auto",
+        )
+        is False
+    )

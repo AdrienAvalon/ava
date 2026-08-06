@@ -693,7 +693,17 @@ def test_une_lecture_REUSSIE_reste_intacte() -> None:
     import ava_extensions.patches.file_read_oriente  # noqa: F401
     from openjarvis.tools.file_read import FileReadTool
 
-    r = FileReadTool().execute(path="/etc/hostname")
+    # ⚠ CE TEST LISAIT `/etc/hostname`, ce qui n'est plus permis depuis le durcissement du
+    #   2026-08-06 : `file_read` a desormais un perimetre par defaut (liste BLANCHE = la
+    #   racine du depot) au lieu d'un `if not allowed_dirs: return True` qui laissait tout
+    #   passer, `/proc/self/environ` compris. On lit donc un fichier du depot — ce qui est
+    #   aussi plus representatif de l'usage reel d'Ava.
+    from pathlib import Path
+
+    import openjarvis.tools.file_read as fr
+
+    racine = Path(fr.__file__).resolve().parents[3]
+    r = FileReadTool().execute(path=str(racine / "pyproject.toml"))
     assert r.success is True
     assert "lire_doc" not in r.content
 

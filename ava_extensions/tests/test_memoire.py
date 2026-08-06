@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -142,7 +143,7 @@ def test_la_recherche_trouve_par_mots_communs(_faits_temporaires: Path) -> None:
     )
     trouves = memoire.chercher("où est le disjoncteur de la chaufferie ?")
     assert len(trouves) == 1
-    assert "porte verte" in trouves[0]
+    assert "porte verte" in trouves[0].texte
 
 
 def test_les_mots_courts_ne_font_pas_tout_correspondre(
@@ -161,7 +162,7 @@ def test_une_question_sans_mot_significatif_rend_les_plus_recents(
     """« De quoi on parlait ? » doit rendre quelque chose, pas rien."""
     _ecrire(_faits_temporaires, "fait ancien", "fait recent")
     trouves = memoire.chercher("et ?")
-    assert trouves and trouves[0] == "fait recent"
+    assert trouves and trouves[0].texte == "fait recent"
 
 
 def test_l_ordre_est_du_plus_recent_au_plus_ancien(_faits_temporaires: Path) -> None:
@@ -178,3 +179,137 @@ def test_rien_sur_ce_sujet_est_distingue_de_memoire_vide(
     r = memoire.MemoireTool().execute(sujet="recette de la tarte aux pommes")
     assert "Rien en mémoire sur ce sujet" in r.content
     assert r.metadata["total"] == 1
+
+
+# ══ Élision — 64 faits sur 168 en contiennent une (mesure du 2026-08-06) ══════════
+
+
+@pytest.mark.parametrize(
+    ("fait", "question"),
+    [
+        ("Adrien travaille sur l'infrastructure Avalon", "infrastructure"),
+        ("Le disjoncteur de l'atelier est derrière la porte verte", "atelier"),
+        ("La caméra n'enregistre pas la nuit", "enregistre"),
+        ("Le chauffage s’arrête quand la maison est vide", "arrête"),
+    ],
+)
+def test_l_ELISION_ne_rend_plus_un_mot_INTROUVABLE(
+    _faits_temporaires: Path, fait: str, question: str
+) -> None:
+    """⚠ LE DÉFAUT ÉTAIT INVISIBLE : la recherche répondait « rien en mémoire sur ce
+    sujet », phrase qu'on croit. Le jeton stocké était `l'infrastructure`, qui ne
+    correspond à aucun mot d'aucune question — donc le fait existait et restait
+    inatteignable. Mesuré : 64 des 168 faits réels contiennent une élision.
+    ⚠ Le dernier cas emploie l'apostrophe TYPOGRAPHIQUE : le modèle amont produit les
+    deux, n'en traiter qu'une laisserait la moitié du corpus muette."""
+    _ecrire(_faits_temporaires, fait)
+    trouves = memoire.chercher(question)
+    assert trouves, f"« {question} » doit retrouver « {fait} »"
+
+
+def test_les_mots_courts_issus_d_une_elision_ne_polluent_pas(
+    _faits_temporaires: Path,
+) -> None:
+    """⚠ CONTRE-TEST : couper sur l'apostrophe produit des fragments d'une lettre
+    (« l », « n », « s »). Le seuil de 4 lettres les écarte — sans quoi tout
+    correspondrait à tout, ce que le seuil existe précisément pour empêcher."""
+    _ecrire(_faits_temporaires, "Le chat s'est enfui par l'échelle")
+    assert memoire.chercher("quel est le prix du gaz aujourd'hui ?") == []
+
+
+# ══ Le temps — la date était collectée et jetée ═══════════════════════════════════
+
+
+def test_le_rendu_SITUE_le_souvenir_dans_le_temps(_faits_temporaires: Path) -> None:
+    """⚠ NEUVIÈME OCCURRENCE de « collecté mais non relayé » : le fichier porte
+    `created_at` depuis toujours, l'ancien chargeur ne rendait que le texte. Ava recevait
+    des souvenirs hors du temps et ne pouvait pas nuancer « d'après ce que j'ai retenu il
+    y a trois semaines »."""
+    _faits_temporaires.write_text(
+        json.dumps(
+            {
+                "text": "La chaufferie est au sous-sol",
+                "source": "auto",
+                "created_at": time.time() - 25 * 86400,
+            }
+        ),
+        encoding="utf-8",
+    )
+    r = memoire.MemoireTool().execute(sujet="chaufferie")
+    assert "appris le" in r.content
+    assert "il y a 25 j" in r.content
+
+
+def test_un_souvenir_PERIME_est_RENDU_et_SIGNALE(_faits_temporaires: Path) -> None:
+    """⚠ LA DEMANDE DE L'ADMIN : garder le fait, dire qu'il n'est plus d'actualité.
+    Le taire ferait dire à Ava du périmé au présent ; le supprimer effacerait ce qui
+    explique le changement."""
+    maintenant = time.time()
+    _faits_temporaires.write_text(
+        json.dumps(
+            {
+                "text": "La caméra du salon est une Imilab",
+                "source": "auto",
+                "created_at": maintenant - 10 * 86400,
+                "perime_le": maintenant,
+                "perime_par": "remplacée par une Reolink E1 Zoom",
+            }
+        ),
+        encoding="utf-8",
+    )
+    r = memoire.MemoireTool().execute(sujet="caméra salon")
+    assert "Imilab" in r.content, "le souvenir doit être RENDU, pas masqué"
+    assert "PLUS D'ACTUALITÉ" in r.content
+    assert "Reolink" in r.content, "la raison explique ce qui a changé"
+    assert "Ne les présente jamais au présent" in r.content
+    assert r.metadata["perimes"] == 1
+
+
+def test_la_notice_de_peremption_n_apparait_QUE_si_besoin(
+    _faits_temporaires: Path,
+) -> None:
+    """⚠ La poser à chaque appel apprendrait au modèle à la sauter, et elle ne dirait
+    rien dans le cas courant."""
+    _ecrire(_faits_temporaires, "La chaufferie est au sous-sol")
+    r = memoire.MemoireTool().execute(sujet="chaufferie")
+    assert "Ne les présente jamais au présent" not in r.content
+    assert r.metadata["perimes"] == 0
+
+
+def test_un_souvenir_PERIME_passe_APRES_un_courant_egal(
+    _faits_temporaires: Path,
+) -> None:
+    """⚠ Rétrogradé, jamais écarté : à pertinence égale le courant passe devant, mais le
+    périmé reste rendu — c'est lui qui porte « c'était vrai jusqu'au 6 août »."""
+    maintenant = time.time()
+    _faits_temporaires.write_text(
+        "\n".join(
+            json.dumps(o)
+            for o in (
+                {
+                    "text": "La caméra du salon était une Imilab",
+                    "created_at": maintenant - 100,
+                    "perime_le": maintenant,
+                },
+                {"text": "La caméra du salon est une Reolink", "created_at": maintenant},
+            )
+        ),
+        encoding="utf-8",
+    )
+    trouves = memoire.chercher("caméra salon")
+    assert len(trouves) == 2, "le périmé doit rester rendu"
+    assert trouves[0].perime is False, "le courant passe devant"
+
+
+def test_une_date_ILLISIBLE_ne_fait_pas_dater_le_souvenir_de_1970(
+    _faits_temporaires: Path,
+) -> None:
+    """Une valeur corrompue vaut « date inconnue », pas « 1er janvier 1970 » — sinon Ava
+    annoncerait des souvenirs vieux de cinquante-six ans."""
+    _faits_temporaires.write_text(
+        json.dumps({"text": "La chaufferie est au sous-sol", "created_at": "hier"}),
+        encoding="utf-8",
+    )
+    r = memoire.MemoireTool().execute(sujet="chaufferie")
+    assert "chaufferie" in r.content.lower()
+    assert "il y a 20" not in r.content

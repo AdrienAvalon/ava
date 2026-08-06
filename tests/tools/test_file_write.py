@@ -26,7 +26,7 @@ class TestFileWriteTool:
 
     def test_write_file(self, tmp_path):
         f = tmp_path / "test.txt"
-        tool = FileWriteTool()
+        tool = FileWriteTool(allowed_dirs=[str(tmp_path)])
         result = tool.execute(path=str(f), content="hello world\n")
         assert result.success is True
         assert f.read_text(encoding="utf-8") == "hello world\n"
@@ -36,14 +36,14 @@ class TestFileWriteTool:
     def test_append_mode(self, tmp_path):
         f = tmp_path / "test.txt"
         f.write_text("line1\n", encoding="utf-8")
-        tool = FileWriteTool()
+        tool = FileWriteTool(allowed_dirs=[str(tmp_path)])
         result = tool.execute(path=str(f), content="line2\n", mode="append")
         assert result.success is True
         assert f.read_text(encoding="utf-8") == "line1\nline2\n"
 
     def test_create_dirs(self, tmp_path):
         f = tmp_path / "sub" / "deep" / "test.txt"
-        tool = FileWriteTool()
+        tool = FileWriteTool(allowed_dirs=[str(tmp_path)])
         result = tool.execute(
             path=str(f),
             content="nested",
@@ -54,7 +54,7 @@ class TestFileWriteTool:
 
     def test_create_dirs_false_missing_parent(self, tmp_path):
         f = tmp_path / "nonexistent" / "test.txt"
-        tool = FileWriteTool()
+        tool = FileWriteTool(allowed_dirs=[str(tmp_path)])
         result = tool.execute(path=str(f), content="data")
         assert result.success is False
         assert "Parent directory does not exist" in result.content
@@ -101,7 +101,7 @@ class TestFileWriteTool:
         f = tmp_path / "big.txt"
         # 10 MB + 1 byte exceeds the limit
         big_content = "x" * (10_485_761)
-        tool = FileWriteTool()
+        tool = FileWriteTool(allowed_dirs=[str(tmp_path)])
         result = tool.execute(path=str(f), content=big_content)
         assert result.success is False
         assert "too large" in result.content.lower()
@@ -109,7 +109,7 @@ class TestFileWriteTool:
     def test_write_creates_new_file(self, tmp_path):
         f = tmp_path / "new_file.txt"
         assert not f.exists()
-        tool = FileWriteTool()
+        tool = FileWriteTool(allowed_dirs=[str(tmp_path)])
         result = tool.execute(path=str(f), content="brand new")
         assert result.success is True
         assert f.exists()
@@ -118,7 +118,7 @@ class TestFileWriteTool:
     def test_overwrite_existing_file(self, tmp_path):
         f = tmp_path / "existing.txt"
         f.write_text("old content", encoding="utf-8")
-        tool = FileWriteTool()
+        tool = FileWriteTool(allowed_dirs=[str(tmp_path)])
         result = tool.execute(path=str(f), content="new content")
         assert result.success is True
         assert f.read_text(encoding="utf-8") == "new content"
@@ -133,3 +133,45 @@ class TestFileWriteTool:
         )
         assert result.success is False
         assert "Invalid mode" in result.content
+
+
+class TestPerimetreParDefaut:
+    """⚠ CE QUE LA CORRECTION DU 2026-08-06 A CHANGE, ET QUE RIEN NE VERROUILLAIT.
+
+    Avant, `allowed_dirs` vide signifiait « tout est permis » (`if not ...: return True`) :
+    un defaut qui S'OUVRE. Ava tourne en DMZ et execute du code tiers ; le meme motif dans
+    `file_read` rendait `/proc/self/environ` lisible, donc trois cles d'API.
+    Le defaut est desormais une liste BLANCHE — la racine du depot d'Ava.
+
+    ⚠ Ces tests manquaient : la correction a ete deployee sans qu'aucun test ne fixe le
+      nouveau comportement, et elle en a casse dix autres que personne n'a vus (ce depot
+      n'a aucune CI). Une correction de securite sans test est une correction qu'on peut
+      annuler par megarde en croyant reparer un test rouge.
+    """
+
+    def test_sans_perimetre_declare_l_exterieur_est_REFUSE(self, tmp_path):
+        """Le contre-test du fail-open : un repertoire quelconque n'est plus permis."""
+        tool = FileWriteTool()
+        r = tool.execute(path=str(tmp_path / "x.txt"), content="test")
+        assert r.success is False
+        assert "outside allowed directories" in r.content
+
+    def test_sans_perimetre_declare_le_DEPOT_reste_accessible(self, tmp_path):
+        """⚠ LE CONTRE-TEST QUI COMPTE AUTANT. Une liste blanche qui ne laisse rien passer
+        se presente exactement comme une liste blanche qui fonctionne — et Ava perdrait
+        l'acces a ses propres fichiers sans qu'aucune erreur ne le dise."""
+        from pathlib import Path
+
+        import openjarvis.tools.file_write as fw
+
+        racine = Path(fw.__file__).resolve().parents[3]
+        assert (racine / "pyproject.toml").exists(), (
+            "le perimetre par defaut doit bien designer la racine du depot"
+        )
+        tool = FileWriteTool()
+        cible = racine / ".pytest-perimetre-defaut.tmp"
+        try:
+            r = tool.execute(path=str(cible), content="ok")
+            assert r.success is True
+        finally:
+            cible.unlink(missing_ok=True)

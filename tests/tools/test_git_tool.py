@@ -584,4 +584,9 @@ class TestCliFallbackWhenRustMissing:
         with self._patch_no_rust():
             result = GitStatusTool().execute(repo_path=str(tmp_path))
         assert result.success is False
-        assert "not a git repository" in result.content
+        # ⚠ NE PAS ASSERTER SUR LE TEXTE DE GIT : il est TRADUIT. Sur un poste en francais,
+        #   git repond « ni ceci ni aucun de ses repertoires parents … n'est un depot git »
+        #   et ce test echoue — sans qu'aucun defaut n'existe. Ce qu'il verifie vraiment,
+        #   c'est qu'un echec revient en ToolResult au lieu de lever ; le code de retour le
+        #   dit, et lui ne depend pas de la langue de l'environnement.
+        assert result.metadata.get("returncode") == 128

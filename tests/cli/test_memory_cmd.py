@@ -139,8 +139,15 @@ def test_memory_list_shows_facts(tmp_path: Path, monkeypatch):
 
 def test_memory_clear_with_confirmation(tmp_path: Path, monkeypatch):
     store = _patch_fact_store(monkeypatch, tmp_path)
-    store.add("fact one")
-    store.add("fact two")
+    # ⚠ « fact one » / « fact two » NE MARCHENT PLUS comme fixtures, et le comportement
+    #   qui les rejette est le bon : depuis la curation a l'ecriture (2026-08-05), deux
+    #   faits fusionnent quand leurs mots significatifs coincident. « one » et « two »
+    #   font trois lettres et ne comptent pas — il ne restait que « fact » des deux cotes,
+    #   donc le second etait refuse et le test comptait 1 au lieu de 2.
+    #   Limite connue a garder en tete : deux faits qui ne different que par un nombre ou
+    #   par un mot de moins de quatre lettres se fusionnent.
+    store.add("Le disjoncteur est derriere la porte verte")
+    store.add("Les parents habitent le batiment d'en face")
 
     result = CliRunner().invoke(cli, ["memory", "clear"], input="y\n")
     assert result.exit_code == 0
