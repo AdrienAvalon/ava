@@ -68,6 +68,41 @@ class LoopGuard:
         except Exception:
             self._rust_impl = None
 
+    def reinitialiser(self) -> None:
+        """Repart de zero — a appeler au DEBUT de chaque requete.
+
+        ⚠ POURQUOI. Le garde-fou vit sur l'instance d'agent, elle-meme partagee par tout le
+          service. Ses compteurs s'accumulaient donc sur la VIE DU PROCESSUS : passe trois
+          appels identiques, un outil devenait DEFINITIVEMENT bloque jusqu'au redemarrage.
+          Mesure du 2026-08-06 : Ava ne pouvait plus relire `cartographie-si.md` — apres
+          quatre lectures reussies, la cinquieme et toutes les suivantes ont ete refusees,
+          y compris la premiere d'une conversation NEUVE.
+        ⚠ Une boucle est un phenomene INTERNE A UNE TACHE : relire le meme document demain
+          est legitime, le relire dix fois dans la meme reponse ne l'est pas. Le compteur
+          doit donc avoir la duree de la tache, pas celle du service.
+        """
+        self._call_counts.clear()
+        self._per_tool_counts.clear()
+        self._warned_cycles.clear()
+        if self._rust_impl is not None:
+            # Le module Rust garde ses propres compteurs : on le reconstruit, faute d'une
+            # methode de remise a zero exposee.
+            try:
+                from openjarvis._rust_bridge import get_rust_module
+
+                _rust = get_rust_module()
+                self._rust_impl = _rust.LoopGuard(
+                    max_identical=self._config.max_identical_calls,
+                    max_ping_pong=(
+                        self._config.ping_pong_window // 2
+                        if self._config.ping_pong_window > 1
+                        else 2
+                    ),
+                    poll_budget=self._config.poll_tool_budget,
+                )
+            except Exception:  # noqa: BLE001 — un garde-fou qui ne se remet pas a zero
+                self._rust_impl = None  # vaut mieux qu'un garde-fou qui bloque tout
+
     def check_call(self, tool_name: str, arguments: str) -> LoopVerdict:
         """Check whether a tool call should proceed or be blocked."""
         if self._rust_impl is not None:

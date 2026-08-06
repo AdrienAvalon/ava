@@ -168,6 +168,11 @@ class NativeReActAgent(ToolUsingAgent):
                 messages.insert(-1, Message(role=Role.USER, content=ex["input"]))
                 messages.insert(-1, Message(role=Role.ASSISTANT, content=ex["output"]))
 
+        # ⚠ Le garde-fou repart de zero a chaque requete : ses compteurs mesurent une
+        #   BOUCLE, phenomene interne a une tache, pas l'usage cumule du service.
+        if self._loop_guard:
+            self._loop_guard.reinitialiser()
+
         all_tool_results: list[ToolResult] = []
         turns = 0
         total_usage: dict[str, int] = {
@@ -228,6 +233,29 @@ class NativeReActAgent(ToolUsingAgent):
                     tool_call.arguments,
                 )
                 if verdict.blocked:
+                    # ⚠ UN BLOCAGE DOIT LAISSER UNE TRACE. Sans cet evenement, un appel
+                    #   refuse par le garde-fou n'apparait NULLE PART : ni dans les traces,
+                    #   ni dans les journaux. Consequence payee le 2026-08-06 — Ava a
+                    #   correctement rapporte « le garde-fou anti-boucle m'a bloquee », la
+                    #   trace ne montrait aucun appel, et j'en ai conclu qu'elle avait
+                    #   invente l'explication. J'ai meme inscrit cette accusation dans sa
+                    #   persona. L'absence de trace ne prouvait rien : elle prouvait
+                    #   seulement que les blocages n'etaient pas traces.
+                    if self._bus is not None:
+                        try:
+                            from openjarvis.core.events import EventType
+
+                            self._bus.publish(
+                                EventType.TOOL_CALL_END,
+                                {
+                                    "tool": tool_call.name,
+                                    "success": False,
+                                    "result": f"Loop guard: {verdict.reason}",
+                                    "latency": 0.0,
+                                },
+                            )
+                        except Exception:  # noqa: BLE001 — la tracabilite ne casse rien
+                            pass
                     tool_result = ToolResult(
                         tool_name=tool_call.name,
                         content=f"Loop guard: {verdict.reason}",

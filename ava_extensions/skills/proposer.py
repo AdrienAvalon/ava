@@ -78,6 +78,9 @@ class ProposerTool(BaseTool):
                 "la doc dit autre chose. "
                 "N'ouvre PAS de proposition pour un simple avis : il faut un ecart "
                 "constate entre ce que dit un document et ce que tu as mesure. "
+                "Pour AMENDER une page existante, emploie `avant`/`apres` (remplacement cible) "
+                "plutot que `contenu` : tu n'as alors pas a reproduire ce que le filtre "
+                "te masque, et tu ne risques pas d'effacer le reste du document. "
                 "Le titre DOIT suivre « type(scope): description » (ex. « docs(hass): "
                 "corriger les bornes de consigne des vannes »). Le contenu est le fichier "
                 "ENTIER apres modification, pas un extrait."
@@ -103,10 +106,29 @@ class ProposerTool(BaseTool):
                     },
                     "contenu": {
                         "type": "string",
-                        "description": "Le fichier ENTIER apres modification.",
+                        "description": (
+                            "Le fichier ENTIER apres modification. A n'employer que pour "
+                            "CREER une page neuve. Pour amender une page existante, "
+                            "preferer `avant`/`apres`."
+                        ),
+                    },
+                    "avant": {
+                        "type": "string",
+                        "description": (
+                            "REMPLACEMENT CIBLE, a preferer des que tu AMENDES : extrait "
+                            "EXACT a remplacer, tel qu'il figure dans le fichier. Il doit "
+                            "y apparaitre une seule fois — sinon la proposition est "
+                            "refusee comme ambigue. Le control plane lit le vrai fichier "
+                            "et applique le remplacement : tu n'as donc PAS a reproduire "
+                            "ce que le filtre te masque (les IP publiques, notamment)."
+                        ),
+                    },
+                    "apres": {
+                        "type": "string",
+                        "description": "Ce qui remplace `avant`. Vide = suppression de l'extrait.",
                     },
                 },
-                "required": ["titre", "description", "chemin", "contenu"],
+                "required": ["titre", "description", "chemin"],
             },
             category="infra",
             latency_estimate=6.0,
@@ -121,17 +143,28 @@ class ProposerTool(BaseTool):
                 content="Je ne peux pas proposer : jeton absent.",
                 success=False,
             )
+        # ⚠ DEUX MODES, ET LE CIBLE PRIME QUAND IL EST FOURNI. Le mode « fichier entier »
+        #   obligeait Ava a reproduire ce qu'elle ne voit pas — les IP publiques que le
+        #   filtre lui masque — donc soit a l'inventer (interdit), soit a recopier le
+        #   marqueur (destructeur). Mesure du 2026-08-06 : elle etait structurellement
+        #   incapable d'amender un document en contenant une.
+        # ⚠ CE CABLAGE MANQUAIT ALORS QUE LA ROUTE EXISTAIT DEJA cote control plane : le
+        #   parametre n'etait pas declare ici, donc le modele ne pouvait pas l'employer et
+        #   retombait sur un `contenu` vide. C'est Ava qui a diagnostique l'ecart, en
+        #   testant les deux voies et en rapportant exactement ce qu'elle observait.
+        fichier: dict[str, str] = {"chemin": params.get("chemin") or ""}
+        avant = params.get("avant")
+        if isinstance(avant, str) and avant.strip():
+            fichier["avant"] = avant
+            fichier["apres"] = str(params.get("apres") or "")
+        else:
+            fichier["contenu"] = str(params.get("contenu") or "")
         corps = json.dumps(
             {
                 "domaine": "documentation",
                 "titre": params.get("titre") or "",
                 "description": params.get("description") or "",
-                "fichiers": [
-                    {
-                        "chemin": params.get("chemin") or "",
-                        "contenu": params.get("contenu") or "",
-                    }
-                ],
+                "fichiers": [fichier],
             }
         ).encode("utf-8")
         requete = urllib.request.Request(
