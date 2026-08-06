@@ -274,6 +274,13 @@ class OrchestratorAgent(ToolUsingAgent):
                     tool_results=all_tool_results,
                     turns=turns,
                     metadata={
+                        # ⚠ LE MOTIF D'ARRET DU MODELE DOIT REMONTER JUSQU'A L'APPELANT.
+                        #   Sans lui, une reponse coupee par `max_tokens` arrive avec
+                        #   `finish_reason: "stop"` — donc indistinguable d'une reponse
+                        #   complete. Vecu le 2026-08-06 : 75 caracteres de texte visible
+                        #   sur une reponse de 4096 jetons entierement mangee par le
+                        #   raisonnement etendu, annoncee comme terminee normalement.
+                        "finish_reason": result.get("finish_reason"),
                         "prompt_tokens": total_prompt_tokens,
                         "completion_tokens": total_completion_tokens,
                         "total_tokens": total_prompt_tokens + total_completion_tokens,

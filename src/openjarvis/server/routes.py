@@ -101,6 +101,48 @@ def _ensure_identity_prompt(messages: list[Message], app_config) -> list[Message
     return [Message(role=Role.SYSTEM, content=prompt), *messages]
 
 
+#: Vocabulaire ANTHROPIC -> vocabulaire OPENAI. Cette route sert une API compatible
+#: OpenAI : y laisser passer un terme Anthropic tel quel casse les clients stricts.
+#: ⚠ RELEVE SUR LE LIVE, PAS DEVINE — et la premiere version de ce correctif transmettait
+#:   le motif brut « quand il n'est pas reconnu ». Une simple question a rendu `end_turn`,
+#:   qui n'existe pas cote OpenAI. J'avais teste les cas que j'imaginais (`stop`,
+#:   `max_tokens`, `length`) et pas celui que le modele emet reellement en regime nominal.
+#: ⚠ Table FERMEE, repli sur `stop` : un motif inconnu ne doit pas fuiter, et le seul repli
+#:   sur qui les clients savent se comporter est `stop`. Les vrais incidents — troncature,
+#:   budget de tours — sont couverts par `length` ci-dessus, donc ce repli ne masque rien.
+_TRADUCTION = {
+    "end_turn": "stop",
+    "stop": "stop",
+    "stop_sequence": "stop",
+    "max_tokens": "length",
+    "length": "length",
+    "tool_use": "tool_calls",
+    "tool_calls": "tool_calls",
+    "content_filter": "content_filter",
+}
+
+
+def _motif_arret(metadata: dict) -> str:
+    """Le VRAI motif d'arret, au format OpenAI — jamais un `stop` de complaisance.
+
+    ⚠ CETTE ROUTE ECRIVAIT `"stop"` EN DUR, et c'est ce qui rendait le defaut couteux :
+      une reponse tronquee arrivait chez l'appelant presentee comme complete. Vecu le
+      2026-08-06 sur une question a deux chiffres — le modele avait consomme ses 4096
+      jetons de sortie dans son bloc de raisonnement etendu et rendu 75 caracteres de
+      texte, coupes au milieu d'un mot. Ni moi, ni le module `ava_veille`, ni le relais
+      Matrix ne pouvaient le savoir.
+    ⚠ L'INFORMATION EXISTAIT DEJA : `metadata["max_turns_exceeded"]` est pose par
+      l'orchestrateur depuis toujours, et n'etait lu par personne. Septieme occurrence
+      d'une capacite construite d'un cote et jamais reliee de l'autre.
+    ⚠ `length` est le terme OpenAI pour « coupe avant la fin » ; Anthropic dit
+      `max_tokens`. On traduit, sinon un client compatible OpenAI ne reconnait pas le cas.
+      Un budget de TOURS epuise est aussi une reponse incomplete : meme motif.
+    """
+    if metadata.get("max_turns_exceeded"):
+        return "length"
+    return _TRADUCTION.get(str(metadata.get("finish_reason") or ""), "stop")
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions(request_body: ChatCompletionRequest, request: Request):
     """Handle chat completion requests (streaming and non-streaming)."""
@@ -510,7 +552,7 @@ def _handle_agent(
                     content=result.content,
                     audio=audio_meta,
                 ),
-                finish_reason="stop",
+                finish_reason=_motif_arret(result.metadata),
             )
         ],
         usage=usage,
