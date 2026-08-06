@@ -250,7 +250,17 @@ class LireDocTool(BaseTool):
                     "chemin": {
                         "type": "string",
                         "description": (
-                            "Chemin du document, sous docs/ et en .md. Omettre pour "
+                            # ⚠ « sous docs/ » etait AMBIGU et coutait un appel sur trois.
+                            #   Ca se lit aussi bien « relatif a docs/ » que « doit etre dans
+                            #   docs/ » — Ava retirait donc le prefixe sur les documents de
+                            #   premier niveau (`docs/x.md` -> `x.md`), se faisait refuser, puis
+                            #   recommencait avec le bon chemin. Le refus ORIENTE bien, mais
+                            #   l'orientation coute un aller-retour a chaque passage de veille.
+                            #   Mesure du 2026-08-06 : 2 appels a `lire_doc` sur 3 dans deux
+                            #   passages consecutifs, pour un seul document lu.
+                            "Chemin COMPLET depuis la racine du depot, prefixe `docs/` INCLUS "
+                            "(exemples : `docs/compliance/PRA.md`, `docs/ava-perimetre.md`). "
+                            "Omettre pour "
                             "obtenir la liste des documents disponibles."
                         ),
                     }
