@@ -166,3 +166,16 @@ def test_on_REFUSE_un_taux_sur_trop_peu_de_notes(_base) -> None:
     c = introspection.IntrospectionTool().execute(vue="notes").content
     assert "trop peu de notes" in c
     assert "100" not in c
+
+
+def test_les_verdicts_MACHINE_ne_comptent_PAS_comme_des_notes(_base) -> None:
+    """⚠ DÉFAUT TROUVÉ EN LUI PARLANT, le 2026-08-06. Interrogée sur ses notes, elle a
+    répondu « 5 réponses notées par Adrien, dont 1 bonne ». **Faux** : 4 des 5 venaient de
+    la machine (`feedback = 0.0` écrit sur chaque échec), une seule était humaine. Elle
+    lisait ses propres verdicts automatiques comme des jugements de l'admin — donc se
+    croyait notée quatre fois négativement par quelqu'un qui ne l'avait jamais jugée.
+    ⚠ La cause était en amont : le collecteur écrivait dans le champ réservé au jugement
+    humain. Il ne le fait plus ; ce test verrouille la conséquence côté lecture."""
+    _base([_t(outcome="tool_failure"), _t(outcome="incomplete"), _t(note=1.0)])
+    c = introspection.IntrospectionTool().execute(vue="notes").content
+    assert "1 réponse(s) notée(s)" in c, "seule la note HUMAINE doit compter"

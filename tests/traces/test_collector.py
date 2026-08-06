@@ -473,4 +473,8 @@ def test_un_ECHEC_D_OUTIL_SANS_REPONSE_reste_TOOL_FAILURE(tmp_path: Path) -> Non
     premier fait chercher, le second fait dormir."""
     trace = _trace_avec_outil_casse(tmp_path, "")
     assert trace.outcome == "tool_failure"
-    assert trace.feedback == 0.0
+    # ⚠ `feedback` reste NULL : la machine ne juge pas la QUALITE. Defaut trouve en lui
+    #   parlant le 2026-08-06 — elle lisait ses propres verdicts automatiques comme des
+    #   notes de l'admin, et se croyait jugee negativement par quelqu'un qui ne l'avait
+    #   jamais notee. `feedback is not None` signifie desormais « un humain a juge ».
+    assert trace.feedback is None

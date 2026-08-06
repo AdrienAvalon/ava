@@ -159,12 +159,22 @@ class TraceCollector:
             bool(getattr(result, "metadata", {}).get("max_turns_exceeded"))
             or not contenu
         )
+        # ⚠ LA MACHINE N'ECRIT PLUS DANS `feedback`, ET C'EST LA MEME DISTINCTION QUE
+        #   `update_feedback` vient de retablir une couche plus haut : `outcome` porte le
+        #   FAIT (ca a marche ou non), `feedback` porte le JUGEMENT DE QUALITE, qui
+        #   n'appartient qu'a un humain. Ecrire `feedback = 0.0` sur un echec melangeait
+        #   les deux.
+        # ⚠ DEFAUT TROUVE EN LUI PARLANT, le 2026-08-06 : interrogee sur ses notes, elle a
+        #   repondu « 5 reponses notees par Adrien, dont 1 bonne ». Faux — **4 des 5
+        #   venaient de la machine**, une seule etait humaine. Elle lisait ses propres
+        #   verdicts automatiques comme des jugements de l'admin, donc se croyait notee
+        #   4 fois negativement par quelqu'un qui ne l'avait jamais jugee.
+        # ⚠ Le champ reste donc NULL tant qu'un humain n'a rien dit — et `feedback is not
+        #   None` signifie desormais exactement « quelqu'un a juge cette reponse ».
         if echecs and not contenu:
             trace.outcome = "tool_failure"
-            trace.feedback = 0.0
         elif tronquee:
             trace.outcome = "incomplete"
-            trace.feedback = 0.0
         elif echecs:
             # ⚠ Pas de `feedback = 0.0` ici : le tour a abouti. Une note nulle sur une
             #   reussite est exactement ce que le correctif supprime.
