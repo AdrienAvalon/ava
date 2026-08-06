@@ -84,6 +84,18 @@ _DEFAULT_SYSTEM_PROMPT = (
 )
 
 
+#: Ce qui n'est JAMAIS un fait sur l'utilisateur, meme rendu dans un tableau JSON bien
+#: forme. Releve sur la memoire reelle du 2026-08-06, pas imagine : titres markdown,
+#: appels d'outil, et phrases ou l'agent parle de lui-meme.
+_NON_FAIT = re.compile(
+    r"^\s*\*{1,2}\w"                      # « *Verification 1 : ... » (titre markdown)
+    r"|^(?:lire_doc|avalon_status|proposer|memoire|journal|logs|camera)\b"  # appel d'outil
+    r"|^\s*(?:Je (?:vais|dois|suis|ne peux|comparerai)|En attente de)\b"   # l'agent parle de lui
+    r"|^RAS\s*$",
+    re.IGNORECASE,
+)
+
+
 class FactExtractor:
     """Extract memory-worthy facts from a conversation turn via an engine."""
 
@@ -181,20 +193,49 @@ class FactExtractor:
             except (json.JSONDecodeError, ValueError):
                 pass
 
-        # 2. Fall back to line-based parsing (markdown bullets / numbered).
-        items: List[str] = []
-        for line in content.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            line = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line)
-            items.append(line)
-        return items
+        # 2. Repli LISTE STRICTE — et « strict » est tout le sujet.
+        #
+        # ⚠ CE REPLI ACCEPTAIT N'IMPORTE QUELLE LIGNE, ET IL A EMPOISONNE LA MEMOIRE.
+        #   Mesure du 2026-08-06 sur `memory_facts.jsonl` : sur 204 faits, une douzaine
+        #   etaient des fragments de la sortie du modele lui-meme, stockes comme des faits
+        #   sur l'utilisateur --
+        #     « *Verification 1 : Lecture du document** »
+        #     « lire_doc docs/ava-perimetre.md »
+        #     « RAS »
+        #     « En attente de vos reponses pour proceder aux verifications. »
+        #   Ils viennent des passages de veille : le modele d'extraction repond en prose au
+        #   lieu du tableau JSON demande, et CHAQUE LIGNE devenait un fait.
+        #
+        # ⚠ C'EST UN ECHEC DE FORMAT PRESENTE COMME UN SUCCES : le parseur ne pouvait pas
+        #   echouer, donc il transformait une non-reponse en douze faits. Et ces faits sont
+        #   PERSISTANTS et COMMUNS a tous les interlocuteurs -- ils faconnent toutes les
+        #   reponses suivantes. Mieux vaut ne rien extraire que d'extraire du bruit.
+        #
+        # On n'accepte donc le repli QUE si le modele a visiblement voulu faire une liste :
+        # toutes les lignes non vides doivent porter une puce ou un numero. Une seule ligne
+        # de prose au milieu, et on rend zero.
+        lignes = [ligne.strip() for ligne in content.splitlines() if ligne.strip()]
+        if not lignes:
+            return []
+        PUCE = re.compile(r"^(?:[-*•]|\d+[.)])\s+")
+        if not all(PUCE.match(ligne) for ligne in lignes):
+            logger.debug(
+                "Memory extraction: sortie non conforme (ni tableau JSON ni liste a puces), "
+                "%d ligne(s) ignoree(s)",
+                len(lignes),
+            )
+            return []
+        return [PUCE.sub("", ligne) for ligne in lignes]
 
     def _clean_fact(self, item: str) -> str:
         fact = str(item).strip().strip("\"'").strip()
         # Drop obvious non-facts the model sometimes emits.
         if not fact or fact.lower() in ("[]", "none", "n/a", "null"):
+            return ""
+        # ⚠ Second filet : meme dans un tableau JSON, le modele glisse parfois des restes de
+        #   sa propre sortie. Un titre markdown, un appel d'outil ou une phrase a la premiere
+        #   personne du singulier ne sont pas des faits SUR L'UTILISATEUR.
+        if _NON_FAIT.search(fact):
             return ""
         if len(fact) > self._max_fact_chars:
             fact = fact[: self._max_fact_chars].rstrip()
