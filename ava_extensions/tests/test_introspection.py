@@ -26,10 +26,10 @@ def _base(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         p = tmp_path / "traces.db"
         cx = sqlite3.connect(p)
         cx.execute(
-            "create table traces (query text, outcome text, started_at real, "
-            "total_tokens real, total_latency_seconds real)"
+            "create table traces (query text, outcome text, feedback real, "
+            "started_at real, total_tokens real, total_latency_seconds real)"
         )
-        cx.executemany("insert into traces values (?,?,?,?,?)", lignes)
+        cx.executemany("insert into traces values (?,?,?,?,?,?)", lignes)
         cx.commit()
         cx.close()
         monkeypatch.setattr(introspection, "CHEMIN_TRACES", p)
@@ -38,8 +38,10 @@ def _base(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return poser
 
 
-def _t(query="q", outcome="completed", age_s=60.0, jetons=1000.0, latence=5.0):
-    return (query, outcome, time.time() - age_s, jetons, latence)
+def _t(
+    query="q", outcome="completed", age_s=60.0, jetons=1000.0, latence=5.0, note=None
+):
+    return (query, outcome, note, time.time() - age_s, jetons, latence)
 
 
 def test_le_resume_donne_le_taux_d_ABOUTISSEMENT(_base) -> None:
@@ -131,3 +133,36 @@ def test_la_base_est_ouverte_en_LECTURE_SEULE(_base) -> None:
     cx = sqlite3.connect(p)
     assert cx.execute("select count(*) from traces").fetchone()[0] == 1
     cx.close()
+
+
+# ══ Les notes humaines — le seul jugement de QUALITÉ du système ═══════════════════
+
+
+def test_les_reponses_NOTEES_sont_rendues(_base) -> None:
+    """⚠ `outcome` dit si ça a MARCHÉ, la note dit si c'était BIEN. Deux questions
+    orthogonales — le magasin de traces écrasait justement l'une avec l'autre."""
+    _base([_t(query="bonne question", note=1.0), _t(query="mauvaise", note=0.0)])
+    r = introspection.IntrospectionTool().execute(vue="notes")
+    assert "2 réponse(s) notée(s), dont 1 jugée(s) bonne(s)" in r.content
+    assert "👍" in r.content and "👎" in r.content
+
+
+def test_AUCUNE_note_n_est_PAS_un_jugement(_base) -> None:
+    """⚠ LE CONTRE-TEST QUI PORTE LE RISQUE. Zéro note ne veut dire ni « mes réponses sont
+    bonnes » ni « elles sont mauvaises » : personne ne les a jugées. L'absence de mesure
+    n'est pas une mesure — c'est la famille de défaut qui a déjà produit un « 5,9 % de
+    réussite » entièrement fabriqué."""
+    _base([_t(), _t()])
+    c = introspection.IntrospectionTool().execute(vue="notes").content
+    assert "Aucune réponse notée" in c
+    assert "L'absence de note ne mesure rien" in c
+
+
+def test_on_REFUSE_un_taux_sur_trop_peu_de_notes(_base) -> None:
+    """⚠ « 100 % de satisfaction » sur une seule note se lit comme une mesure et n'en est
+    pas une. Au 2026-08-06 il n'y avait qu'UNE note sur 220 traces, parce que rien ne
+    rendait le `trace_id` à Adrien."""
+    _base([_t(note=1.0)])
+    c = introspection.IntrospectionTool().execute(vue="notes").content
+    assert "trop peu de notes" in c
+    assert "100" not in c

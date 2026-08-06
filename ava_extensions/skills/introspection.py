@@ -75,7 +75,7 @@ def _traces(depuis_s: float) -> list[dict[str, Any]] | None:
         cx = sqlite3.connect(f"file:{CHEMIN_TRACES}?mode=ro", uri=True, timeout=5)
         cx.row_factory = sqlite3.Row
         lignes = cx.execute(
-            "select query, outcome, started_at, total_tokens, total_latency_seconds "
+            "select query, outcome, feedback, started_at, total_tokens, total_latency_seconds "
             "from traces where started_at > ? order by started_at desc",
             (time.time() - depuis_s,),
         ).fetchall()
@@ -145,7 +145,49 @@ def _couteux(traces: list[dict[str, Any]]) -> list[str]:
     return lignes
 
 
-_VUES = {"resume": _resume, "echecs": _echecs, "couteux": _couteux}
+def _notes(traces: list[dict[str, Any]]) -> list[str]:
+    """Ce qu'Adrien a explicitement noté — le seul jugement de QUALITÉ du système.
+
+    ⚠ `outcome` dit si ça a MARCHÉ, la note dit si c'était BIEN. Les deux répondent à des
+      questions orthogonales, et les confondre coûte cher : une réponse parfaitement
+      aboutie peut être mauvaise, une réponse coupée par un redémarrage n'est pas
+      « mauvaise », elle est absente. Le magasin de traces écrasait justement le verdict
+      machine avec la note humaine — corrigé le 2026-08-06.
+
+    ⚠ CE QUE JE NE DOIS PAS EN CONCLURE : il y a très peu de notes (1 sur 220 au
+      2026-08-06), parce que rien ne rendait le `trace_id` à Adrien. Un taux calculé sur
+      un échantillon d'une unité n'est pas une mesure — d'où le refus explicite ci-dessous
+      d'en fabriquer un.
+    """
+    notes = [t for t in traces if t.get("feedback") is not None]
+    if not notes:
+        return [
+            "  Aucune réponse notée sur cette période.",
+            "  ⚠ Ce n'est PAS « mes réponses sont mauvaises » ni « elles sont bonnes » :",
+            "    personne ne les a jugées. L'absence de note ne mesure rien.",
+        ]
+    bonnes = [t for t in notes if float(t["feedback"]) >= 0.5]
+    lignes = [
+        f"  {len(notes)} réponse(s) notée(s), dont {len(bonnes)} jugée(s) bonne(s)."
+    ]
+    if len(notes) < 10:
+        # ⚠ On REFUSE de publier un pourcentage sous 10 notes. « 100 % de satisfaction »
+        #   sur une seule note se lit comme une mesure et n'en est pas une — c'est la
+        #   famille de défaut qui a déjà produit un « 5,9 % de réussite » entièrement
+        #   fabriqué par l'absence de données.
+        lignes.append(
+            "  (trop peu de notes pour en tirer un taux — je ne le calcule pas)"
+        )
+    for t in notes[:_MAX_LIGNES]:
+        quand = time.strftime(
+            "%d/%m %H:%M", time.localtime(float(t.get("started_at") or 0))
+        )
+        marque = "👍" if float(t["feedback"]) >= 0.5 else "👎"
+        lignes.append(f"  {marque} {quand} — {str(t.get('query') or '')[:80]}")
+    return lignes
+
+
+_VUES = {"resume": _resume, "echecs": _echecs, "couteux": _couteux, "notes": _notes}
 
 
 @ToolRegistry.register("introspection")
@@ -176,7 +218,8 @@ class IntrospectionTool(BaseTool):
                         "enum": list(_VUES),
                         "description": (
                             "'resume' (défaut) : chiffres d'ensemble. 'echecs' : les "
-                            "questions qui n'ont pas abouti. 'couteux' : les plus chères."
+                            "questions qui n'ont pas abouti. 'couteux' : les plus "
+                            "chères. 'notes' : ce qu'Adrien a explicitement jugé."
                         ),
                     },
                     "depuis": {

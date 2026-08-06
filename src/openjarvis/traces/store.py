@@ -248,19 +248,32 @@ class TraceStore:
 
         Returns True if the trace was found and updated, False otherwise.
         """
-        # ⚠ ON DERIVE AUSSI `outcome`, ET C'EST TOUT L'INTERET DE CE CORRECTIF.
-        #   Mesure du 2026-08-05 : sur 65 traces, **0 avaient un `feedback`, 0 un
-        #   `outcome`**. Or `outcome` a de VRAIS consommateurs — `traces/analyzer.py`
-        #   filtre dessus pour calculer les taux de reussite par outil et par route,
-        #   `learning/agents/skill_discovery.py` le lit aussi — mais AUCUN producteur.
-        #   Un champ avec des lecteurs et pas d'ecrivain fait croire a une boucle
-        #   d'apprentissage qui n'a jamais tourne.
+        # ⚠ CETTE METHODE DETRUISAIT LE VERDICT MACHINE, et c'est le defaut corrige ici.
+        #   Elle ecrivait `outcome = "success"/"failure"` derive de la note humaine. Or
+        #   `outcome` porte un FAIT VERIFIABLE — `completed`, `recovered`, `tool_failure`,
+        #   `incomplete` — et la note porte un JUGEMENT DE QUALITE. Les deux repondent a
+        #   des questions orthogonales : « est-ce que ca a marche ? » et « est-ce que
+        #   c'etait bien ? ». Une reponse qui aboutit parfaitement peut etre mauvaise ; une
+        #   reponse coupee par un redemarrage n'est pas « mauvaise », elle est absente.
+        # ⚠ MESURE DU 2026-08-06 : **219 verdicts machine sur 220** auraient ete ecrases par
+        #   une seule note humaine. Noter « 0,3 » une reponse par ailleurs aboutie aurait
+        #   remplace `recovered` par `failure` — on aurait perdu l'information « un outil a
+        #   lache mais elle s'en est sortie », qui est justement celle qui sert a trouver
+        #   les outils fragiles.
+        # ⚠ POURQUOI LA DERIVATION EXISTAIT, ET POURQUOI ELLE N'A PLUS LIEU D'ETRE : au
+        #   2026-08-05, `outcome` avait des LECTEURS et aucun ECRIVAIN — le deriver de la
+        #   note etait alors le seul moyen de le remplir. Depuis, `traces/collector.py`
+        #   l'ecrit a chaque trace. La raison de la derivation a disparu ; ce qui reste
+        #   n'est que sa nuisance.
+        # ⚠ ON DERIVE ENCORE, MAIS SEULEMENT SI LE CHAMP EST VIDE. Une trace ancienne sans
+        #   verdict machine profite toujours de la note ; une trace notee par la machine
+        #   n'est jamais ecrasee. `COALESCE` fait exactement cette lecture.
         # ⚠ Seuil a 0,5 sur une note normalisee 0-1. Une note EXACTEMENT a 0,5 compte
         #   comme un succes : en cas de doute on ne penalise pas, sinon les analyses
         #   deviennent pessimistes par construction.
         resultat = "success" if score >= 0.5 else "failure"
         cursor = self._conn.execute(
-            "UPDATE traces SET feedback = ?, outcome = ? WHERE trace_id = ?",
+            "UPDATE traces SET feedback = ?, outcome = COALESCE(outcome, ?) WHERE trace_id = ?",
             (score, resultat, trace_id),
         )
         self._conn.commit()

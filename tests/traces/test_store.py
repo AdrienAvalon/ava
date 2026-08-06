@@ -191,3 +191,49 @@ class TestTraceStore:
         assert retrieved.metadata["key"] == "value"
         assert retrieved.metadata["nested"] == [1, 2, 3]
         store.close()
+
+
+# ══ Une note humaine ne DÉTRUIT plus le verdict machine ═══════════════════════════
+
+
+def _trace_notable(outcome: str | None):
+    from openjarvis.core.types import Trace
+
+    t = Trace(query="q", agent="a", model="m", engine="e", steps=[], result="r")
+    t.outcome = outcome
+    return t
+
+
+def test_une_note_NE_DETRUIT_PAS_le_verdict_machine(tmp_path: Path) -> None:
+    """⚠ LE DÉFAUT CORRIGÉ LE 2026-08-06. `update_feedback` écrivait
+    `outcome = "success"/"failure"` dérivé de la note humaine. Or `outcome` porte un FAIT
+    (`completed`, `recovered`, `tool_failure`) et la note un JUGEMENT DE QUALITÉ : deux
+    questions orthogonales. Une réponse parfaitement aboutie peut être mauvaise ; une
+    réponse coupée par un redémarrage n'est pas « mauvaise », elle est absente.
+    ⚠ Mesure : **219 verdicts machine sur 220** auraient été écrasés par une seule note.
+    Noter « 0,3 » une réponse aboutie aurait remplacé `recovered` par `failure` — perdant
+    l'information « un outil a lâché mais elle s'en est sortie », justement celle qui sert
+    à trouver les outils fragiles."""
+    store = TraceStore(tmp_path / "t.db")
+    trace = _trace_notable("recovered")
+    store.save(trace)
+    assert store.update_feedback(trace.trace_id, 0.3) is True
+    relu = store.list_traces()[0]
+    assert relu.outcome == "recovered", (
+        "le fait machine doit survivre au jugement humain"
+    )
+    assert relu.feedback == 0.3
+    store.close()
+
+
+def test_une_trace_SANS_verdict_profite_encore_de_la_note(tmp_path: Path) -> None:
+    """⚠ LE CONTRE-TEST. La dérivation existait pour une raison : au 2026-08-05, `outcome`
+    avait des lecteurs et aucun écrivain. La supprimer entièrement priverait les traces
+    anciennes du seul verdict qu'elles pouvaient avoir. On ne dérive donc plus QUE si le
+    champ est vide — `COALESCE` fait exactement cette lecture."""
+    store = TraceStore(tmp_path / "t.db")
+    trace = _trace_notable(None)
+    store.save(trace)
+    store.update_feedback(trace.trace_id, 0.9)
+    assert store.list_traces()[0].outcome == "success"
+    store.close()
