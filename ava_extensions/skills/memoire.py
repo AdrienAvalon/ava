@@ -113,7 +113,7 @@ def _mots(s: str) -> set[str]:
     """
     propre = _sans_accents(s).lower().replace("’", " ").replace("'", " ")
     return {
-        m.strip(".,;:!?\"()") for m in propre.split() if len(m.strip(".,;:!?\"()")) >= 4
+        m.strip('.,;:!?"()') for m in propre.split() if len(m.strip('.,;:!?"()')) >= 4
     }
 
 
@@ -442,7 +442,10 @@ class MemoireTool(BaseTool):
             )
         _marquages.append(time.time())
         logger.info(
-            "memoire: fait perime — source=%s raison=%r fait=%r", source, raison[:80], fait[:80]
+            "memoire: fait perime — source=%s raison=%r fait=%r",
+            source,
+            raison[:80],
+            fait[:80],
         )
         return ToolResult(
             tool_name=self.tool_id,

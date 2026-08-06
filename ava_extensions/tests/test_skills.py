@@ -435,8 +435,18 @@ DASH_CAM = {
                 "par_zone": {"la cour": 30, "le portail": 2},
             },
             "derniers": [
-                {"objet": "personne", "zones": ["le portail"], "debut": 1.0, "en_cours": True},
-                {"objet": "voiture", "zones": ["la cour"], "debut": 1.0, "en_cours": False},
+                {
+                    "objet": "personne",
+                    "zones": ["le portail"],
+                    "debut": 1.0,
+                    "en_cours": True,
+                },
+                {
+                    "objet": "voiture",
+                    "zones": ["la cour"],
+                    "debut": 1.0,
+                    "en_cours": False,
+                },
             ],
         }
     },
@@ -524,25 +534,42 @@ def test_camera_ACCORDE_au_pluriel(cam: Any) -> None:
     assert "30 voiture," not in sortie and "30 voiture " not in sortie
 
 
-def test_camera_dit_AUCUNE_ALERTE_quand_le_bruit_domine(cam: Any, monkeypatch: Any) -> None:
+def test_camera_dit_AUCUNE_ALERTE_quand_le_bruit_domine(
+    cam: Any, monkeypatch: Any
+) -> None:
     """⚠ « 5 detections » et « 5 detections, aucune alerte » decrivent la MEME realite,
     l'une de facon inquietante et l'autre rassurante. Mesure du 2026-08-04 : les 5
     evenements nocturnes etaient tous des voitures GAREES redetectees par salves, et
     Frigate les classait correctement en `detection` — zero alerte. Ava doit le dire."""
-    dash = {**DASH_CAM, "module_data": {"frigate": {
-        **DASH_CAM["module_data"]["frigate"],
-        "revue": {"alertes": 0, "detections": 5, "dernieres_alertes": []},
-    }}}
+    dash = {
+        **DASH_CAM,
+        "module_data": {
+            "frigate": {
+                **DASH_CAM["module_data"]["frigate"],
+                "revue": {"alertes": 0, "detections": 5, "dernieres_alertes": []},
+            }
+        },
+    }
     monkeypatch.setattr(cam, "_dashboard", lambda: dash)
     assert "Aucune alerte" in cam.CameraTool().execute().content
 
 
 def test_camera_RACONTE_les_alertes_quand_il_y_en_a(cam: Any, monkeypatch: Any) -> None:
-    dash = {**DASH_CAM, "module_data": {"frigate": {
-        **DASH_CAM["module_data"]["frigate"],
-        "revue": {"alertes": 1, "detections": 2, "dernieres_alertes": [
-            {"objets": ["personne"], "zones": ["le portail"], "debut": 1.0}]},
-    }}}
+    dash = {
+        **DASH_CAM,
+        "module_data": {
+            "frigate": {
+                **DASH_CAM["module_data"]["frigate"],
+                "revue": {
+                    "alertes": 1,
+                    "detections": 2,
+                    "dernieres_alertes": [
+                        {"objets": ["personne"], "zones": ["le portail"], "debut": 1.0}
+                    ],
+                },
+            }
+        },
+    }
     monkeypatch.setattr(cam, "_dashboard", lambda: dash)
     s = cam.CameraTool().execute().content
     assert "1 alerte" in s and "le portail" in s
@@ -596,7 +623,9 @@ def test_TOUT_outil_pose_sur_le_disque_est_IMPORTE_par_boot() -> None:
     C'est le defaut recurrent de ce projet sous une forme de plus : *une source qui ne
     porte pas la donnee repond « rien » sans erreur.* Ici la source est la liste d'imports.
     """
-    poses = {f.stem for f in (RACINE / "skills").glob("*.py") if not f.stem.startswith("_")}
+    poses = {
+        f.stem for f in (RACINE / "skills").glob("*.py") if not f.stem.startswith("_")
+    }
     manquants = sorted(poses - _outils_importes_par_boot())
     assert not manquants, (
         "Outils presents sur le disque mais JAMAIS importes par `boot.py` — ils "
@@ -608,7 +637,9 @@ def test_le_garde_fou_precedent_examine_VRAIMENT_quelque_chose() -> None:
     """Contre-test indispensable : un test dont la lecture echoue silencieusement reste
     vert pour toujours. On verifie donc que les DEUX cotes de la comparaison sont peuples.
     """
-    poses = {f.stem for f in (RACINE / "skills").glob("*.py") if not f.stem.startswith("_")}
+    poses = {
+        f.stem for f in (RACINE / "skills").glob("*.py") if not f.stem.startswith("_")
+    }
     importes = _outils_importes_par_boot()
     assert len(poses) >= 5, f"la decouverte des outils ne rend que {poses}"
     assert len(importes) >= 5, f"la lecture de boot.py ne rend que {importes}"
@@ -712,7 +743,9 @@ def test_TOUT_patch_pose_sur_le_disque_est_IMPORTE_par_boot() -> None:
     """Meme garde-fou que pour les outils, etendu aux patches : un module pose et jamais
     importe ne s'execute pas, et rien ne le signale. C'est ainsi que `proposer` est reste
     invisible au modele le 2026-08-05 alors que tout semblait en place."""
-    poses = {f.stem for f in (RACINE / "patches").glob("*.py") if not f.stem.startswith("_")}
+    poses = {
+        f.stem for f in (RACINE / "patches").glob("*.py") if not f.stem.startswith("_")
+    }
     arbre = ast.parse((RACINE / "boot.py").read_text(encoding="utf-8"))
     importes: set[str] = set()
     for noeud in ast.walk(arbre):
@@ -764,7 +797,9 @@ def test_un_echec_d_outil_NOTE_la_trace() -> None:
 
     t = _trace_avec([True, False, True])
     echecs = [
-        s for s in t.steps if s.step_type == StepType.TOOL_CALL and s.output.get("success") is False
+        s
+        for s in t.steps
+        if s.step_type == StepType.TOOL_CALL and s.output.get("success") is False
     ]
     assert echecs, "le critere doit reperer l'echec"
 
@@ -774,9 +809,9 @@ def test_l_ABSENCE_d_echec_ne_vaut_PAS_succes() -> None:
     automatique noterait des reponses plausibles comme bonnes — le defaut meme qu'on
     corrige tous les jours. Un `success` fabrique se lirait comme une mesure et ferait
     croire la boucle saine ; `None` dit « non evalue », qui est la verite."""
-    source = (RACINE.parent / "src" / "openjarvis" / "traces" / "collector.py").read_text(
-        encoding="utf-8"
-    )
+    source = (
+        RACINE.parent / "src" / "openjarvis" / "traces" / "collector.py"
+    ).read_text(encoding="utf-8")
     assert 'trace.outcome = "tool_failure"' in source
     assert 'trace.outcome = "success"' not in source, (
         "aucun succes ne doit etre ecrit automatiquement — l'absence d'echec n'est pas une preuve"

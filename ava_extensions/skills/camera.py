@@ -62,7 +62,11 @@ def _quand(horodatage: Any) -> str:
     h = datetime.datetime.fromtimestamp(ts)
     if ecart < 86400:
         return f"à {h.strftime('%H:%M')}"
-    return f"hier à {h.strftime('%H:%M')}" if ecart < 172800 else h.strftime("%d/%m à %H:%M")
+    return (
+        f"hier à {h.strftime('%H:%M')}"
+        if ecart < 172800
+        else h.strftime("%d/%m à %H:%M")
+    )
 
 
 # ⚠ LES LIBELLÉS DE ZONE PORTENT L'ARTICLE, PAS LA PRÉPOSITION. Le control plane rend
@@ -98,7 +102,9 @@ def _sante(d: dict[str, Any]) -> list[str]:
     if not d.get("detection_active", True):
         lignes.append("  ⚠ La détection d'objets est désactivée sur la caméra.")
     if not d.get("historique_lisible", True):
-        lignes.append("  ⚠ Je n'arrive pas à relire l'historique — ce n'est pas « rien ne s'est passé ».")
+        lignes.append(
+            "  ⚠ Je n'arrive pas à relire l'historique — ce n'est pas « rien ne s'est passé »."
+        )
     return lignes
 
 
@@ -123,7 +129,9 @@ def _resume(d: dict[str, Any]) -> str:
             lignes.append(f"  ⚠ {r['alertes']} alerte(s) sur 24 h :")
             for a in r.get("dernieres_alertes") or []:
                 quoi = " et ".join(a.get("objets") or ["quelque chose"])
-                lignes.append(f"    · {_quand(a.get('debut'))} — {quoi} {_ou(a.get('zones'))}")
+                lignes.append(
+                    f"    · {_quand(a.get('debut'))} — {quoi} {_ou(a.get('zones'))}"
+                )
         else:
             lignes.append("  Aucune alerte sur les dernières 24 h.")
 
@@ -138,7 +146,10 @@ def _resume(d: dict[str, Any]) -> str:
         )
         lignes.append(f"  Sur 24 h : {e['total']} détections — {objets}.")
         if e.get("par_zone"):
-            zones = ", ".join(f"{k} ({v})" for k, v in sorted(e["par_zone"].items(), key=lambda x: -x[1]))
+            zones = ", ".join(
+                f"{k} ({v})"
+                for k, v in sorted(e["par_zone"].items(), key=lambda x: -x[1])
+            )
             lignes.append(f"  Par endroit : {zones}.")
         # ⚠ LA PHRASE QUI EVITE LA REPONSE FAUSSE. Sans elle, « 32 détections de voiture »
         #   s'entend « 32 voitures » — alors qu'il y en a quatre, dont trois garées en
@@ -154,7 +165,9 @@ def _resume(d: dict[str, Any]) -> str:
     if passes:
         lignes.append("  Derniers passages :")
         for x in passes[:4]:
-            lignes.append(f"    · {_quand(x.get('debut'))} — {x['objet']} {_ou(x.get('zones'))}")
+            lignes.append(
+                f"    · {_quand(x.get('debut'))} — {x['objet']} {_ou(x.get('zones'))}"
+            )
 
     if not lignes:
         return "Je n'ai pas de relevé exploitable de la caméra."
@@ -236,5 +249,8 @@ class CameraTool(BaseTool):
             tool_name=self.tool_id,
             content=_resume(d),
             success=True,
-            metadata={"camera": d.get("camera"), "evenements": (d.get("evenements_24h") or {}).get("total")},
+            metadata={
+                "camera": d.get("camera"),
+                "evenements": (d.get("evenements_24h") or {}).get("total"),
+            },
         )

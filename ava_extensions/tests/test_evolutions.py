@@ -47,7 +47,11 @@ def _git(monkeypatch: pytest.MonkeyPatch):
 
 def test_les_changements_sont_RENDUS_avec_leur_date(_git) -> None:
     _git(
-        _bloc("2026-08-06", "feat(memoire): un fait perime est MARQUE et CONSERVE", "corps")
+        _bloc(
+            "2026-08-06",
+            "feat(memoire): un fait perime est MARQUE et CONSERVE",
+            "corps",
+        )
         + _bloc("2026-08-05", "fix(securite): fermer file_write par symetrie")
     )
     r = evolutions.EvolutionsTool().execute()
@@ -122,7 +126,8 @@ def test_le_corps_est_TRONQUE_et_sans_pied_de_commit(_git) -> None:
         _bloc(
             "2026-08-06",
             "feat: une capacite",
-            "Co-Authored-By: quelqu'un\nLa vraie explication du changement\n" + "x" * 500,
+            "Co-Authored-By: quelqu'un\nLa vraie explication du changement\n"
+            + "x" * 500,
         )
     )
     r = evolutions.EvolutionsTool().execute()

@@ -48,7 +48,11 @@ def _execute_oriente(self: FileReadTool, **params: Any) -> Any:
     # ⚠ On n'oriente QUE sur le cas mesure : une demande qui ressemble a de la
     #   documentation du depot. Ajouter cette phrase a tout echec la rendrait du bruit,
     #   et le modele cesserait de la lire — exactement le sort d'une alerte qui crie trop.
-    if chemin.endswith(".md") or "docs/" in chemin or chemin.rstrip("/").endswith("docs"):
+    if (
+        chemin.endswith(".md")
+        or "docs/" in chemin
+        or chemin.rstrip("/").endswith("docs")
+    ):
         resultat.content = f"{resultat.content}{_INDICE}"
     return resultat
 

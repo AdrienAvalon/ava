@@ -78,7 +78,9 @@ def _rendre_couverture_sauvegarde(px: dict[str, Any]) -> list[str]:
         return []
     cv = px.get("backup_coverage")
     if cv is None:
-        return ["  sauvegardes des VM : non mesurable (Proxmox n'a pas repondu sur ses jobs)"]
+        return [
+            "  sauvegardes des VM : non mesurable (Proxmox n'a pas repondu sur ses jobs)"
+        ]
 
     lignes = [
         f"  sauvegardes des VM : {cv.get('total_couverts', 0)} / {cv.get('total_a_proteger', 0)} "
@@ -86,7 +88,9 @@ def _rendre_couverture_sauvegarde(px: dict[str, Any]) -> list[str]:
     ]
     for j in cv.get("jobs") or []:
         cibles = j.get("vmids")
-        cibles = "tous les guests" if cibles == "tous" else f"{len(cibles or [])} guests"
+        cibles = (
+            "tous les guests" if cibles == "tous" else f"{len(cibles or [])} guests"
+        )
         etat = "actif" if j.get("enabled") else "DESACTIVE"
         lignes.append(
             f"    job {j.get('id')} ({j.get('storage')}, {j.get('schedule')}) : {etat}, {cibles}"
@@ -101,7 +105,9 @@ def _rendre_couverture_sauvegarde(px: dict[str, Any]) -> list[str]:
     #   invite a la traiter comme un oubli — ce qui est precisement ce que l'ecriture de
     #   la raison sert a empecher.
     for e in cv.get("exemptes") or []:
-        lignes.append(f"    exemptee : {e.get('vmid')} {e.get('name')} — {e.get('raison')}")
+        lignes.append(
+            f"    exemptee : {e.get('vmid')} {e.get('name')} — {e.get('raison')}"
+        )
     return lignes
 
 
@@ -134,7 +140,9 @@ def _rendre_proxmox(px: dict[str, Any]) -> str:
     if ha.get("expectation"):
         lignes.append(f"  haute disponibilite : {ha['expectation']}")
     elif "enabled" in ha:
-        lignes.append(f"  haute disponibilite : {'armee' if ha['enabled'] else 'desarmee'}")
+        lignes.append(
+            f"  haute disponibilite : {'armee' if ha['enabled'] else 'desarmee'}"
+        )
     lignes.extend(_rendre_couverture_sauvegarde(px))
     rep = px.get("replication") or {}
     jobs = rep.get("status") or []
@@ -204,9 +212,8 @@ def _format_domaine(data: dict[str, Any], domaine: str) -> str:
     if cle not in modules:
         # ⚠ On NOMME les domaines disponibles au lieu de dire « inconnu » : sans cette
         #   liste, le modele reessaie au hasard ou conclut que la donnee n'existe pas.
-        return (
-            f"Domaine « {domaine} » inconnu. Domaines disponibles : "
-            + ", ".join(sorted(k for k in modules if not k.startswith("_")))
+        return f"Domaine « {domaine} » inconnu. Domaines disponibles : " + ", ".join(
+            sorted(k for k in modules if not k.startswith("_"))
         )
     donnees = modules[cle] or {}
     sante = donnees.get("_health") if isinstance(donnees, dict) else None

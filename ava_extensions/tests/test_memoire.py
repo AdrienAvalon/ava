@@ -291,7 +291,10 @@ def test_un_souvenir_PERIME_passe_APRES_un_courant_egal(
                     "created_at": maintenant - 100,
                     "perime_le": maintenant,
                 },
-                {"text": "La caméra du salon est une Reolink", "created_at": maintenant},
+                {
+                    "text": "La caméra du salon est une Reolink",
+                    "created_at": maintenant,
+                },
             )
         ),
         encoding="utf-8",
@@ -387,7 +390,10 @@ def test_le_PLAFOND_horaire_borne_les_degats(_faits_temporaires: Path) -> None:
     """⚠ Ava est autonome : une boucle qui se trompe pourrait marquer toute la mémoire en
     quelques secondes. Rien ne serait perdu — le marquage ne supprime pas — mais la
     mémoire cesserait d'être utilisable, et la panne ressemblerait à de la prudence."""
-    _ecrire(_faits_temporaires, *[f"Fait numéro {i} sur un sujet distinct" for i in range(12)])
+    _ecrire(
+        _faits_temporaires,
+        *[f"Fait numéro {i} sur un sujet distinct" for i in range(12)],
+    )
     acceptes = sum(
         1
         for i in range(10)

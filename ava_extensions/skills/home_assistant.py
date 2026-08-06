@@ -180,7 +180,9 @@ def _surveillance(d: dict[str, Any]) -> list[str]:
     # ⚠ Une IA à 0 se comporte EXACTEMENT comme un capteur sain qui ne voit rien. C'est ce
     #   qui a rendu la détection véhicule invisible du 25 au 28 juillet.
     if muettes := c.get("detections_muettes"):
-        lignes.append(f"  ⚠ Détection désactivée (sensibilité à 0) : {', '.join(muettes)}")
+        lignes.append(
+            f"  ⚠ Détection désactivée (sensibilité à 0) : {', '.join(muettes)}"
+        )
     return lignes
 
 

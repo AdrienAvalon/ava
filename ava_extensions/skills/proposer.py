@@ -190,7 +190,9 @@ class ProposerTool(BaseTool):
                 success=False,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("proposer: control plane injoignable (%s)", type(exc).__name__)
+            logger.warning(
+                "proposer: control plane injoignable (%s)", type(exc).__name__
+            )
             return ToolResult(
                 tool_name=self.tool_id,
                 content="Le control plane ne repond pas — je n'ai rien propose.",
@@ -305,7 +307,9 @@ class LireDocTool(BaseTool):
                 success=False,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("lire_doc: control plane injoignable (%s)", type(exc).__name__)
+            logger.warning(
+                "lire_doc: control plane injoignable (%s)", type(exc).__name__
+            )
             return ToolResult(
                 tool_name=self.tool_id,
                 content="Le control plane ne repond pas — je n'ai rien pu lire.",
