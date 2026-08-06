@@ -57,6 +57,54 @@ def _fetch_hosts() -> list[dict[str, Any]]:
     return d if isinstance(d, list) else (d.get("hosts") or [])
 
 
+def _rendre_couverture_sauvegarde(px: dict[str, Any]) -> list[str]:
+    """Quelles VM sont reellement protegees par vzdump/PBS — la question qu'elle ne
+    pouvait pas trancher.
+
+    ⚠ POURQUOI CE RENDU EXISTE. Le 2026-08-06, a la question « combien de VM sont
+      reellement protegees ? », la reponse honnete a ete « je n'ai pas la vue » : l'etat
+      `backups` du control plane ne parle que de restic (volumes Docker d'AVA), jamais des
+      machines virtuelles. Le champ `backup_coverage` a ete ajoute au module `proxmox`
+      pour ca — et le collecter sans le RELAYER ici l'aurait laisse hors de sa portee,
+      exactement comme les cinq fois precedentes.
+
+    ⚠ TROIS ETATS DISTINCTS, et les confondre serait pire que se taire :
+      · cle ABSENTE  -> le control plane deploye est anterieur : on ne dit rien.
+      · valeur None  -> l'endpoint Proxmox n'a pas repondu : on le DIT. « je ne sais pas
+        quels jobs existent » n'est pas « aucune VM n'est sauvegardee ».
+      · dictionnaire -> on rend le compte, les jobs, les orphelins et les exemptions.
+    """
+    if "backup_coverage" not in px:
+        return []
+    cv = px.get("backup_coverage")
+    if cv is None:
+        return ["  sauvegardes des VM : non mesurable (Proxmox n'a pas repondu sur ses jobs)"]
+
+    lignes = [
+        f"  sauvegardes des VM : {cv.get('total_couverts', 0)} / {cv.get('total_a_proteger', 0)} "
+        "couvertes par vzdump/PBS (les gabarits sont exclus du compte)"
+    ]
+    for j in cv.get("jobs") or []:
+        cibles = j.get("vmids")
+        cibles = "tous les guests" if cibles == "tous" else f"{len(cibles or [])} guests"
+        etat = "actif" if j.get("enabled") else "DESACTIVE"
+        lignes.append(
+            f"    job {j.get('id')} ({j.get('storage')}, {j.get('schedule')}) : {etat}, {cibles}"
+        )
+    orphelins = cv.get("non_couverts") or []
+    if orphelins:
+        lignes.append(
+            "    SANS AUCUNE SAUVEGARDE : "
+            + ", ".join(f"{g.get('vmid')} {g.get('name')}" for g in orphelins)
+        )
+    # ⚠ Une exemption se rend AVEC SA RAISON. Annoncer « 1 exemptee » sans dire pourquoi
+    #   invite a la traiter comme un oubli — ce qui est precisement ce que l'ecriture de
+    #   la raison sert a empecher.
+    for e in cv.get("exemptes") or []:
+        lignes.append(f"    exemptee : {e.get('vmid')} {e.get('name')} — {e.get('raison')}")
+    return lignes
+
+
 def _rendre_proxmox(px: dict[str, Any]) -> str:
     """Vue par machine virtuelle et par noeud — ce qu'Ava disait ne pas avoir."""
     lignes = []
@@ -87,6 +135,7 @@ def _rendre_proxmox(px: dict[str, Any]) -> str:
         lignes.append(f"  haute disponibilite : {ha['expectation']}")
     elif "enabled" in ha:
         lignes.append(f"  haute disponibilite : {'armee' if ha['enabled'] else 'desarmee'}")
+    lignes.extend(_rendre_couverture_sauvegarde(px))
     rep = px.get("replication") or {}
     jobs = rep.get("status") or []
     if jobs:
