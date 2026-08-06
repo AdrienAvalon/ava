@@ -43,7 +43,13 @@ CHEMIN_JETON = Path(
         "AVA_VOICE_TOKEN_FILE", str(Path.home() / ".openjarvis" / "cp_voice_token")
     )
 ).expanduser()
-_TIMEOUT_S = 30.0
+# ⚠ IL DOIT RESTER AU-DESSUS DU BUDGET DU CONTROL PLANE, sinon le message d'erreur MENT.
+#   Le CP prend au pire 5 + 10 + 12 = 27 s (`core/logs.py`, budget resserre le 2026-08-06 ;
+#   il pouvait atteindre 55 s). Couper avant lui produisait « Le control plane ne repond
+#   pas » sur un CP lent mais parfaitement fonctionnel — donc envoyait diagnostiquer la
+#   mauvaise machine. Les deux valeurs bougent ENSEMBLE : reduire ce delai sans reduire le
+#   budget du CP ramene le mensonge.
+_TIMEOUT_S = 32.0
 
 # ⚠ Miroir du catalogue du CP. Duplique volontairement : la description doit etre dans
 #   le `ToolSpec` pour que le modele sache quoi demander AVANT d'appeler. Un test verifie

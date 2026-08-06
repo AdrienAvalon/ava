@@ -91,6 +91,12 @@ def _ou(zones: Any) -> str:
     return " et ".join(_PREPOSITION.get(n, f"dans {n}") for n in noms)
 
 
+#: Sous ce seuil, Frigate cesse d'enregistrer : « rien détecté » devient un mensonge.
+_DISQUE_CRITIQUE_PCT = 10.0
+#: Au-dessus du critique mais assez bas pour valoir un mot — sans alarmer.
+_DISQUE_BAS_PCT = 20.0
+
+
 def _sante(d: dict[str, Any]) -> list[str]:
     """Ce qui empêcherait de croire le reste."""
     lignes = []
@@ -105,6 +111,29 @@ def _sante(d: dict[str, Any]) -> list[str]:
         lignes.append(
             "  ⚠ Je n'arrive pas à relire l'historique — ce n'est pas « rien ne s'est passé »."
         )
+    # ⚠ LE DISQUE APPARTIENT À LA MÊME FAMILLE QUE LE FLUX MORT, et il était COLLECTÉ SANS
+    #   ÊTRE RENDU : le control plane publie `stockage_libre_pct` depuis toujours, cette
+    #   fonction ne le regardait pas. Or un disque plein arrête l'enregistrement — et à
+    #   partir de là « rien détecté » cesse d'être une observation pour devenir un
+    #   mensonge, exactement comme quand la caméra n'envoie plus d'image.
+    #   C'est la condition qui rend cet outil dangereux quand elle est tue, parce qu'elle
+    #   ne se voit nulle part ailleurs : le conteneur reste `healthy`, la caméra filme, et
+    #   la réponse est rassurante.
+    libre = d.get("stockage_libre_pct")
+    if libre is not None:
+        try:
+            valeur = float(libre)
+        except (TypeError, ValueError):
+            valeur = -1.0
+        if 0 <= valeur < _DISQUE_CRITIQUE_PCT:
+            lignes.append(
+                f"  ⚠ Il ne reste que {valeur:.0f} % de disque pour les enregistrements : "
+                "des événements ont pu ne pas être enregistrés."
+            )
+        elif 0 <= valeur < _DISQUE_BAS_PCT:
+            lignes.append(
+                f"  · Disque d'enregistrement à {valeur:.0f} % libre, à surveiller."
+            )
     return lignes
 
 
