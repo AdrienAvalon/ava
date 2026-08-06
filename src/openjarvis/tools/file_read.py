@@ -13,6 +13,14 @@ from openjarvis.tools._stubs import BaseTool, ToolSpec
 _MAX_SIZE_BYTES = 1_048_576
 
 
+#: Perimetre par defaut de `file_read` : la racine du depot d'Ava. Ce fichier vit dans
+#: `<racine>/src/openjarvis/tools/`, d'ou les trois remontees.
+#: ⚠ On ne met NI `~/.openjarvis` (il contient `api_key`) NI le repertoire personnel : le
+#:   seul usage legitime MESURE est la lecture du depot (l'unique appel reussi sur 16
+#:   lisait `CLAUDE.md`).
+_DEFAUT_AUTORISE = [Path(__file__).resolve().parents[3]]
+
+
 @ToolRegistry.register("file_read")
 class FileReadTool(BaseTool):
     """Read file contents with optional directory restrictions."""
@@ -29,13 +37,34 @@ class FileReadTool(BaseTool):
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name="file_read",
-            description=("Read the contents of a file. Returns the text content."),
+            # ⚠ DESCRIPTION EXPLICITE SUR LE PERIMETRE — mesure du 2026-08-06 : cet outil
+            #   reussissait **1 fois sur 16**. Les 15 echecs visaient TOUS la documentation
+            #   d'Avalon (`docs/compliance/cartographie-si.md`, `docs/ava-perimetre.md`...),
+            #   qui n'est PAS sur cette machine. Pire, le modele reessayait le meme chemin
+            #   jusqu'a QUATRE fois avant d'abandonner : il ne l'apprenait qu'en echouant.
+            # ⚠ L'unique appel reussi lisait `CLAUDE.md`, dans le depot d'Ava — l'outil a
+            #   donc un usage legitime et il ne faut PAS le retirer. Ce qui manquait, c'est
+            #   que la description dise OU il peut lire. Une ambiguite dans un contrat
+            #   d'outil se supprime ; elle ne se rattrape pas par un bon message d'erreur
+            #   (le patch d'orientation existe deja et rattrapait bien — mais chaque
+            #   rattrapage coute un tour).
+            description=(
+                "Lit un fichier PRESENT SUR LA MACHINE D'AVA (son propre depot, ses "
+                "configurations, ses journaux locaux). "
+                "⚠ La documentation de l'infrastructure Avalon n'est PAS sur cette machine : "
+                "pour tout chemin en `docs/`, utiliser `lire_doc`, jamais cet outil."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Path to the file to read.",
+                        "description": (
+                            "Chemin du fichier sur la machine d'Ava. Relatif au depot "
+                            "(ex. `CLAUDE.md`) ou absolu. ⚠ PAS un chemin de la "
+                            "documentation Avalon (`docs/...`) — celle-ci se lit avec "
+                            "`lire_doc`."
+                        ),
                     },
                     "max_lines": {
                         "type": "integer",
@@ -48,13 +77,28 @@ class FileReadTool(BaseTool):
         )
 
     def _is_path_allowed(self, path: Path) -> bool:
-        """Check if path is within allowed directories."""
-        if not self._allowed_dirs:
-            return True
+        """Le chemin est-il dans un repertoire autorise ? FERME par defaut.
+
+        ⚠ CE TEST S'OUVRAIT PAR DEFAUT, ET C'ETAIT UNE VRAIE EXPOSITION. `allowed_dirs`
+          n'est renseigne nulle part (l'outil est enregistre automatiquement, sans
+          arguments), donc `if not self._allowed_dirs: return True` autorisait TOUT le
+          systeme de fichiers. La seule protection etait la liste noire de
+          `security/file_policy.py`.
+        ⚠ UNE LISTE NOIRE ENUMERE LE MAL, donc elle a toujours des trous — mesures le
+          2026-08-06 sur la machine reelle : `.ssh/id_ed25519` et `.env` etaient bien
+          refuses, mais **`/proc/self/environ` etait LISIBLE**, et il porte
+          `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` et `OPENJARVIS_API_KEY`. La configuration
+          `~/.openjarvis/config.toml` (qui contient `api_key`) passait aussi.
+          Trois cles d'API lisibles par un outil que le modele peut appeler, dans une VM
+          qui execute du code tiers.
+        ⚠ Une liste BLANCHE enumere le bien : elle n'a pas ce mode de defaillance. Le
+          defaut couvre le seul usage legitime MESURE — lire des fichiers du depot d'Ava
+          (l'unique appel reussi sur 16 lisait `CLAUDE.md`). La liste noire reste active
+          PAR-DESSUS : les deux se cumulent, elles ne se remplacent pas.
+        """
+        autorises = self._allowed_dirs or _DEFAUT_AUTORISE
         resolved = path.resolve()
-        return any(
-            resolved == d or resolved.is_relative_to(d) for d in self._allowed_dirs
-        )
+        return any(resolved == d or resolved.is_relative_to(d) for d in autorises)
 
     def execute(self, **params: Any) -> ToolResult:
         file_path = params.get("path", "")
