@@ -313,3 +313,107 @@ def test_une_date_ILLISIBLE_ne_fait_pas_dater_le_souvenir_de_1970(
     r = memoire.MemoireTool().execute(sujet="chaufferie")
     assert "chaufferie" in r.content.lower()
     assert "il y a 20" not in r.content
+
+
+# ══ Périmer — autorisé par arbitrage de l'admin, SOUS CONDITION ═══════════════════
+
+
+@pytest.fixture(autouse=True)
+def _quota_neuf() -> None:
+    """Le plafond horaire est un état de module : le remettre à zéro entre les tests."""
+    memoire._marquages.clear()
+
+
+def _perimer(**kw: object) -> object:
+    base = {
+        "action": "perimer",
+        "fait": "La caméra du salon est une Imilab",
+        "raison": "remplacée par une Reolink E1 Zoom le 06/08",
+        "verifie_par": "admin",
+    }
+    base.update(kw)
+    return memoire.MemoireTool().execute(**base)
+
+
+def test_perimer_MARQUE_sans_supprimer(_faits_temporaires: Path) -> None:
+    """⚠ LE CŒUR DE LA DEMANDE. Le fait reste : il dit ce qui ÉTAIT vrai."""
+    _ecrire(_faits_temporaires, "La caméra du salon est une Imilab")
+    r = _perimer()
+    assert r.success is True
+    souvenirs = memoire.charger_souvenirs()
+    assert len(souvenirs) == 1, "le fait ne doit PAS être supprimé"
+    assert souvenirs[0].perime is True
+    assert "Reolink" in souvenirs[0].perime_par
+    assert "admin" in souvenirs[0].perime_par, "la source vérifiée est conservée"
+
+
+def test_perimer_SANS_source_verifiee_est_REFUSE(_faits_temporaires: Path) -> None:
+    """⚠ LA CONDITION POSÉE PAR L'ADMIN : « après qu'elle ait fait toutes les
+    vérifications ». Une consigne qu'aucun code ne fait respecter est un vœu."""
+    _ecrire(_faits_temporaires, "La caméra du salon est une Imilab")
+    r = _perimer(verifie_par="")
+    assert r.success is False
+    assert "VÉRIFIÉ" in r.content
+    assert memoire.charger_souvenirs()[0].perime is False
+
+
+def test_une_source_INVENTEE_est_REFUSEE(_faits_temporaires: Path) -> None:
+    """⚠ Liste FERMÉE, pas texte libre : un champ libre laisserait écrire « j'ai
+    vérifié », ce qui ne vérifie rien."""
+    _ecrire(_faits_temporaires, "La caméra du salon est une Imilab")
+    r = _perimer(verifie_par="j'ai vérifié")
+    assert r.success is False
+    assert memoire.charger_souvenirs()[0].perime is False
+
+
+def test_une_raison_VIDE_DE_SENS_est_REFUSEE(_faits_temporaires: Path) -> None:
+    """« obsolète » ne se relit pas dans six mois — on veut CE QUI A CHANGÉ."""
+    _ecrire(_faits_temporaires, "La caméra du salon est une Imilab")
+    r = _perimer(raison="obsolète")
+    assert r.success is False
+    assert "CE QUI A CHANGÉ" in r.content
+
+
+def test_un_fait_INTROUVABLE_est_signale_sans_rien_ecrire(
+    _faits_temporaires: Path,
+) -> None:
+    _ecrire(_faits_temporaires, "La chaufferie est au sous-sol")
+    r = _perimer(fait="un fait qui n'a jamais existé")
+    assert r.success is False
+    assert "introuvable" in r.content
+
+
+def test_le_PLAFOND_horaire_borne_les_degats(_faits_temporaires: Path) -> None:
+    """⚠ Ava est autonome : une boucle qui se trompe pourrait marquer toute la mémoire en
+    quelques secondes. Rien ne serait perdu — le marquage ne supprime pas — mais la
+    mémoire cesserait d'être utilisable, et la panne ressemblerait à de la prudence."""
+    _ecrire(_faits_temporaires, *[f"Fait numéro {i} sur un sujet distinct" for i in range(12)])
+    acceptes = sum(
+        1
+        for i in range(10)
+        if _perimer(
+            fait=f"Fait numéro {i} sur un sujet distinct",
+            raison=f"vérifié en direct, la valeur {i} a changé depuis",
+            verifie_par="avalon_status",
+        ).success
+    )
+    assert acceptes == memoire._PLAFOND_PAR_HEURE
+
+
+def test_le_marquage_ecrit_LA_OU_L_OUTIL_LIT(_faits_temporaires: Path) -> None:
+    """⚠ Le magasin est construit sur CHEMIN_FAITS, pas sur son chemin par défaut. Écrire
+    ailleurs que là où l'on vient de lire produirait un marquage invisible — un succès
+    sans effet, la pire forme d'échec."""
+    _ecrire(_faits_temporaires, "La caméra du salon est une Imilab")
+    _perimer()
+    contenu = _faits_temporaires.read_text(encoding="utf-8")
+    assert "perime_le" in contenu
+    assert "Reolink" in contenu
+
+
+def test_chercher_reste_le_comportement_PAR_DEFAUT(_faits_temporaires: Path) -> None:
+    """Aucun appel existant ne doit changer de sens : sans `action`, on cherche."""
+    _ecrire(_faits_temporaires, "La chaufferie est au sous-sol")
+    r = memoire.MemoireTool().execute(sujet="chaufferie")
+    assert r.success is True
+    assert "chaufferie" in r.content.lower()

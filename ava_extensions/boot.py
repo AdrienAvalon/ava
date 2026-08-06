@@ -73,6 +73,7 @@ def _skills() -> None:
         logs,
         avalon_status,
         camera,
+        evolutions,
         home_assistant,
         memoire,
         proposer,

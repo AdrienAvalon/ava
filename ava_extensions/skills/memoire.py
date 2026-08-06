@@ -261,9 +261,49 @@ def _rendre(souvenir: Souvenir, maintenant: float | None = None) -> str:
     return f"  · {souvenir.texte}{suffixe}"
 
 
+#: Ce qui compte comme VÉRIFICATION. Liste FERMÉE — c'est la condition posée par l'admin
+#: le 2026-08-06 en autorisant Ava à périmer un fait : « après qu'elle ait fait toutes les
+#: vérifications ». Un champ de texte libre laisserait écrire « j'ai vérifié », ce qui ne
+#: vérifie rien ; une liste fermée oblige à NOMMER la source consultée, et cette source
+#: doit être un outil qu'elle possède réellement.
+#: ⚠ `admin` est dans la liste et c'est délibéré : quand Adrien dit lui-même « ce n'est
+#:   plus vrai », c'est la meilleure source qui existe. Mais il faut le DÉCLARER, donc le
+#:   distinguer d'une déduction.
+_SOURCES_VERIFICATION = (
+    "avalon_status",
+    "home_assistant",
+    "camera",
+    "logs",
+    "journal",
+    "lire_doc",
+    "memoire",
+    "admin",
+)
+
+#: Longueur minimale d'une raison. « obsolète » n'explique rien et ne se relit pas dans six
+#: mois ; on veut ce qui a changé, pas le constat qu'il a changé.
+_RAISON_MIN = 20
+
+#: Garde-fou de VOLUME. Ava est autonome (`ava_veille` tourne toutes les 6 h) : une boucle
+#: qui se trompe pourrait marquer la mémoire entière comme périmée en quelques secondes.
+#: Rien ne serait perdu — le marquage ne supprime pas — mais la mémoire cesserait d'être
+#: utilisable, et la panne ressemblerait à un modèle devenu prudent. Six par heure suffit à
+#: un vrai ménage de conversation et borne la casse.
+_PLAFOND_PAR_HEURE = 6
+_FENETRE_S = 3600.0
+_marquages: list[float] = []
+
+
+def _plafond_atteint(maintenant: float | None = None) -> bool:
+    """Vrai si le quota horaire de marquages est épuisé. Purge la fenêtre au passage."""
+    maintenant = time.time() if maintenant is None else maintenant
+    _marquages[:] = [t for t in _marquages if maintenant - t < _FENETRE_S]
+    return len(_marquages) >= _PLAFOND_PAR_HEURE
+
+
 @ToolRegistry.register("memoire")
 class MemoireTool(BaseTool):
-    """Cherche dans ce qu'Ava a appris au fil des conversations."""
+    """Cherche dans ce qu'Ava a appris, et marque ce qui n'est plus d'actualité."""
 
     tool_id = "memoire"
     is_local = True
@@ -278,18 +318,56 @@ class MemoireTool(BaseTool):
                 "particularités de la maison et de l'infrastructure). À utiliser dès "
                 "qu'une question porte sur quelque chose qui a pu être dit auparavant, ou "
                 "quand Adrien demande de se souvenir. Cette mémoire est COMMUNE à tous les "
-                "interlocuteurs : Ava apprend de tout le monde."
+                "interlocuteurs : Ava apprend de tout le monde.\n"
+                "Avec action='perimer', marque un fait comme n'étant PLUS D'ACTUALITÉ. "
+                "Le fait n'est PAS supprimé : il reste en mémoire, signalé comme dépassé, "
+                "parce qu'il dit ce qui ÉTAIT vrai — donc ce qui a changé. "
+                "⚠ N'utiliser qu'APRÈS AVOIR VÉRIFIÉ, jamais sur une impression : consulter "
+                "d'abord la source qui fait foi (avalon_status, home_assistant, camera, "
+                "logs…) ou tenir la contradiction d'Adrien lui-même, puis nommer cette "
+                "source dans verifie_par. Un fait qu'on croit dépassé sans l'avoir vérifié "
+                "se laisse tel quel."
             ),
             parameters={
                 "type": "object",
                 "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["chercher", "perimer"],
+                        "description": (
+                            "'chercher' (défaut) lit la mémoire ; 'perimer' marque un fait "
+                            "comme dépassé sans le supprimer."
+                        ),
+                    },
                     "sujet": {
                         "type": "string",
                         "description": (
                             "Ce qu'on cherche à retrouver, en quelques mots. Omettre pour "
                             "obtenir les souvenirs les plus récents."
                         ),
-                    }
+                    },
+                    "fait": {
+                        "type": "string",
+                        "description": (
+                            "Le fait à marquer, recopié depuis un résultat de recherche. "
+                            "Requis pour action='perimer'."
+                        ),
+                    },
+                    "raison": {
+                        "type": "string",
+                        "description": (
+                            "CE QUI A CHANGÉ, et depuis quand si on le sait — pas le "
+                            "constat qu'il a changé. Requis pour action='perimer'."
+                        ),
+                    },
+                    "verifie_par": {
+                        "type": "string",
+                        "enum": list(_SOURCES_VERIFICATION),
+                        "description": (
+                            "La source RÉELLEMENT consultée avant de marquer. 'admin' "
+                            "quand Adrien l'a dit lui-même. Requis pour action='perimer'."
+                        ),
+                    },
                 },
                 "required": [],
             },
@@ -298,7 +376,88 @@ class MemoireTool(BaseTool):
             timeout_seconds=5.0,
         )
 
+    def _refus(self, motif: str) -> ToolResult:
+        """Un refus DIT CE QU'IL MANQUE. Un « non » sans raison se relit comme une panne."""
+        return ToolResult(
+            tool_name=self.tool_id, content=motif, success=False, metadata={"perime": 0}
+        )
+
+    def _perimer(self, params: dict[str, Any]) -> ToolResult:
+        """Marque un fait comme dépassé. NE SUPPRIME JAMAIS.
+
+        ⚠ AUTORISÉ PAR ARBITRAGE ÉCRIT DE L'ADMIN (2026-08-06), sous condition explicite :
+          « après qu'elle ait fait toutes les vérifications ». Cette condition est
+          APPLIQUÉE ici, pas seulement écrite dans la description de l'outil — une
+          consigne qu'aucun code ne fait respecter n'est qu'un vœu, et c'est précisément
+          la classe de défaut que ce système passe son temps à corriger.
+
+        ⚠ TROIS GARDES, chacune répond à un mode d'échec distinct :
+          · `verifie_par` dans une liste FERMÉE — impose de NOMMER la source consultée.
+            Un texte libre laisserait écrire « j'ai vérifié », qui ne vérifie rien ;
+          · `raison` d'au moins vingt caractères — on veut CE QUI A CHANGÉ, pas le constat
+            qu'il a changé. « obsolète » ne se relit pas dans six mois ;
+          · plafond horaire — Ava est autonome, une boucle qui se trompe pourrait marquer
+            toute la mémoire en quelques secondes. Rien ne serait perdu, mais la mémoire
+            cesserait d'être utilisable et la panne ressemblerait à de la prudence.
+
+        ⚠ RÉVERSIBLE PAR CONSTRUCTION : le fait reste sur le disque avec son texte intact.
+          Une erreur se défait en retirant deux champs du JSONL (`openjarvis memory
+          revive`), sans rien réécrire.
+        """
+        fait = str(params.get("fait") or "").strip()
+        raison = str(params.get("raison") or "").strip()
+        source = str(params.get("verifie_par") or "").strip()
+
+        if not fait:
+            return self._refus("Pour périmer un fait, il faut le recopier dans `fait`.")
+        if source not in _SOURCES_VERIFICATION:
+            return self._refus(
+                "Avant de périmer un fait, il faut l'avoir VÉRIFIÉ et nommer la source "
+                f"dans `verifie_par` — l'une de : {', '.join(_SOURCES_VERIFICATION)}. "
+                "Si la vérification n'a pas été faite, la faire d'abord ; sinon, laisser "
+                "le fait tel quel."
+            )
+        if len(raison) < _RAISON_MIN:
+            return self._refus(
+                "`raison` doit dire CE QUI A CHANGÉ (et depuis quand si c'est connu), "
+                f"pas seulement que c'est dépassé — au moins {_RAISON_MIN} caractères."
+            )
+        if _plafond_atteint():
+            return self._refus(
+                f"Plafond atteint : pas plus de {_PLAFOND_PAR_HEURE} faits périmés par "
+                "heure. Si un ménage plus large est nécessaire, en parler à Adrien."
+            )
+
+        from openjarvis.memory.store import LocalFactStore
+
+        # ⚠ Le magasin est construit sur CHEMIN_FAITS, pas sur son chemin par défaut : les
+        #   deux coïncident en production, et diffèrent sous test. Écrire ailleurs que là
+        #   où l'on vient de lire produirait un marquage invisible — un succès sans effet.
+        store = LocalFactStore(CHEMIN_FAITS)
+        motif = f"{raison} (vérifié via {source})"
+        if not store.mark_stale(fait, motif):
+            return self._refus(
+                "Ce fait est introuvable en mémoire, ou déjà marqué comme dépassé. "
+                "Le recopier exactement depuis un résultat de recherche."
+            )
+        _marquages.append(time.time())
+        logger.info(
+            "memoire: fait perime — source=%s raison=%r fait=%r", source, raison[:80], fait[:80]
+        )
+        return ToolResult(
+            tool_name=self.tool_id,
+            content=(
+                f"Marqué comme n'étant plus d'actualité : « {fait} »\n"
+                f"Raison retenue : {motif}\n"
+                "Le fait reste en mémoire — il dit ce qui ÉTAIT vrai."
+            ),
+            success=True,
+            metadata={"perime": 1, "verifie_par": source},
+        )
+
     def execute(self, **params: Any) -> ToolResult:
+        if str(params.get("action") or "chercher") == "perimer":
+            return self._perimer(params)
         sujet = params.get("sujet")
         faits = charger_souvenirs()
         if not faits:
