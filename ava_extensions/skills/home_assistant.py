@@ -90,8 +90,30 @@ def _presence(d: dict[str, Any]) -> list[str]:
     return lignes
 
 
+def _figees(d: dict[str, Any]) -> dict[str, str]:
+    """Nom de sonde → depuis quand elle est muette. Vide si tout va bien.
+
+    ⚠ LE CONTROL PLANE MESURE CETTE FRAICHEUR DEPUIS LE 2026-08-06 ET NE ME LA DONNAIT
+      PAS — dixieme occurrence de « collecte mais non relaye » dans ce systeme, et celle-ci
+      a un cout direct sur la qualite de mes reponses.
+    ⚠ CE QUI S'EST PASSE SANS ELLE, le 2026-08-06 : interrogee sur « 23,3 °C dans la salle
+      de bain des parents », j'ai correctement doute — mais faute de pouvoir constater que
+      la sonde etait FIGEE, j'ai INVENTE un mecanisme (« doublon ou mapping d'entite
+      foireux », au motif que la cuisine affichait aussi 23,3). La coincidence etait reelle,
+      l'explication fausse : ce sont deux appareils Tuya distincts, et la salle de bain
+      n'emettait plus rien depuis cinq jours. Une valeur figee est PLAUSIBLE, NUMERIQUE et
+      CREDIBLE — c'est exactement la panne qu'on ne peut pas deduire, seulement mesurer.
+    """
+    return {
+        str(s.get("nom") or s.get("entite")): str(s.get("motif") or "")
+        for s in (d.get("sondes_muettes") or [])
+        if s.get("nom") or s.get("entite")
+    }
+
+
 def _climat(d: dict[str, Any]) -> list[str]:
     lignes: list[str] = []
+    muettes = _figees(d)
     t = d.get("temperatures") or {}
     for cle, libelle in (
         ("exterieur", "Extérieur"),
@@ -104,7 +126,13 @@ def _climat(d: dict[str, Any]) -> list[str]:
     for piece, valeur in (d.get("pieces") or {}).items():
         v = _nombre(valeur, " °C")
         if v:
-            lignes.append(f"  {piece} : {v}")
+            # ⚠ L'AVERTISSEMENT VA SUR LA LIGNE DE LA VALEUR, pas dans un bloc a part.
+            #   Une note en fin de reponse se lit apres avoir deja cru le chiffre ; ici on
+            #   ne peut pas citer la temperature sans voir qu'elle est morte.
+            alerte = muettes.get(piece)
+            lignes.append(
+                f"  {piece} : {v}" + (f"  ⚠ VALEUR MORTE — {alerte}" if alerte else "")
+            )
     meteo = d.get("meteo")
     if meteo:
         tm = _nombre(d.get("meteo_temperature"), " °C")
@@ -210,6 +238,27 @@ def _resume(d: dict[str, Any], domaine: str | None) -> str:
     if piles and (domaine is None or domaine == "maison"):
         noms = ", ".join(f"{p['nom']} ({p['niveau']:.0f} %)" for p in piles)
         sortie.append(f"À changer : pile(s) faible(s) — {noms}")
+    # ⚠ LES SONDES MUETTES SE DISENT PARTOUT AUSSI, et pour une raison plus forte que les
+    #   piles : une pile faible dégrade une mesure, une sonde figée en FABRIQUE une. Elle
+    #   rend une valeur plausible, numérique et crédible — la seule panne qui ressemble
+    #   exactement à un fonctionnement normal. Sans cette ligne, une question qui ne porte
+    #   pas sur le climat (« il fait bon chez les parents ? » posée en domaine `maison`)
+    #   citerait la valeur morte sans le moindre signe.
+    muettes = d.get("sondes_muettes") or []
+    if muettes:
+        noms = ", ".join(f"{s.get('nom')} ({s.get('motif')})" for s in muettes)
+        sortie.append(
+            f"⚠ Sonde(s) qui n'émettent plus — valeur affichée NON fiable : {noms}"
+        )
+    # ⚠ LA CAUSE AVANT L'EFFET : quand une intégration est tombée, toutes ses sondes
+    #   paraissent figées. Nommer l'intégration évite de faire chercher cinq pannes de
+    #   capteur là où il n'y en a qu'une, en amont.
+    integrations = d.get("integrations_ko") or []
+    if integrations:
+        noms = ", ".join(str(i.get("nom") or i.get("domaine")) for i in integrations)
+        sortie.append(
+            f"⚠ Intégration(s) en échec — CAUSE probable des sondes muettes : {noms}"
+        )
     if not sortie:
         return "Aucune donnée exploitable dans le relevé de la maison."
     return "\n".join(sortie)

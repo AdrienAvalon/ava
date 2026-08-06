@@ -816,3 +816,72 @@ def test_l_ABSENCE_d_echec_ne_vaut_PAS_succes() -> None:
     assert 'trace.outcome = "success"' not in source, (
         "aucun succes ne doit etre ecrit automatiquement — l'absence d'echec n'est pas une preuve"
     )
+
+
+# ══ Sondes muettes — collectées par le CP, jamais relayées à Ava ══════════════════
+
+
+def test_une_sonde_FIGEE_est_signalee_SUR_LA_LIGNE_de_sa_valeur() -> None:
+    """⚠ DIXIÈME OCCURRENCE DE « COLLECTÉ MAIS NON RELAYÉ », et celle-ci a un coût
+    mesurable sur la qualité des réponses. Le 2026-08-06, interrogée sur « 23,3 °C dans la
+    salle de bain des parents », Ava a correctement douté — mais faute de pouvoir
+    CONSTATER que la sonde était figée, elle a INVENTÉ un mécanisme (« doublon ou mapping
+    d'entité foireux », parce que la cuisine affichait aussi 23,3). La coïncidence était
+    réelle, l'explication fausse : deux appareils Tuya distincts, et la salle de bain
+    n'émettait plus rien depuis cinq jours.
+    ⚠ L'avertissement doit être SUR LA LIGNE de la valeur : une note en fin de réponse se
+    lit après avoir déjà cru le chiffre."""
+    from ava_extensions.skills import home_assistant as ha
+
+    d = {
+        "pieces": {"Cuisine": 23.3, "Salle de bain étage (parents)": 23.3},
+        "sondes_muettes": [
+            {
+                "nom": "Salle de bain étage (parents)",
+                "entite": "sensor.salle_de_bain_etage_temperature",
+                "motif": "figée depuis 128.5 h",
+            }
+        ],
+    }
+    lignes = ha._climat(d)
+    morte = [x for x in lignes if "Salle de bain étage" in x]
+    saine = [x for x in lignes if "Cuisine" in x]
+    assert morte and "VALEUR MORTE" in morte[0]
+    assert "128.5" in morte[0]
+    assert saine and "VALEUR MORTE" not in saine[0], (
+        "la sonde saine ne doit rien porter"
+    )
+
+
+def test_une_sonde_muette_est_dite_MEME_hors_du_domaine_climat() -> None:
+    """⚠ Une pile faible dégrade une mesure ; une sonde figée en FABRIQUE une. Sans cette
+    remontée globale, une question posée en domaine `maison` citerait la valeur morte sans
+    le moindre signe."""
+    from ava_extensions.skills import home_assistant as ha
+
+    d = {
+        "lumieres": {"Salon": "allumée"},
+        "sondes_muettes": [
+            {"nom": "Salle de bain étage", "motif": "figée depuis 128.5 h"}
+        ],
+    }
+    assert "NON fiable" in ha._resume(d, "maison")
+
+
+def test_l_INTEGRATION_en_echec_est_nommee_comme_CAUSE() -> None:
+    """⚠ Quand une intégration tombe, toutes ses sondes paraissent figées. La nommer évite
+    de faire chercher cinq pannes de capteur là où il n'y en a qu'une, en amont."""
+    from ava_extensions.skills import home_assistant as ha
+
+    d = {"lumieres": {"Salon": "allumée"}, "integrations_ko": [{"nom": "Tuya"}]}
+    r = ha._resume(d, "maison")
+    assert "CAUSE probable" in r and "Tuya" in r
+
+
+def test_AUCUN_avertissement_quand_tout_va_bien() -> None:
+    """⚠ LE CONTRE-TEST. Un avertissement permanent est un avertissement qu'on cesse de
+    lire — c'est ce qui a coûté l'alerte Aruba pendant des semaines."""
+    from ava_extensions.skills import home_assistant as ha
+
+    r = ha._resume({"pieces": {"Cuisine": 23.3}, "sondes_muettes": []}, None)
+    assert "VALEUR MORTE" not in r and "NON fiable" not in r
