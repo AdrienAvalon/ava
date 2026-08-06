@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from typing import Dict, Tuple
 
 from openjarvis._rust_bridge import get_rust_module, scan_result_from_json
@@ -141,8 +143,31 @@ class PIIScanner(BaseScanner):
         return scan_result_from_json(self._rust_impl.scan(text))
 
     def redact(self, text: str) -> str:
-        """Replace PII matches with ``[REDACTED:{pattern_name}]``."""
-        return self._rust_impl.redact(text)
+        """Replace PII matches with ``[REDACTED:{pattern_name}]``.
+
+        ⚠ ON APPLIQUE LES MOTIFS DECLARES CI-DESSUS, PAS CEUX DU MODULE RUST — et l'ecart
+          entre les deux etait grave. Le motif Python s'appelle `ipv4_public` et EXCLUT
+          explicitement les plages privees (10/8, 172.16/12, 192.168/16, 127, 0). Le motif
+          Rust s'appelle `ipv4_address` et caviarde TOUTE adresse IPv4.
+          Cette methode rendait `self._rust_impl.redact(text)` : les motifs declares juste
+          au-dessus etaient DU CODE MORT, et l'intention ecrite n'etait pas celle qui
+          s'executait. Meme classe de defaut que `is_sensitive_file`, corrige le 2026-08-05.
+
+        ⚠ CE QUE CA COUTAIT, MESURE LE 2026-08-06. Ava est une assistante d'INFRASTRUCTURE :
+          le module Rust lui masquait toutes les adresses de son propre reseau. Invitee a
+          amender une page de documentation, elle a lu `[REDACTED:ipv4_address]` a la place
+          des 22 adresses du fichier — et sa proposition (merge request !29) les aurait
+          TOUTES effacees, puisque le contenu remplace le fichier entier. Elle n'avait aucun
+          moyen de s'en apercevoir : ce qu'elle lisait etait faux et se presentait comme vrai.
+
+        ⚠ CE QU'ON NE PERD PAS : courriels, numeros de securite sociale, cartes bancaires,
+          telephones et adresses IP PUBLIQUES restent caviardes. Seules les adresses privees
+          — celles de la maison, qui n'ont de sens que chez elle — redeviennent lisibles.
+        """
+        resultat = text
+        for nom, (motif, _niveau, _desc) in self.PATTERNS.items():
+            resultat = re.sub(motif, f"[REDACTED:{nom}]", resultat)
+        return resultat
 
 
 __all__ = ["PIIScanner", "SecretScanner"]
