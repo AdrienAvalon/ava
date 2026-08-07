@@ -95,12 +95,15 @@ class JournalTool(BaseTool):
                 "Ce qu'Ava a OBSERVÉ se passer, avec les dates : arrivées et départs des "
                 "personnes, températures, modules de l'infrastructure qui se dégradent ou "
                 "se rétablissent, appareils qui cessent de répondre, piles faibles. "
-                "À utiliser pour toute question sur le PASSÉ ou sur une évolution : "
+                "À utiliser pour le passé de la MAISON et des modules : "
                 "« il s'est passé quoi cette nuit ? », « quand est rentrée Aurélie ? », "
                 "« c'est la combientième fois que le disjoncteur tombe ? », « le score a "
                 "bougé aujourd'hui ? ». "
                 "⚠ À ne pas confondre avec l'outil `memoire`, qui porte des faits durables "
-                "SANS date (emplacements, habitudes, préférences). Ici, tout est daté."
+                "SANS date (emplacements, habitudes, préférences). Ici, tout est daté. "
+                "⚠ NI AVEC `logs`, QUI SEUL PORTE LES JOURNAUX DES MACHINES : services "
+                "redémarrés, erreurs de conteneurs, déploiements, tentatives SSH. Cet "
+                "outil-ci ne les voit PAS — n'en conclus jamais qu'ils n'existent pas."
             ),
             parameters={
                 "type": "object",

@@ -217,3 +217,43 @@ def test_la_TRONCATURE_de_la_repartition_est_ANNONCEE(outil: Any) -> None:
         }
     )
     assert "les 8 premiers seulement" in rendu
+
+
+def test_journal_RENVOIE_vers_logs_et_reciproquement(outil: Any) -> None:
+    """⚠ LA DÉSAMBIGUÏSATION ÉTAIT ASYMÉTRIQUE, ET ÇA A COÛTÉ UNE RÉPONSE ENTIÈRE.
+
+    Mesuré le 2026-08-07 : interrogée sur les redémarrages de services, Ava a répondu
+    « ni les outils dont je dispose, ni le journal ne mesurent de compteur de
+    redémarrages par service » — dix minutes après avoir répondu correctement à la même
+    question avec `logs`. Elle avait pris `journal` (ses observations) pour `logs` (les
+    journaux des machines), n'y avait rien trouvé, et conclu à l'absence de tout outil.
+
+    `logs` disait déjà « ⚠ Différent de `journal` ». Mais `journal` revendiquait « toute
+    question sur le PASSÉ ou sur une évolution » — une formule assez large pour capturer
+    « combien de services ont redémarré ces 24 h ». Le renvoi doit aller dans les DEUX
+    sens, sinon l'outil qui sur-revendique gagne.
+
+    ⚠ Ce test réduit une probabilité, il ne garantit rien : le choix d'outil est une
+      décision du modèle. Ce qui est vérifiable, c'est que les deux descriptions se
+      renvoient l'une à l'autre — et ça, ça doit rester vrai.
+    """
+    import importlib.util as _iu
+    from pathlib import Path as _P
+
+    chemin = (
+        _P(outil.__file__).parent / "journal.py" if hasattr(outil, "__file__") else None
+    )
+    src_journal = (
+        chemin.read_text(encoding="utf-8")
+        if chemin and chemin.exists()
+        else (_P(__file__).resolve().parents[1] / "skills" / "journal.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "`logs`" in src_journal, "journal ne renvoie plus vers logs"
+    assert "n'en conclus jamais qu'ils n'existent pas" in src_journal
+    src_logs = (_P(__file__).resolve().parents[1] / "skills" / "logs.py").read_text(
+        encoding="utf-8"
+    )
+    assert "journal" in src_logs, "logs ne renvoie plus vers journal"
+    assert _iu is not None
