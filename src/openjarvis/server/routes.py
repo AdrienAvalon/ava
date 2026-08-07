@@ -521,7 +521,7 @@ def _handle_agent(
             from openjarvis.traces.collector import TraceCollector
 
             collector = TraceCollector(agent, store=trace_store, bus=bus)
-            result = collector.run(input_text, context=ctx)
+            result = collector.run(input_text, context=ctx, provenance=req.user)
             # ⚠ On le lit APRÈS `run`, jamais avant : `last_trace` n'est renseigné
             #   qu'une fois la trace construite et persistée.
             _trace = collector.last_trace

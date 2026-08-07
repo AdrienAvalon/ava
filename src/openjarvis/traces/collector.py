@@ -51,9 +51,17 @@ class TraceCollector:
         self,
         input: str,
         context: Optional[AgentContext] = None,
+        *,
+        provenance: Optional[str] = None,
         **kwargs: Any,
     ) -> AgentResult:
-        """Execute the wrapped agent and record a trace."""
+        """Execute the wrapped agent and record a trace.
+
+        ⚠ `provenance` dit QUI a posé la question. Sans lui, les traces sont
+          indiscernables — mesuré le 2026-08-07 — et le registre mélange les vraies
+          conversations de l'admin avec les sondes adverses à prémisse fausse. C'est le
+          prérequis de la mémoire épisodique, pas un agrément.
+        """
         self._current_steps = []
         self._current_model = ""
         self._current_engine = ""
@@ -93,6 +101,10 @@ class TraceCollector:
             messages=messages,
             started_at=started_at,
             ended_at=ended_at,
+            # ⚠ Absent plutôt que deviné : une trace sans provenance déclarée reste
+            #   `inconnue`, elle ne devient pas « l'admin » par défaut. Le défaut le plus
+            #   dangereux serait d'attribuer à quelqu'un des propos qu'il n'a pas tenus.
+            metadata={"provenance": provenance} if provenance else {},
         )
         # Recompute totals from steps
         for step in trace.steps:

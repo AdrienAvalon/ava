@@ -28,6 +28,19 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int = 1024
     stream: bool = False
     tools: Optional[List[Dict[str, Any]]] = None
+    #: ⚠ QUI POSE LA QUESTION — champ standard de l'API OpenAI, et le PRÉREQUIS de la
+    #: mémoire épisodique. Mesure du 2026-08-07 : les 352 traces sont indiscernables
+    #: entre elles (même `agent`, même `engine`, `messages` et `metadata` vides), alors
+    #: qu'elles mélangent DEUX sources — les vraies conversations de l'admin par Matrix,
+    #: et les sondes adverses que je lui envoie avec des prémisses DÉLIBÉRÉMENT FAUSSES.
+    #: Exposer ce registre comme « ta mémoire des échanges » lui ferait donc se souvenir
+    #: que l'admin a dit des choses que j'ai inventées pour la tester — « le chauffage
+    #: des parents est coupé depuis ce matin » figure dans le registre à côté de « c'est
+    #: bien le port 1 de l'Aruba », l'un fabriqué et l'autre réel.
+    #: ⚠ D'où l'ordre : la provenance D'ABORD, la mémoire épisodique ENSUITE. Un registre
+    #: qu'on ne peut pas attribuer est pire qu'un registre absent — il a l'autorité du
+    #: verbatim.
+    user: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
