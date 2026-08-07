@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import os
 import time
 import unicodedata
@@ -239,6 +240,36 @@ def _date_courte(horodatage: float) -> str:
     return datetime.fromtimestamp(horodatage).strftime("%d/%m")
 
 
+#: Ce qui trahit une MESURE plutôt qu'un fait structurel. ⚠ CE MOTIF NE BLOQUE RIEN — il
+#: pose un avertissement à la LECTURE, et cette retenue est le résultat d'une mesure, pas
+#: une prudence de principe.
+#: ⚠ SIMULÉ D'ABORD SUR LES 243 FAITS RÉELS, comme l'exige la doctrine de ce dépôt. Un
+#:   filtre de REJET bâti sur ce motif en écartait 34, dont une majorité de faits
+#:   parfaitement durables : « Caméra Reolink E1 Zoom dans le salon, installée le 06/08 »
+#:   (la date lue comme un score), « Cluster Proxmox avec 2 nœuds » (le mot `offline`), et
+#:   surtout **« Les 41 conteneurs tournent sur la machine ava, pas sur la VM
+#:   avalon-ai-ava-01 »** — c'est-à-dire la correction même qui venait de réparer le défaut
+#:   du 2026-08-07. Un filtre qui détruit le correctif est pire que le défaut.
+#: ⚠ LA DISTINCTION EST SÉMANTIQUE, PAS LEXICALE : « 41 conteneurs sur ava » est
+#:   structurel, « 41 conteneurs sur ma VM » est une mesure fausse, et les deux s'écrivent
+#:   pareil. Aucune expression régulière ne les sépare. D'où le choix d'AVERTIR : le fait
+#:   reste, il dit ce qui était vrai, et le lecteur sait où regarder deux fois.
+#: ⚠ Le mal réel est mesuré : le 2026-08-07, six faits faux sur l'architecture — issus
+#:   pour partie des propres réponses erronées d'Ava, extraites comme des faits — l'ont
+#:   fait se tromper trois fois de suite. Elle l'a dit elle-même : « je m'étais fait avoir
+#:   par ma propre mémoire ».
+_MESURE = re.compile(
+    r"\d+\s*/\s*\d{2,3}\b"
+    r"|\d+([.,]\d+)?\s*%"
+    r"|\d+([.,]\d+)?\s*°"
+    r"|\b(?:il y a|depuis)\s+\d+\s*(?:h|heures?|min|minutes?|jours?|j)\b"
+    r"|\b\d+\s*(?:conteneurs?|VM|cibles?|targets?|agents?|alertes?|erreurs?"
+    r"|redemarrages?|redémarrages?|snapshots?|entites?|entités?|capteurs?)\b"
+    r"|\b(?:unhealthy|healthy|offline|firing|degraded)\b",
+    re.IGNORECASE,
+)
+
+
 def _rendre(souvenir: Souvenir, maintenant: float | None = None) -> str:
     """Une ligne de souvenir, SITUÉE DANS LE TEMPS.
 
@@ -256,6 +287,12 @@ def _rendre(souvenir: Souvenir, maintenant: float | None = None) -> str:
         raison = f" : {souvenir.perime_par}" if souvenir.perime_par else ""
         marques.append(
             f"PLUS D'ACTUALITÉ depuis le {_date_courte(souvenir.perime_le)}{raison}"
+        )
+    # ⚠ ON N'AVERTIT QUE SUR UN FAIT ENCORE ACTIF : un souvenir déjà marqué dépassé
+    #   porte son avertissement, en ajouter un second le noierait.
+    if not souvenir.perime and _MESURE.search(souvenir.texte):
+        marques.append(
+            "porte une VALEUR MESURÉE — relis-la avec tes outils, ne la cite pas telle quelle"
         )
     suffixe = f"  [{' — '.join(marques)}]" if marques else ""
     return f"  · {souvenir.texte}{suffixe}"

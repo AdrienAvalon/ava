@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import pathlib
 import json
 import time
 from pathlib import Path
@@ -423,3 +424,64 @@ def test_chercher_reste_le_comportement_PAR_DEFAUT(_faits_temporaires: Path) -> 
     r = memoire.MemoireTool().execute(sujet="chaufferie")
     assert r.success is True
     assert "chaufferie" in r.content.lower()
+
+
+# ══ Avertissement de lecture — le levier choisi APRÈS avoir écarté le rejet ═══════
+
+
+def test_un_fait_qui_porte_une_MESURE_est_signale() -> None:
+    """⚠ MAL MESURÉ, PAS SUPPOSÉ. Le 2026-08-07, six faits faux sur l'architecture —
+    issus pour partie des propres réponses erronées d'Ava, extraites comme des faits —
+    l'ont fait se tromper TROIS fois de suite sur la même question. Elle l'a dit
+    elle-même : « je m'étais fait avoir par ma propre mémoire »."""
+    s = memoire.Souvenir(
+        texte="La VM avalon-ai-ava-01 porte 41 conteneurs Docker", cree_le=0
+    )
+    rendu = memoire._rendre(s, maintenant=0)
+    assert "VALEUR MESURÉE" in rendu
+
+
+def test_un_fait_STRUCTUREL_n_est_PAS_signale() -> None:
+    """⚠ LE CONTRE-TEST QUI PORTE LE RISQUE. Un avertissement sur tout serait un
+    avertissement qu'on cesse de lire — et il ferait douter des faits les plus utiles,
+    ceux qui décrivent l'installation."""
+    for texte in (
+        "Le disjoncteur est derrière la porte verte",
+        "Vit avec Annie et Jean-Pierre",
+        "Utilise Ansible pour la configuration",
+        "Caméra Reolink E1 Zoom dans le salon de la grange",
+    ):
+        assert "VALEUR MESURÉE" not in memoire._rendre(
+            memoire.Souvenir(texte=texte, cree_le=0), maintenant=0
+        )
+
+
+def test_un_fait_DEJA_PERIME_ne_recoit_PAS_de_second_avertissement() -> None:
+    """⚠ Il porte déjà « PLUS D'ACTUALITÉ », qui est plus fort. En empiler un second le
+    noierait — deux avertissements sur la même ligne se lisent comme du bruit."""
+    s = memoire.Souvenir(
+        texte="La VM porte 41 conteneurs Docker",
+        cree_le=0,
+        perime_le=1.0,
+        perime_par="mesuré sur avalon_status",
+    )
+    rendu = memoire._rendre(s, maintenant=0)
+    assert "PLUS D'ACTUALITÉ" in rendu
+    assert "VALEUR MESURÉE" not in rendu
+
+
+def test_le_REJET_a_ete_ECARTE_et_la_raison_est_CONSIGNEE() -> None:
+    """⚠ RÉSULTAT NÉGATIF, CONSERVÉ EXPRÈS. La réponse évidente était de REJETER ces faits
+    à l'extraction. Simulé sur les 243 faits réels — comme l'exige la doctrine de ce dépôt
+    (« un filtre de purge se simule TOUJOURS d'abord ») — le rejet en écartait 34, dont une
+    majorité de faits durables : la caméra du salon (sa date `06/08` lue comme un score),
+    « Cluster Proxmox avec 2 nœuds » (le mot `offline`), et surtout **la correction qui
+    venait de réparer le défaut du jour**.
+
+    La distinction est SÉMANTIQUE : « 41 conteneurs sur ava » est structurel, « 41
+    conteneurs sur ma VM » est une mesure fausse, et les deux s'écrivent pareil. Sans
+    cette trace, la prochaine session referait le filtre et détruirait les mêmes faits.
+    """
+    src = (pathlib.Path(memoire.__file__)).read_text(encoding="utf-8")
+    assert "CE MOTIF NE BLOQUE RIEN" in src
+    assert "SIMULÉ D'ABORD SUR LES 243 FAITS RÉELS" in src
