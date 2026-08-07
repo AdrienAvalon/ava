@@ -74,6 +74,26 @@ def _jeton() -> str:
 
 
 @ToolRegistry.register("logs")
+def _repartition_rendue(d: dict) -> str:
+    """La vraie hiérarchie, en clair — ou rien du tout.
+
+    ⚠ DOUZIÈME OCCURRENCE DE « COLLECTÉ MAIS NON RELAYÉ », et la plus démonstrative :
+      le control plane calculait déjà cette répartition, elle était livrée, déployée,
+      testée — et elle finissait dans `metadata`, que le modèle ne lit pas. Mesuré le
+      2026-08-07 : après déploiement du correctif côté CP, Ava a redonné EXACTEMENT le
+      même classement faux qu'avant. Une correction qui n'atteint pas le consommateur se
+      lit comme une correction qui ne marche pas — et on va la chercher au mauvais endroit.
+    ⚠ Rien quand il n'y a rien : un en-tête « Répartition : » suivi du vide apprendrait
+      au modèle à ignorer la section.
+    """
+    rep = d.get("repartition")
+    if not isinstance(rep, list) or not rep:
+        return ""
+    lignes = [f"  {x.get('nom', '?')} : {x.get('occurrences', 0)}" for x in rep]
+    suite = f" ({d['repartition_tronquee']})" if d.get("repartition_tronquee") else ""
+    return f"\nRépartition réelle sur toute la fenêtre{suite} :\n" + "\n".join(lignes)
+
+
 class LogsTool(BaseTool):
     """Les journaux de l'infrastructure, par questions nommees."""
 
@@ -202,19 +222,42 @@ class LogsTool(BaseTool):
         lignes = d.get("lignes") or []
         if not lignes:
             # Source sensible : comptage seul, et on dit pourquoi.
+            # ⚠ C'EST ICI QUE LA RÉPARTITION COMPTE LE PLUS. Ces sources sont en
+            #   « comptage seul » (elles portent des identités) : sans elle, Ava ne peut
+            #   dire QUE « 358 erreurs », un nombre sur lequel on ne peut rien décider.
+            #   Avec elle : « 190 sur Home Assistant, 96 sur SonarQube » — actionnable,
+            #   et toujours agrégé. C'est exactement ce que promettait la justification
+            #   écrite de l'arbitrage du 2026-08-05, sans que ce soit livré nulle part.
             return ToolResult(
                 tool_name=self.tool_id,
-                content=f"{entete}.\n({d.get('detail', 'comptage seul')})",
+                content=f"{entete}.\n({d.get('detail', 'comptage seul')})"
+                + _repartition_rendue(d),
                 success=True,
                 metadata=d,
             )
         rendu = []
         for x in lignes[:20]:
             h = datetime.datetime.fromtimestamp(x["horodatage"]).strftime("%d/%m %H:%M")
-            rendu.append(f"  · {h} — {x['texte'][:150]}")
+            # ⚠ L'HÔTE EST AFFICHÉ, et il change un diagnostic. Sans lui, Ava a vu douze
+            #   lignes « Started systemd-timedated.service » en deux minutes et conclu à
+            #   une boucle de plantage : c'étaient les douze MACHINES de la flotte
+            #   interrogeant le service en même temps. Un événement simultané sur la
+            #   flotte est indiscernable d'une boucle sur une machine sans cette colonne.
+            ho = x.get("hote")
+            marque = f"[{ho}] " if ho and ho != "?" else ""
+            rendu.append(f"  · {h} — {marque}{x['texte'][:150]}")
+        # ⚠ La consigne du CP est REPRISE dans le contenu : elle dit au modèle que les
+        #   lignes sont un échantillon des plus récentes et qu'on n'en déduit pas de
+        #   classement. Dans `metadata`, elle ne serait jamais lue.
+        note = f"\n{d['comment_lire']}" if d.get("comment_lire") else ""
+        tronq = "\n(échantillon des plus récentes)" if d.get("lignes_tronquees") else ""
         return ToolResult(
             tool_name=self.tool_id,
-            content=f"{entete} :\n" + "\n".join(rendu),
+            content=f"{entete} :\n"
+            + "\n".join(rendu)
+            + tronq
+            + _repartition_rendue(d)
+            + note,
             success=True,
             metadata={k: v for k, v in d.items() if k != "lignes"},
         )

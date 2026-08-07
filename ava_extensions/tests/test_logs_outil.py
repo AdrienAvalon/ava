@@ -173,3 +173,47 @@ def test_le_vocabulaire_est_le_MEME_que_celui_du_control_plane() -> None:
     ).group(1)
     cles_ava = set(re.findall(r'"([a-z_]+)"', bloc))
     assert cles_ava == cles_cp, f"divergence : {cles_ava ^ cles_cp}"
+
+
+# ══ Le relais — douzième « collecté mais non relayé » ═════════════════════════════
+
+
+def test_la_REPARTITION_atteint_le_MODELE_et_pas_seulement_metadata(outil: Any) -> None:
+    """⚠ LE DÉFAUT LE PLUS INSTRUCTIF DE LA SÉRIE. Le control plane calculait la
+    répartition, elle était livrée, déployée, testée de son côté — et elle finissait
+    dans `metadata`, que le modèle ne lit pas.
+
+    Mesuré le 2026-08-07 : après déploiement du correctif côté CP, Ava a redonné
+    EXACTEMENT le même classement faux qu'avant. Une correction qui n'atteint pas son
+    consommateur se lit comme une correction qui ne marche pas — et on va la chercher
+    au mauvais endroit, c'est-à-dire dans le code qu'on vient de réparer.
+    """
+    rendu = outil._repartition_rendue(
+        {
+            "repartition": [
+                {"nom": "systemd-timedated", "occurrences": 300},
+                {"nom": "lynis", "occurrences": 12},
+            ]
+        }
+    )
+    assert "systemd-timedated : 300" in rendu
+    assert "lynis : 12" in rendu
+
+
+def test_une_repartition_ABSENTE_ne_rend_RIEN(outil: Any) -> None:
+    """⚠ Un en-tête « Répartition : » suivi du vide apprend au modèle à ignorer la
+    section — et il l'ignorera aussi le jour où elle portera quelque chose."""
+    assert outil._repartition_rendue({}) == ""
+    assert outil._repartition_rendue({"repartition": []}) == ""
+
+
+def test_la_TRONCATURE_de_la_repartition_est_ANNONCEE(outil: Any) -> None:
+    """⚠ Remplacer une extrapolation fausse par une vue amputée silencieuse serait le
+    même défaut déplacé d'un cran."""
+    rendu = outil._repartition_rendue(
+        {
+            "repartition": [{"nom": "a", "occurrences": 1}],
+            "repartition_tronquee": "les 8 premiers seulement",
+        }
+    )
+    assert "les 8 premiers seulement" in rendu
