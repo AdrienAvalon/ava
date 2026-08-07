@@ -9,6 +9,7 @@ caps the total number of facts, and is safe to call from multiple threads.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
@@ -18,6 +19,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable, List
 
@@ -227,6 +229,52 @@ class FactStore(ABC):
 
 
 @FactStoreRegistry.register("local")
+@contextmanager
+def _verrou_exclusif(chemin: Path):
+    """Serialise le cycle lire-modifier-ecrire entre TOUS les ecrivains du fichier.
+
+    ⚠ PERTE DE MISE A JOUR MESUREE LE 2026-08-07, sur la SEULE capacite d'ecriture d'Ava.
+      Deux `mark_stale` emis dans la meme seconde ont tous deux rendu True et tous deux
+      journalise « fait perime » — un seul a survecu sur le disque. Le second magasin
+      avait charge le fichier AVANT que le premier ne l'ecrive, puis a reecrit sa propre
+      copie par-dessus. Ava a donc annonce « les deux sont perimes » de bonne foi, et
+      c'etait faux : un succes rapporte sans effet, exactement la classe de defaut que ce
+      projet traque.
+
+    ⚠ LE VERROU EN MEMOIRE NE SUFFISAIT PAS, et c'est ce qui rend le defaut invisible a
+      la relecture : `self._lock` existe et fonctionne, mais l'appelant construit un
+      `LocalFactStore` NEUF a chaque appel — donc deux verrous distincts qui ne se voient
+      pas. Et la CLI (`openjarvis memory revive`) ecrit depuis un AUTRE processus, ou
+      aucun verrou memoire ne peut porter.
+
+    ⚠ Verrou sur un fichier SIDECAR, jamais sur le fichier de donnees lui-meme :
+      `_flush` procede par `os.replace`, donc l'inode change a chaque ecriture et un
+      verrou pose dessus protegerait un fichier qui n'existe deja plus. Meme piege que le
+      bind-mount Grafana colle a son ancien inode.
+
+    ⚠ NE BLOQUE JAMAIS INDEFINIMENT ET NE LEVE JAMAIS : si le verrou est indisponible
+      (systeme de fichiers sans flock, permission refusee), on continue SANS. Perdre une
+      ecriture concurrente est un defaut rare ; refuser d'ecrire du tout en serait un
+      permanent.
+    """
+    verrou = None
+    try:
+        verrou = open(str(chemin) + ".lock", "a+")  # noqa: SIM115 — ferme dans le finally
+        fcntl.flock(verrou.fileno(), fcntl.LOCK_EX)
+    except Exception:  # noqa: BLE001
+        if verrou is not None:
+            verrou.close()
+        verrou = None
+    try:
+        yield
+    finally:
+        if verrou is not None:
+            try:
+                fcntl.flock(verrou.fileno(), fcntl.LOCK_UN)
+            finally:
+                verrou.close()
+
+
 class LocalFactStore(FactStore):
     """Append-only JSONL fact store on the local filesystem.
 
@@ -310,7 +358,7 @@ class LocalFactStore(FactStore):
         if source == "auto" and _PERISSABLE.search(_sans_accents(text)):
             logger.debug("fait perissable refuse: %s", text[:80])
             return False
-        with self._lock:
+        with _verrou_exclusif(self._path), self._lock:
             self._sync_from_disk_locked()
             # ⚠ COMPARAISON SUR L'EMPREINTE, pas sur la chaine exacte. Le dedoublonnage
             #   d'origine testait l'egalite stricte en minuscules : « Parle francais » et
@@ -391,7 +439,9 @@ class LocalFactStore(FactStore):
         cible = _empreinte(text or "")
         if not cible:
             return False
-        with self._lock:
+        # ⚠ Le verrou FICHIER encadre le cycle complet lire-modifier-ecrire : sans lui,
+        #   deux marquages simultanes se perdent l'un l'autre (mesure du 2026-08-07).
+        with _verrou_exclusif(self._path), self._lock:
             self._sync_from_disk_locked()
             for fact in self._facts:
                 if _empreinte(fact.text) == cible and not fact.perime:
