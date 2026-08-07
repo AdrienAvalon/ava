@@ -73,7 +73,6 @@ def _jeton() -> str:
         return ""
 
 
-@ToolRegistry.register("logs")
 def _repartition_rendue(d: dict) -> str:
     """La vraie hiérarchie, en clair — ou rien du tout.
 
@@ -94,6 +93,7 @@ def _repartition_rendue(d: dict) -> str:
     return f"\nRépartition réelle sur toute la fenêtre{suite} :\n" + "\n".join(lignes)
 
 
+@ToolRegistry.register("logs")
 class LogsTool(BaseTool):
     """Les journaux de l'infrastructure, par questions nommees."""
 

@@ -257,3 +257,41 @@ def test_journal_RENVOIE_vers_logs_et_reciproquement(outil: Any) -> None:
     )
     assert "journal" in src_logs, "logs ne renvoie plus vers journal"
     assert _iu is not None
+
+
+def test_le_DECORATEUR_enregistre_bien_la_CLASSE_et_pas_autre_chose() -> None:
+    """⚠ MON PROPRE DÉFAUT, LE 2026-08-07, ET LE PLUS INSTRUCTIF DE LA NUIT.
+
+    En ajoutant `_repartition_rendue`, je l'ai insérée ENTRE `@ToolRegistry.register("logs")`
+    et `class LogsTool`. Le décorateur a donc enregistré ma fonction d'affichage à la place
+    de l'outil : Ava a perdu `logs` entièrement et répondu « je n'ai pas d'outil qui trace
+    les redémarrages de services », dix minutes après s'en être servie.
+
+    ⚠ ET LES 330 TESTS SONT RESTÉS VERTS. La fixture `outil` REMPLACE
+      `ToolRegistry.register` par une lambda neutre pour pouvoir charger le module hors
+      application — donc elle neutralise exactement le mécanisme qui venait de casser.
+      Un harnais qui désactive ce qu'il devrait vérifier ne peut pas voir ce défaut, et
+      son vert se lit comme une garantie.
+
+    ⚠ Pire : j'ai d'abord diagnostiqué un problème de CHOIX D'OUTIL et corrigé la
+      désambiguïsation `journal`/`logs`. Cette correction-là tient sur ses propres mérites
+      (l'asymétrie était réelle), mais elle ne réparait pas la panne — j'ai réparé à côté
+      parce que je n'avais pas vérifié que l'outil était seulement PRÉSENT.
+
+    D'où un contrôle STATIQUE, sur la source : le décorateur doit être immédiatement suivi
+    de la classe. C'est la seule vérification que la fixture ne peut pas neutraliser.
+    """
+    from pathlib import Path as _P
+
+    src = (_P(__file__).resolve().parents[1] / "skills" / "logs.py").read_text(
+        encoding="utf-8"
+    )
+    lignes = src.splitlines()
+    i = next(
+        n
+        for n, ligne in enumerate(lignes)
+        if ligne.startswith('@ToolRegistry.register("logs")')
+    )
+    assert lignes[i + 1].startswith("class LogsTool"), (
+        f"le decorateur enregistre « {lignes[i + 1][:60]} » — l'outil `logs` a disparu du perimetre d'Ava"
+    )
