@@ -282,6 +282,21 @@ def _format_summary(data: dict[str, Any]) -> str:
             issues.append(detail)
 
     lines = [f"Score Avalon: {global_score}/{max_score} — {status}"]
+    # ⚠ SUR QUELLE MACHINE TOURNE LE CONTROL PLANE — et ce n'est pas un détail décoratif.
+    #   Mesuré le 2026-08-07 : interrogée TROIS fois sur « le module `ava_chat` du control
+    #   plane tourne-t-il sur ta VM ? » (faux, il tourne sur AVA), Ava a confirmé les trois
+    #   fois. Sa preuve : « l'hôte `ava` porte 41 conteneurs, c'est là que tourne ava_chat ».
+    #   Elle avait la bonne information et en tirait la mauvaise conclusion, parce que
+    #   **l'hôte s'appelle `ava` et elle s'appelle Ava**. Une règle de persona ne lève pas
+    #   une collision de noms ; une donnée explicite, si.
+    #   ⚠ La phrase dit AUSSI ce que ça implique : ses modules ne tournent pas chez elle.
+    #   Sans cette moitié, le nom seul se relirait comme un nom parmi d'autres.
+    hote_cp = str(data.get("tourne_sur") or "").strip()
+    if hote_cp:
+        lines.append(
+            f"Le control plane (et TOUS ses modules, y compris ceux qui te concernent) "
+            f"tourne sur la machine « {hote_cp} » — PAS sur ta VM."
+        )
     if issues:
         lines.append("Modules en dégradation:")
         for it in issues[:8]:
