@@ -515,12 +515,17 @@ def _handle_agent(
     original_model = agent._model
     if model:
         agent._model = model
+    trace_id: str | None = None
     try:
         if trace_store is not None:
             from openjarvis.traces.collector import TraceCollector
 
             collector = TraceCollector(agent, store=trace_store, bus=bus)
             result = collector.run(input_text, context=ctx)
+            # ⚠ On le lit APRÈS `run`, jamais avant : `last_trace` n'est renseigné
+            #   qu'une fois la trace construite et persistée.
+            _trace = collector.last_trace
+            trace_id = _trace.trace_id if _trace is not None else None
         else:
             result = agent.run(input_text, context=ctx)
     finally:
@@ -557,6 +562,7 @@ def _handle_agent(
         ],
         usage=usage,
         complexity=complexity_info,
+        trace_id=trace_id,
     )
 
 

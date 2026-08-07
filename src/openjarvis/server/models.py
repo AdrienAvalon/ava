@@ -72,6 +72,16 @@ class ChatCompletionResponse(BaseModel):
     choices: List[Choice] = Field(default_factory=list)
     usage: UsageInfo = Field(default_factory=UsageInfo)
     complexity: Optional[ComplexityInfo] = None
+    #: ⚠ L'IDENTIFIANT DE TRACE, ET C'EST LE CHAÎNON QUI MANQUAIT À TOUTE LA BOUCLE
+    #: D'APPRENTISSAGE. Mesure du 2026-08-07 : **1 trace notée sur 327**. La route
+    #: `POST /v1/feedback` existe depuis toujours et fonctionne ; le verdict machine
+    #: est riche (289 `completed`, 33 `recovered`, 2 `tool_failure`). Ce qui manquait
+    #: n'était ni le stockage, ni la route, ni l'analyse : c'est que l'identifiant ne
+    #: SORTAIT JAMAIS du processus. Personne ne pouvait noter parce que personne ne
+    #: savait quoi nommer.
+    #: ⚠ `None` quand les traces sont désactivées — jamais une chaîne vide, qui se
+    #: passerait pour un identifiant valide et produirait des 404 inexplicables.
+    trace_id: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
