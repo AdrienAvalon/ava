@@ -150,7 +150,23 @@ def _chauffage(d: dict[str, Any]) -> list[str]:
         actif = " (chauffe actuellement)" if info.get("chauffe") else ""
         ouv = info.get("ouverture")
         detail = f", vanne à {ouv} %" if isinstance(ouv, (int, float)) else ""
-        lignes.append(f"  {nom} : {etat}{actif}{detail}")
+        # ⚠ « DEPUIS QUAND », ET C'EST LA TREIZIÈME FOIS QUE CE DÉFAUT REVIENT — celle-ci
+        #   créée par moi, le même jour, en livrant le producteur sans le consommateur.
+        #   Mesure du 2026-08-07 : à « le chauffage est coupé depuis ce matin ? », Ava a
+        #   répondu « ça confirme ta remarque » alors que les vannes étaient en hors-gel
+        #   depuis QUATRE JOURS. Le control plane publie désormais `depuis_h` ; sans cette
+        #   ligne, elle continuait de répondre « je n'ai pas cette date » — mesuré aussi.
+        #   ⚠ Rendu en JOURS au-delà de 48 h : « 88,3 h » oblige le lecteur à diviser, et
+        #   c'est exactement le genre de calcul mental où l'on se trompe d'un facteur.
+        depuis = info.get("depuis_h")
+        age = ""
+        if isinstance(depuis, (int, float)) and depuis > 0:
+            age = (
+                f" depuis {depuis / 24:.0f} j"
+                if depuis >= 48
+                else f" depuis {depuis:.0f} h"
+            )
+        lignes.append(f"  {nom} : {etat}{actif}{detail}{age}")
     return lignes
 
 
