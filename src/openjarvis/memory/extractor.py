@@ -96,11 +96,11 @@ _DEFAULT_SYSTEM_PROMPT = (
 #:   (`cp_voice_token lisible en clair via file_read`). Le controle a blanc sur les faits
 #:   REELS l'a montre avant application — un filtre de purge se simule TOUJOURS d'abord.
 _NON_FAIT = re.compile(
-    r"\*\*"                                    # titre / gras markdown
-    r"|\?\s*$"                                  # une question n'est pas un fait
-    r"|\b(?:je|me|moi|ma|mon|mes)\b"            # 1re personne
-    r"|\bj[\'\u2019]\w"                          # elision : j'ai, j'extrairai, j'analyse
-    r"|\b(?:vous|votre|vos|tu|te|toi|ton|ta|tes)\b"   # 2e personne / dialogue
+    r"\*\*"  # titre / gras markdown
+    r"|\?\s*$"  # une question n'est pas un fait
+    r"|\b(?:je|me|moi|ma|mon|mes)\b"  # 1re personne
+    r"|\bj[\'\u2019]\w"  # elision : j'ai, j'extrairai, j'analyse
+    r"|\b(?:vous|votre|vos|tu|te|toi|ton|ta|tes)\b"  # 2e personne / dialogue
     r"|^(?:lire_doc|avalon_status|proposer|memoire|journal|logs|camera)\b"  # appel d'outil
     r"|^RAS\s*$",
     re.IGNORECASE,

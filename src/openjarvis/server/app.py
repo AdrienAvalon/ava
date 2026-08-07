@@ -341,9 +341,10 @@ def create_app(
     # passed to FastAPI() — see top of create_app().
     try:
         from ava_extensions.server.tts_route import router as _ava_tts_router
+
         app.include_router(_ava_tts_router)
     except ImportError as _ava_exc:  # pragma: no cover - optional
-        logger.warning('Ava TTS route not registered: %s', _ava_exc)
+        logger.warning("Ava TTS route not registered: %s", _ava_exc)
     # --- end Ava extension ---
     include_all_routes(app)
 
