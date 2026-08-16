@@ -126,11 +126,67 @@ assert hasattr(config_module.load_config, "cache_clear")
     assert result.returncode == 0, result.stderr
 
 
+def test_la_production_refuse_un_override_de_persona(tmp_path: Path) -> None:
+    persona = tmp_path / "persona.md"
+    persona.write_text("Persona mutable interdite.", encoding="utf-8")
+    config = tmp_path / "config.toml"
+    config.write_text(f'[agent]\nsystem_prompt_path = "{persona}"\n', encoding="utf-8")
+    code = f"""
+from pathlib import Path
+
+from openjarvis.core.config import load_config
+
+load_config(Path({str(config)!r}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            "AVA_BUNDLED_PERSONA_ONLY": "1",
+            "AVA_PERCEPTION": "0",
+        },
+    )
+
+    assert result.returncode != 0
+    assert "override de persona Ava interdit" in result.stderr
+
+
 def test_la_persona_embarquee_est_non_vide() -> None:
     contenu = system_prompt_loader._read_persona(
         system_prompt_loader._DEFAULT_PERSONA, configured=False
     )
     assert "Tu es **Ava**" in contenu
+
+
+def test_un_override_vide_charge_la_persona_de_la_release(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('[agent]\nsystem_prompt_path = ""\n', encoding="utf-8")
+    code = f"""
+from pathlib import Path
+
+from ava_extensions.patches.system_prompt_loader import _DEFAULT_PERSONA
+from openjarvis.core.config import load_config
+
+loaded = load_config(Path({str(config)!r}))
+persona = _DEFAULT_PERSONA.resolve()
+assert loaded.agent.system_prompt_path == ""
+assert loaded.agent.default_system_prompt == persona.read_text(encoding="utf-8").strip()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            "AVA_BUNDLED_PERSONA_ONLY": "1",
+            "AVA_PERCEPTION": "0",
+        },
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_les_configurations_injectees_restent_ava_et_non_mutantes() -> None:

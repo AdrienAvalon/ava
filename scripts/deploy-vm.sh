@@ -307,6 +307,18 @@ quote_remote() {
   printf '%q' "$1"
 }
 
+# La configuration persistante ne doit jamais decoupler la persona du code livre.
+# Avec un override vide, le loader resout sa persona depuis son propre paquet : une
+# bascule ou un rollback du lien current change donc code et identite d'un seul tenant.
+validate_runtime_policy() {
+  local expected_target=$1 q_expected_target
+  q_expected_target=$(quote_remote "$expected_target")
+  ssh_vm "set -eu
+export OPENJARVIS_NO_ANALYTICS=1 DO_NOT_TRACK=1 AVA_BUNDLED_PERSONA_ONLY=1 AVA_PERCEPTION=0 PYTHONDONTWRITEBYTECODE=1
+cd /tmp
+AVA_EXPECTED_RELEASE=$q_expected_target $q_expected_target/.venv/bin/python -I -c \"import os; from pathlib import Path; from ava_extensions.patches.system_prompt_loader import _DEFAULT_PERSONA; from openjarvis.analytics.identity import is_analytics_enabled; from openjarvis.core.config import load_config; root=Path(os.environ['AVA_EXPECTED_RELEASE']).resolve(); persona=_DEFAULT_PERSONA.resolve(); config=load_config(); assert config.agent.system_prompt_path == ''; assert persona.is_relative_to(root); assert config.agent.default_system_prompt == persona.read_text(encoding='utf-8').strip(); assert not is_analytics_enabled(config.analytics)\""
+}
+
 previous_target_is_safe() {
   local target=$1 suffix q_target
   if [[ "$target" == "$LEGACY_ROOT" ]]; then
@@ -515,8 +527,11 @@ health_check() {
   ssh_vm "set -eu
 export OPENJARVIS_NO_ANALYTICS=1 DO_NOT_TRACK=1 PYTHONDONTWRITEBYTECODE=1
 cd /tmp
-$Q_CURRENT/.venv/bin/python -I -c \"import anthropic, openjarvis_rust; from openjarvis._rust_bridge import get_rust_module; get_rust_module()\"
-$Q_CURRENT/.venv/bin/python -I -c \"from openjarvis.core.config import load_config; from openjarvis.analytics.identity import is_analytics_enabled; assert not is_analytics_enabled(load_config().analytics)\"" >/dev/null
+$Q_CURRENT/.venv/bin/python -I -c \"import anthropic, openjarvis_rust; from openjarvis._rust_bridge import get_rust_module; get_rust_module()\"" >/dev/null
+  validate_runtime_policy "$expected_target" || {
+    echo "   x persona ou politique runtime hors de la release attendue" >&2
+    return 1
+  }
 }
 
 garbage_collect_releases() {
@@ -548,19 +563,24 @@ find $Q_RELEASE_ROOT -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\\n' \
 }
 
 rollback() {
-  local rollback_ok=0 result
+  local result
   if [[ "$BOOTSTRAP_WITHOUT_PREVIOUS" -eq 1 ]]; then
     echo "   ! echec du premier demarrage : retour a aucun service actif" >&2
     result=$(ssh_vm "sudo $Q_DEADMAN_HELPER rollback --candidate $Q_RELEASE" 2>/dev/null || true)
-    if [[ "$result" == "bootstrap-stopped" ]] \
-      && ! ssh_vm "test -e $Q_CURRENT" \
-      && [[ "$(ssh_vm "systemctl is-active $Q_SERVICE" 2>/dev/null || true)" =~ ^(failed|inactive)$ ]] \
-      && [[ "$(ssh_vm "systemctl is-active openjarvis-relay.service" 2>/dev/null || true)" =~ ^(failed|inactive)$ ]] \
-      && [[ "$(ssh_vm "systemctl is-active openjarvis-relay-tls.service" 2>/dev/null || true)" =~ ^(failed|inactive)$ ]]; then
-      echo "   + bootstrap replie; candidate conservee pour diagnostic: $RELEASE_PATH" >&2
+    if [[ "$result" == "bootstrap-stopped" ]]; then
+      # Un retour positif du helper signifie que son etat root-owned ET le verrou
+      # ont deja ete retires. Les drapeaux locaux doivent le refleter avant tout
+      # controle supplementaire, meme si celui-ci echoue ensuite.
       DEADMAN_ARMED=0
       LOCK_HELD=0
-      rollback_ok=1
+      if ! ssh_vm "test -e $Q_CURRENT" \
+        && [[ "$(ssh_vm "systemctl is-active $Q_SERVICE" 2>/dev/null || true)" =~ ^(failed|inactive)$ ]] \
+        && [[ "$(ssh_vm "systemctl is-active openjarvis-relay.service" 2>/dev/null || true)" =~ ^(failed|inactive)$ ]] \
+        && [[ "$(ssh_vm "systemctl is-active openjarvis-relay-tls.service" 2>/dev/null || true)" =~ ^(failed|inactive)$ ]]; then
+        echo "   + bootstrap replie; candidate conservee pour diagnostic: $RELEASE_PATH" >&2
+      else
+        echo "   x CRITIQUE: bootstrap replie mais etat arrete non confirme; candidate conservee sans dead-man ni verrou" >&2
+      fi
     else
       echo "   x CRITIQUE: bootstrap non confirme; le dead-man distant reste autoritaire" >&2
     fi
@@ -570,19 +590,22 @@ rollback() {
   echo "   ! echec apres bascule : restauration de $PREVIOUS_TARGET" >&2
   result=$(ssh_vm "sudo $Q_DEADMAN_HELPER rollback --candidate $Q_RELEASE" 2>/dev/null || true)
   if [[ "$result" == "rolled-back" ]]; then
+    # Comme pour le bootstrap, le helper ne renvoie rolled-back qu'apres avoir
+    # supprime son etat et le verrou. Ne jamais annoncer ensuite qu'ils existent.
+    DEADMAN_ARMED=0
+    LOCK_HELD=0
     sleep "$HEALTH_DELAY_SECONDS"
     # Le helper n'efface son etat qu'apres les trois chemins HTTP. Le controle local
     # ajoute le PID/cwd, l'import Rust et la telemetrie pour ne jamais annoncer un
     # rollback sain sur la seule reponse de systemd.
     if health_check "$PREVIOUS_TARGET"; then
-      rollback_ok=1
-      DEADMAN_ARMED=0
-      LOCK_HELD=0
       echo "   + rollback confirme sur la cible precedente" >&2
+    else
+      KEEP_FAILED_CANDIDATE=1
+      echo "   x CRITIQUE: cible precedente restauree mais sante etendue non confirmee; candidate conservee sans dead-man ni verrou" >&2
     fi
-  fi
-  if [[ "$rollback_ok" -ne 1 ]]; then
-    echo "   x CRITIQUE: la cible precedente a ete restauree mais sa sante n'est pas confirmee" >&2
+  else
+    echo "   x CRITIQUE: rollback distant non confirme; le dead-man distant reste autoritaire" >&2
   fi
   SWITCHED=0
 }
@@ -764,7 +787,6 @@ export OPENJARVIS_NO_ANALYTICS=1 DO_NOT_TRACK=1 PYTHONDONTWRITEBYTECODE=1
 cd /tmp
 AVA_EXPECTED_RELEASE=$Q_RELEASE $Q_RELEASE/.venv/bin/python -I -c \"import os; from pathlib import Path; import anthropic, ava_extensions, openjarvis, openjarvis_rust; from openjarvis._rust_bridge import get_rust_module; root=Path(os.environ['AVA_EXPECTED_RELEASE']).resolve(); assert Path(openjarvis.__file__).resolve().is_relative_to(root); assert Path(ava_extensions.__file__).resolve().is_relative_to(root); get_rust_module()\"
 AVA_EXPECTED_RELEASE=$Q_RELEASE $Q_RELEASE/.venv/bin/python -I -c \"import ava_extensions.boot; from openjarvis.core.registry import ToolRegistry, TTSRegistry, SpeechRegistry; expected_tools={'avalon_status','home_assistant'}; missing=expected_tools-set(ToolRegistry.keys()); assert not missing, missing; assert 'memoire' not in ToolRegistry.keys(); assert 'kokoro-fr' in TTSRegistry.keys(); assert 'openai_ava' in SpeechRegistry.keys()\"
-$Q_RELEASE/.venv/bin/python -I -c \"from openjarvis.core.config import load_config; from openjarvis.analytics.identity import is_analytics_enabled; assert not is_analytics_enabled(load_config().analytics)\"
 AVA_RELEASE_HISTORY_FILE=$Q_REMOTE_EVOLUTIONS $Q_RELEASE/.venv/bin/python -I -c \"from ava_extensions.skills.evolutions import _lignes_git; assert _lignes_git('', 3) is not None\"
 $Q_RELEASE/.venv/bin/jarvis --help >/dev/null
 cd $Q_RELEASE
@@ -775,6 +797,9 @@ test \"\$(sha256sum -- $Q_REMOTE_WHEEL | awk '{print \$1}')\" = $WHEEL_SHA256
 test \"\$(sha256sum -- $Q_REMOTE_ATTESTATION | awk '{print \$1}')\" = $ATTESTATION_SHA256
 test \"\$(sha256sum -- $Q_REMOTE_RUST_ARCHIVE | awk '{print \$1}')\" = $RUST_TREE_SHA256
 test \"\$(sha256sum -- $Q_REMOTE_EVOLUTIONS | awk '{print \$1}')\" = $EVOLUTIONS_SHA256"
+
+  validate_runtime_policy "$RELEASE_PATH" \
+    || fatal "persona ou politique runtime hors de la candidate immuable"
 
   printf '%s\n' "$expected_manifest" | ssh_vm "cat > $Q_RELEASE/.ava-release"
   ssh_vm "set -eu
@@ -794,6 +819,9 @@ test \"\$(sha256sum -- $Q_REMOTE_WHEEL | awk '{print \$1}')\" = $WHEEL_SHA256
 test \"\$(sha256sum -- $Q_REMOTE_ATTESTATION | awk '{print \$1}')\" = $ATTESTATION_SHA256
 test \"\$(sha256sum -- $Q_REMOTE_RUST_ARCHIVE | awk '{print \$1}')\" = $RUST_TREE_SHA256
 test \"\$(sha256sum -- $Q_REMOTE_EVOLUTIONS | awk '{print \$1}')\" = $EVOLUTIONS_SHA256"
+
+  validate_runtime_policy "$RELEASE_PATH" \
+    || fatal "persona ou politique runtime hors de la release existante"
 fi
 
 titre "6/7 Bascule atomique et redemarrage"

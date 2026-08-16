@@ -56,6 +56,7 @@ class DeploymentFixture(NamedTuple):
     deadman_state: Path
     ssh_cutoff: Path
     fake_deadman: Path
+    runtime_policy_count: Path
 
 
 def _make_deployment_fixture(tmp_path: Path) -> DeploymentFixture:
@@ -151,8 +152,25 @@ def _make_deployment_fixture(tmp_path: Path) -> DeploymentFixture:
     relay_ca.write_text("test-only public CA\n")
     deadman_state = tmp_path / "deadman-state"
     ssh_cutoff = tmp_path / "ssh-cutoff"
+    runtime_policy_count = tmp_path / "runtime-policy-count"
     python_stub = tmp_path / "python-stub"
-    _write_executable(python_stub, "#!/usr/bin/env bash\nexit 0\n")
+    _write_executable(
+        python_stub,
+        """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *"config.agent.system_prompt_path == ''"* ]]; then
+  count=0
+  [[ ! -f "$FAKE_RUNTIME_POLICY_COUNT" ]] || count=$(cat "$FAKE_RUNTIME_POLICY_COUNT")
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$FAKE_RUNTIME_POLICY_COUNT"
+  if [[ -n "${FAKE_RUNTIME_POLICY_FAIL_AT:-}" \
+    && "$count" -eq "$FAKE_RUNTIME_POLICY_FAIL_AT" ]]; then
+    exit 93
+  fi
+fi
+exit 0
+""",
+    )
 
     _write_executable(
         fake_bin / "ssh",
@@ -423,6 +441,7 @@ fi
             "FAKE_SSH_CUTOFF": str(ssh_cutoff),
             "FAKE_CURL_COUNT": str(tmp_path / "curl-count"),
             "FAKE_PYTHON_STUB": str(python_stub),
+            "FAKE_RUNTIME_POLICY_COUNT": str(runtime_policy_count),
         }
     )
     return DeploymentFixture(
@@ -443,6 +462,7 @@ fi
         deadman_state=deadman_state,
         ssh_cutoff=ssh_cutoff,
         fake_deadman=fake_deadman,
+        runtime_policy_count=runtime_policy_count,
     )
 
 
@@ -717,6 +737,63 @@ def test_build_failure_keeps_legacy_and_cleans_incomplete_release(
     assert not fixture.restart_count.exists()
 
 
+def test_runtime_policy_failure_blocks_before_atomic_switch(tmp_path: Path) -> None:
+    fixture = _make_deployment_fixture(tmp_path)
+
+    result = _deploy(fixture, FAKE_RUNTIME_POLICY_FAIL_AT="1")
+
+    assert result.returncode != 0
+    assert "candidate immuable" in result.stderr
+    assert fixture.runtime_policy_count.read_text().strip() == "1"
+    assert fixture.current.resolve() == fixture.legacy
+    assert not (fixture.releases / fixture.commit).exists()
+    assert not (fixture.releases / ".deploy-lock").exists()
+    assert not fixture.restart_count.exists()
+
+
+def test_runtime_policy_failure_after_switch_rolls_back(tmp_path: Path) -> None:
+    fixture = _make_deployment_fixture(tmp_path)
+
+    result = _deploy(fixture, FAKE_RUNTIME_POLICY_FAIL_AT="2")
+
+    assert result.returncode != 0
+    assert "persona ou politique runtime" in result.stderr
+    assert "rollback confirme" in result.stderr
+    assert fixture.runtime_policy_count.read_text().strip() == "2"
+    assert fixture.current.resolve() == fixture.legacy
+    assert not (fixture.releases / fixture.commit).exists()
+    assert not (fixture.releases / ".deploy-lock").exists()
+    assert fixture.restart_count.read_text().strip() == "2"
+
+
+def test_failed_extended_check_after_completed_rollback_reports_remote_state(
+    tmp_path: Path,
+) -> None:
+    fixture = _make_deployment_fixture(tmp_path)
+    legacy_python = fixture.legacy / ".venv/bin/python"
+    _write_executable(
+        legacy_python,
+        """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *"config.agent.system_prompt_path == ''"* ]]; then
+  exit 94
+fi
+exit 0
+""",
+    )
+
+    result = _deploy(fixture, FAKE_RUNTIME_POLICY_FAIL_AT="2")
+
+    candidate = fixture.releases / fixture.commit
+    assert result.returncode != 0
+    assert fixture.current.resolve() == fixture.legacy
+    assert candidate.is_dir()
+    assert not fixture.deadman_state.exists()
+    assert not (fixture.releases / ".deploy-lock").exists()
+    assert "candidate conservee sans dead-man ni verrou" in result.stderr
+    assert "dead-man distant reste arme" not in result.stderr
+
+
 def test_failed_health_rolls_back_and_removes_candidate(tmp_path: Path) -> None:
     fixture = _make_deployment_fixture(tmp_path)
 
@@ -866,6 +943,13 @@ def test_contract_has_no_in_place_checkout_or_frontend_mutation() -> None:
     assert "openjarvis-relay.service openjarvis-relay-tls.service" in source
     assert "https://${RELAY_TLS_NAME}:8443/health" in source
     assert "--cacert $Q_RELAY_CA" in source
+    assert "config.agent.system_prompt_path == ''" in source
+    assert "AVA_BUNDLED_PERSONA_ONLY=1" in source
+    assert "persona=_DEFAULT_PERSONA.resolve()" in source
+    assert "persona.is_relative_to(root)" in source
+    assert "config.agent.default_system_prompt == persona.read_text" in source
+    assert source.count('validate_runtime_policy "$RELEASE_PATH"') == 2
+    assert 'validate_runtime_policy "$expected_target"' in source
     assert "_lignes_git('', 3) is not None" in source
     assert source.index("EVOLUTIONS_SHA256=") < source.index(
         'titre "1/7 Verrou et bootstrap'

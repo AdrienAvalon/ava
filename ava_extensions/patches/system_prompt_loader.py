@@ -2,12 +2,15 @@
 
 OpenJarvis expose ``agent.system_prompt_path`` mais le runtime principal ne le lit pas.
 Le fork utilise la persona versionnee dans ce paquet par defaut et refuse une persona
-explicitement configuree qui serait absente, vide, illisible ou symbolique.
+explicitement configuree qui serait absente, vide, illisible ou symbolique. En
+production, la politique root-owned ``AVA_BUNDLED_PERSONA_ONLY=1`` interdit tout
+override persistant.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from functools import wraps
 from pathlib import Path
@@ -18,6 +21,7 @@ _PATCH_MARKER = "_ava_system_prompt_patched"
 _DEFAULT_PERSONA = (
     Path(__file__).resolve().parents[1] / "identity" / "system_prompts" / "ava.md"
 )
+_BUNDLED_PERSONA_ONLY = os.environ.get("AVA_BUNDLED_PERSONA_ONLY") == "1"
 
 
 def _wrapper_chain(function):  # noqa: ANN001, ANN202 - wrappers dynamiques
@@ -77,6 +81,10 @@ def apply_identity(config):  # noqa: ANN001, ANN201 - schema upstream dynamique
     if agent is None:
         raise RuntimeError("schema upstream inattendu: section agent absente")
     configured_path = str(getattr(agent, "system_prompt_path", "") or "").strip()
+    if configured_path and _BUNDLED_PERSONA_ONLY:
+        raise RuntimeError(
+            "override de persona Ava interdit par la politique de la release"
+        )
     path = Path(configured_path).expanduser() if configured_path else _DEFAULT_PERSONA
     content = _read_persona(path, configured=bool(configured_path))
     agent.default_system_prompt = content
