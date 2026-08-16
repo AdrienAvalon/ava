@@ -731,7 +731,11 @@ def _validate_case(value: Any, path: str) -> dict[str, Any]:
         "continuity_all_of",
         "accuracy_all_of",
     }
-    optional_secondary = {"accuracy_any_of_groups"}
+    optional_secondary = {
+        "continuity_any_of_groups",
+        "accuracy_any_of_groups",
+        "required_secondary",
+    }
     if type(secondary) is not dict:
         raise ContractError(f"{secondary_path}: objet requis")
     secondary_keys = set(secondary)
@@ -750,30 +754,59 @@ def _validate_case(value: Any, path: str) -> dict[str, Any]:
         "accuracy_all_of",
     ):
         _string_list(secondary[key], f"{secondary_path}.{key}")
-    accuracy_groups = _list(
-        secondary.get("accuracy_any_of_groups", []),
-        f"{secondary_path}.accuracy_any_of_groups",
-    )
-    validated_groups: list[tuple[str, ...]] = []
-    for index, group in enumerate(accuracy_groups):
-        alternatives = _string_list(
-            group,
-            f"{secondary_path}.accuracy_any_of_groups[{index}]",
+    grouped_metrics: set[str] = set()
+    for metric in ("continuity", "accuracy"):
+        groups_key = f"{metric}_any_of_groups"
+        groups = _list(
+            secondary.get(groups_key, []),
+            f"{secondary_path}.{groups_key}",
         )
-        if not alternatives:
-            raise ContractError(
-                f"{secondary_path}.accuracy_any_of_groups[{index}]: "
-                "au moins une alternative requise"
+        validated_groups: list[tuple[str, ...]] = []
+        for index, group in enumerate(groups):
+            alternatives = _string_list(
+                group,
+                f"{secondary_path}.{groups_key}[{index}]",
             )
-        validated_groups.append(tuple(alternatives))
-    if len(set(validated_groups)) != len(validated_groups):
+            if not alternatives:
+                raise ContractError(
+                    f"{secondary_path}.{groups_key}[{index}]: "
+                    "au moins une alternative requise"
+                )
+            validated_groups.append(tuple(alternatives))
+        if len(set(validated_groups)) != len(validated_groups):
+            raise ContractError(f"{secondary_path}.{groups_key}: groupes dupliques")
+        if groups and secondary[f"{metric}_all_of"]:
+            raise ContractError(
+                f"{secondary_path}: {metric}_all_of et {groups_key} "
+                "ne peuvent pas etre combines"
+            )
+        if groups:
+            grouped_metrics.add(metric)
+    required_metrics = _string_list(
+        secondary.get("required_secondary", []),
+        f"{secondary_path}.required_secondary",
+    )
+    unknown_required_metrics = sorted(set(required_metrics) - set(SECONDARY_METRICS))
+    if unknown_required_metrics:
         raise ContractError(
-            f"{secondary_path}.accuracy_any_of_groups: groupes dupliques"
+            f"{secondary_path}.required_secondary: metriques inconnues "
+            f"{unknown_required_metrics}"
         )
-    if accuracy_groups and secondary["accuracy_all_of"]:
+    configured_metrics = {
+        metric
+        for metric, phrases in (
+            ("warmth", secondary["warmth_any_of"]),
+            ("wit", secondary["wit_any_of"]),
+            ("continuity", secondary["continuity_all_of"]),
+            ("accuracy", secondary["accuracy_all_of"]),
+        )
+        if phrases
+    } | grouped_metrics
+    missing_criteria = sorted(set(required_metrics) - configured_metrics)
+    if missing_criteria:
         raise ContractError(
-            f"{secondary_path}: accuracy_all_of et accuracy_any_of_groups "
-            "ne peuvent pas etre combines"
+            f"{secondary_path}.required_secondary: critere non vide requis pour "
+            f"{missing_criteria}"
         )
     return case
 

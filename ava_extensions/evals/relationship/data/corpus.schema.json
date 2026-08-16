@@ -105,9 +105,79 @@
             "warmth_any_of": {"$ref": "#/$defs/stringArray"},
             "wit_any_of": {"$ref": "#/$defs/stringArray"},
             "continuity_all_of": {"$ref": "#/$defs/stringArray"},
+            "continuity_any_of_groups": {"$ref": "#/$defs/stringGroups"},
             "accuracy_all_of": {"$ref": "#/$defs/stringArray"},
-            "accuracy_any_of_groups": {"$ref": "#/$defs/stringGroups"}
-          }
+            "accuracy_any_of_groups": {"$ref": "#/$defs/stringGroups"},
+            "required_secondary": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {"enum": ["warmth", "wit", "continuity", "accuracy"]}
+            }
+          },
+          "allOf": [
+            {
+              "not": {
+                "required": ["continuity_all_of", "continuity_any_of_groups"],
+                "properties": {
+                  "continuity_all_of": {"minItems": 1},
+                  "continuity_any_of_groups": {"minItems": 1}
+                }
+              }
+            },
+            {
+              "not": {
+                "required": ["accuracy_all_of", "accuracy_any_of_groups"],
+                "properties": {
+                  "accuracy_all_of": {"minItems": 1},
+                  "accuracy_any_of_groups": {"minItems": 1}
+                }
+              }
+            },
+            {
+              "if": {
+                "required": ["required_secondary"],
+                "properties": {"required_secondary": {"contains": {"const": "warmth"}}}
+              },
+              "then": {"properties": {"warmth_any_of": {"minItems": 1}}}
+            },
+            {
+              "if": {
+                "required": ["required_secondary"],
+                "properties": {"required_secondary": {"contains": {"const": "wit"}}}
+              },
+              "then": {"properties": {"wit_any_of": {"minItems": 1}}}
+            },
+            {
+              "if": {
+                "required": ["required_secondary"],
+                "properties": {"required_secondary": {"contains": {"const": "continuity"}}}
+              },
+              "then": {
+                "anyOf": [
+                  {"properties": {"continuity_all_of": {"minItems": 1}}},
+                  {
+                    "required": ["continuity_any_of_groups"],
+                    "properties": {"continuity_any_of_groups": {"minItems": 1}}
+                  }
+                ]
+              }
+            },
+            {
+              "if": {
+                "required": ["required_secondary"],
+                "properties": {"required_secondary": {"contains": {"const": "accuracy"}}}
+              },
+              "then": {
+                "anyOf": [
+                  {"properties": {"accuracy_all_of": {"minItems": 1}}},
+                  {
+                    "required": ["accuracy_any_of_groups"],
+                    "properties": {"accuracy_any_of_groups": {"minItems": 1}}
+                  }
+                ]
+              }
+            }
+          ]
         }
       }
     }

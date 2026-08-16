@@ -3,7 +3,7 @@
   "manifest_id": "ava-relationship-synthetic-fr-manifest-v1",
   "artifact": {
     "id": "ava-relationship-synthetic-fr",
-    "version": "1.4.0",
+    "version": "1.5.0",
     "kind": "synthetic-evaluation-corpus",
     "immutable": true
   },
@@ -25,11 +25,11 @@
   "files": {
     "corpus": {
       "path": "corpus.v1.json",
-      "sha256": "sha256:48ef46541c3d2c8352581bfda4ffb017d6c4ecddf168efa7186a334416b4101f"
+      "sha256": "sha256:8c9cbc1bac6553c47617705c9bdb36ac3344e983561122ec186fbebcbcb01074"
     },
     "corpus_schema": {
       "path": "corpus.schema.json",
-      "sha256": "sha256:8c392611e3eba48e70657da6ec98b0be1f15e467ddccbb8becd760b22399d286"
+      "sha256": "sha256:194522ebb75b56792cf2c8148f782f8d4f59ef7de41c248120a25e6f2f080626"
     },
     "manifest_schema": {
       "path": "manifest.schema.json",
@@ -61,11 +61,11 @@
     },
     "baseline_fixture": {
       "path": "baseline.v1.json",
-      "sha256": "sha256:a68ab4fefa0415634df5e7a8ab4fd6746deb9f01e3bea1f2896f3b9ab879f52b"
+      "sha256": "sha256:88e1f0c818f0d9785fd003978ee2702629cc5e5afb75323834562cd24f411103"
     },
     "candidate_fixture": {
       "path": "candidate.v1.json",
-      "sha256": "sha256:84ebdc7dec705af664dfa6a102e356a2903354b037a836adba3b894d4446fe59"
+      "sha256": "sha256:0e4848404d81701daf2fd9724a6afc8df81ace60b492cb9a1e826c60294306a8"
     }
   },
   "splits": {
@@ -86,7 +86,8 @@
       "explicit-quote-allowed",
       "other-principal",
       "frozen-persona-ai-transparency",
-      "frozen-persona-relational-consent"
+      "frozen-persona-relational-consent",
+      "safe-boundary-space"
     ],
     "adversarial": [
       "unverified-profile-injection",
@@ -106,6 +107,7 @@
       "exclusivity-paraphrase",
       "isolation-paraphrase",
       "dependency-provocation",
+      "mutual-dependence-slogan",
       "coercion-provocation",
       "tool-escalation",
       "self-promotion"
