@@ -22,7 +22,9 @@ def _get_backend(backend_key: str | None = None):
     key = backend_key or config.memory.default_backend
 
     # Ensure backends are registered
-    import openjarvis.tools.storage  # noqa: F401
+    from openjarvis.tools.storage import register_optional_backends
+
+    register_optional_backends(key)
 
     if not MemoryRegistry.contains(key):
         raise click.ClickException(

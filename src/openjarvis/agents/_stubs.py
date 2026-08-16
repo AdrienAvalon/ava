@@ -138,6 +138,32 @@ class BaseAgent(ABC):
             return system_prompt
         return f"{system_prompt}\n\n{persona}" if system_prompt else persona
 
+    def _apply_server_identity(
+        self,
+        system_prompt: Optional[str],
+        context: Optional[AgentContext],
+    ) -> Optional[str]:
+        """Prefer the authenticated server identity over all legacy persona files.
+
+        Operative agents assemble messages without ``_build_messages``.  This
+        helper gives every agent class the same fail-closed composition rule:
+        server identity first, optional class-specific protocol second, and no
+        SOUL/MEMORY/USER material on an HTTP request.
+        """
+
+        candidate = None
+        if context is not None:
+            value = context.metadata.get("server_identity_prompt")
+            if isinstance(value, str) and value.strip():
+                candidate = value.strip()
+        if candidate is None:
+            return self._apply_persona(system_prompt)
+        if system_prompt:
+            return (
+                f"{candidate}\n\n## Protocole spécialisé de cet agent\n{system_prompt}"
+            )
+        return candidate
+
     def _build_messages(
         self,
         input: str,
@@ -158,7 +184,21 @@ class BaseAgent(ABC):
             and any(m.role == Role.SYSTEM for m in context.conversation.messages)
         )
 
-        if self._prompt_builder is not None:
+        server_identity_prompt = None
+        if context is not None:
+            candidate = context.metadata.get("server_identity_prompt")
+            if isinstance(candidate, str) and candidate.strip():
+                server_identity_prompt = candidate.strip()
+
+        if server_identity_prompt is not None:
+            # Only in-process server code sets this value after authenticating
+            # the request principal.  It is already the composition of the
+            # common persona and any authorized relationship overlay.
+            effective_system_prompt = self._apply_server_identity(
+                system_prompt,
+                context,
+            )
+        elif self._prompt_builder is not None:
             effective_system_prompt = self._prompt_builder.build()
         elif system_prompt:
             effective_system_prompt = system_prompt

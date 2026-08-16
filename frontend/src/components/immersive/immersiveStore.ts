@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { OIDC_AUTHORITY, OIDC_CLIENT_ID } from '../auth/oidcIdentity';
 import type { ImmersiveState } from './immersiveStates';
 
 export interface CognitiveSignals {
@@ -129,12 +130,9 @@ const MAX_LIGNES = 400;
  *   multi-agent. Elle valait `'ava.transcript.v1'`, une constante GLOBALE : le
  *   cloisonnement serveur était donc **court-circuité côté client**.
  *
- *   Scénario démontré par l'audit, sur la tablette ou le poste partagé de la maison :
- *   Adrien converse (présence des personnes, état de l'infra) → l'historique va sur le
- *   disque du navigateur. Aurélie se connecte dans le même profil ; son historique
- *   serveur est vide, donc l'hydratation abandonne — et elle voit toute la conversation
- *   d'Adrien, étiquetée « ⌈ ADRIEN ⌉ ». Pire : sa première question part au modèle avec
- *   les 40 derniers tours d'Adrien en contexte.
+ *   Scénario démontré par l'audit, sur un navigateur partagé : une personne converse,
+ *   puis une autre ouvre la même interface. Une clé globale exposerait le premier
+ *   transcript et l'enverrait au modèle avec la première question du compte suivant.
  *
  *   ⚠ Aggravant relevé par l'audit : les jetons OIDC vivent en `sessionStorage` (perdus
  *   à la fermeture de l'onglet) alors que le transcript est en `localStorage`. Les deux
@@ -144,20 +142,19 @@ const MAX_LIGNES = 400;
  * ⚠ SANS IDENTITÉ, ON NE PERSISTE RIEN. Écrire dans un seau commun est exactement la
  *   faute déjà corrigée côté serveur (`conversation.py` rend `None` au lieu d'« anonyme »).
  */
-function cleStockage(): string | null {
+export function cleStockage(): string | null {
   try {
-    for (let i = 0; i < sessionStorage.length; i++) {
-      const cle = sessionStorage.key(i);
-      if (!cle || !cle.startsWith('oidc.user:')) continue;
-      const brut = sessionStorage.getItem(cle);
-      if (!brut) continue;
-      const jeton: string = JSON.parse(brut)?.id_token || '';
-      const corps = jeton.split('.')[1];
-      if (!corps) continue;
-      const charge = JSON.parse(atob(corps.replace(/-/g, '+').replace(/_/g, '/')));
-      const sub = charge?.sub || charge?.preferred_username;
-      if (sub) return `ava.transcript.v2:${sub}`;
-    }
+    const oidcKey = `oidc.user:${OIDC_AUTHORITY}:${OIDC_CLIENT_ID}`;
+    const brut = sessionStorage.getItem(oidcKey);
+    if (!brut) return null;
+    const jeton: string = JSON.parse(brut)?.id_token || '';
+    const corps = jeton.split('.')[1];
+    if (!corps) return null;
+    const base64 = corps.replace(/-/g, '+').replace(/_/g, '/');
+    const rembourrage = '='.repeat((4 - (base64.length % 4)) % 4);
+    const charge = JSON.parse(atob(`${base64}${rembourrage}`));
+    const sub = charge?.sub;
+    if (sub) return `ava.transcript.v2:${sub}`;
   } catch {
     /* stockage indisponible ou jeton illisible */
   }
@@ -199,9 +196,9 @@ function sauverTranscript(lignes: TurnLine[]): void {
  *   message. C'est la moitié invisible de la demande « que l'historique survive et
  *   qu'Ava s'en serve ».
  *
- * ⚠ Les lignes `system` sont ÉCARTÉES : ce sont des messages d'erreur affichés à
- *   l'utilisateur (« Erreur réseau… »), pas des tours de conversation. Les renvoyer au
- *   modèle lui ferait croire qu'il a produit ces phrases.
+ * ⚠ Seules les paires adjacentes `user` → `ava` sont rejouées. Une ligne `system`
+ *   signale notamment un échec, et une question restée sans réponse après erreur,
+ *   abandon ou fermeture ne doit jamais réentrer dans le contexte au rechargement.
  *
  * ⚠ Plafond à 40 tours : au-delà, le contexte renvoyé à chaque requête coûterait plus
  *   cher que la conversation elle-même — et les tours anciens n'aident plus. Le
@@ -209,13 +206,19 @@ function sauverTranscript(lignes: TurnLine[]): void {
  *   ne l'est pas.
  */
 export function chargerHistoriqueModele(): { role: 'user' | 'assistant'; content: string }[] {
-  return chargerTranscript()
-    .filter((l) => l.role === 'user' || l.role === 'ava')
-    .slice(-40)
-    .map((l) => ({
-      role: l.role === 'ava' ? ('assistant' as const) : ('user' as const),
-      content: l.text,
-    }));
+  const lignes = chargerTranscript();
+  const paires: { role: 'user' | 'assistant'; content: string }[] = [];
+  for (let index = 0; index + 1 < lignes.length; index += 1) {
+    const question = lignes[index];
+    const reponse = lignes[index + 1];
+    if (question.role !== 'user' || reponse.role !== 'ava') continue;
+    paires.push(
+      { role: 'user', content: question.text },
+      { role: 'assistant', content: reponse.text },
+    );
+    index += 1;
+  }
+  return paires.slice(-40);
 }
 
 let compteur = 0;

@@ -1,14 +1,166 @@
 import { useEffect, useRef } from 'react';
 import { chargerHistoriqueModele, useImmersiveStore } from './immersiveStore';
-import { ajouterConversation, lireConversation } from './memoireServeur';
+import { entetesIdentite, lireConversation } from './memoireServeur';
 import { brancherAnalyseur, relacherAnalyseur } from './voixAmplitude';
 
-interface Message {
+export interface Message {
   role: 'user' | 'assistant' | 'system';
   content: string;
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+export interface HydrationGate {
+  wait: () => Promise<void>;
+  complete: () => void;
+}
+
+/**
+ * A one-shot barrier between server-history hydration and the first chat send.
+ * Both a successful read and an explicit failure release it; a slow read does
+ * not get to overwrite a message that was already appended locally.
+ */
+export function createHydrationGate(): HydrationGate {
+  let completed = false;
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  return {
+    wait: () => pending,
+    complete: () => {
+      if (completed) return;
+      completed = true;
+      release();
+    },
+  };
+}
+
+export const TURN_ID_HEADER = 'X-Ava-Turn-Id';
+const CHAT_RETRY_DELAYS_MS = [200, 700] as const;
+const MAX_RETRY_AFTER_MS = 10_000;
+
+type ChatFetch = (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+) => Promise<Response>;
+
+class NonRetryableChatError extends Error {}
+
+function delaiRetryAfter(response: Response): number {
+  const valeur = response.headers?.get('Retry-After');
+  if (!valeur) return 0;
+  const secondes = Number(valeur);
+  if (!Number.isFinite(secondes) || secondes < 0) return 0;
+  return Math.min(secondes * 1_000, MAX_RETRY_AFTER_MS);
+}
+
+async function attendreRetry(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+  await new Promise<void>((resolve, reject) => {
+    const timer = globalThis.setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      globalThis.clearTimeout(timer);
+      reject(new DOMException('Aborted', 'AbortError'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+export function creerTurnId(): string {
+  return globalThis.crypto.randomUUID();
+}
+
+export interface DurableChatOptions {
+  messages: Message[];
+  turnId: string;
+  signal: AbortSignal;
+  model?: string;
+  maxTokens?: number;
+  fetchImpl?: ChatFetch;
+  retryDelaysMs?: readonly number[];
+  waitImpl?: (ms: number, signal: AbortSignal) => Promise<void>;
+}
+
+/**
+ * Call the server with one stable turn id until the committed answer is observed.
+ * A response lost after the server commit is replayed from SQLite on the next attempt,
+ * so retries never require a second durable write or a second successful model answer.
+ */
+export async function demanderChatDurable({
+  messages,
+  turnId,
+  signal,
+  model = MODEL,
+  maxTokens = MAX_TOKENS,
+  fetchImpl = fetch,
+  retryDelaysMs = CHAT_RETRY_DELAYS_MS,
+  waitImpl = attendreRetry,
+}: DurableChatOptions): Promise<string> {
+  const headers = entetesIdentite({
+    'Content-Type': 'application/json',
+    [TURN_ID_HEADER]: turnId,
+  });
+  const body = JSON.stringify({
+    model,
+    messages,
+    stream: false,
+    max_tokens: maxTokens,
+  });
+  let lastError: unknown = new Error('Ava chat failed');
+
+  for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
+    let waitMs = retryDelaysMs[attempt] ?? 0;
+    try {
+      const response = await fetchImpl('/v1/chat/completions', {
+        method: 'POST',
+        headers,
+        signal,
+        body,
+      });
+      if (!response.ok) {
+        const error = new Error(`HTTP ${response.status}`);
+        if (response.status === 425 || response.status === 429) {
+          waitMs = Math.max(waitMs, delaiRetryAfter(response));
+        } else if (response.status < 500) {
+          throw new NonRetryableChatError(error.message);
+        }
+        throw error;
+      }
+      const data = await response.json();
+      const content: string = data?.choices?.[0]?.message?.content ?? '';
+      if (!content) throw new Error('réponse durable vide');
+      return content;
+    } catch (error) {
+      if ((error as Error)?.name === 'AbortError') throw error;
+      if (error instanceof NonRetryableChatError) throw error;
+      lastError = error;
+      if (attempt >= retryDelaysMs.length) break;
+      await waitImpl(waitMs, signal);
+    }
+  }
+  // A final 425 deliberately remains unresolved: the server still owns the pending
+  // key and will never regenerate it automatically. Reload/reconciliation can recover
+  // a later commit; sending a different UUID is a new action, not a retry of this one.
+  throw lastError;
+}
+
+/**
+ * Add a turn to the model context only after the server has durably acknowledged it.
+ * Failed or aborted questions remain visible in the UI transcript but can never leak
+ * into the next model request as an unanswered user message.
+ */
+export async function completerTourDurable(
+  history: Message[],
+  userText: string,
+  request: (messages: Message[]) => Promise<string>,
+): Promise<string> {
+  const userMessage: Message = { role: 'user', content: userText };
+  const assistantText = await request([...history, userMessage]);
+  history.push(userMessage, { role: 'assistant', content: assistantText });
+  return assistantText;
+}
 
 /**
  * ⚠ LE MODÈLE EST CODÉ EN DUR ICI, ET C'EST UN PIÈGE COÛTEUX (constaté le 2026-08-04).
@@ -33,7 +185,8 @@ const MAX_TOKENS = 800;
 /**
  * ⚠ LA VOIX D'AVA REPASSE EN SOUVERAIN (2026-08-04). Ces deux constantes valaient
  * `openai_tts` / `nova` : **chaque phrase prononcée par Ava était POSTée chez OpenAI** —
- * y compris « Adrien est présent, Aurélie est absente » ou l'état de l'infrastructure,
+ * y compris « une personne est présente, une autre est absente » ou l'état de
+ * l'infrastructure,
  * c'est-à-dire exactement les données que `conversation.py` qualifie de personnelles et
  * que la persona d'Ava lui prescrit de ne pas laisser fuir vers un cloud tiers.
  *
@@ -217,6 +370,7 @@ export function useDaemonChat() {
    */
   const history = useRef<Message[]>(chargerHistoriqueModele() as Message[]);
   const abortCtrl = useRef<AbortController | null>(null);
+  const hydrationGate = useRef<HydrationGate>(createHydrationGate());
 
   /**
    * ⚠ HYDRATATION DEPUIS LE SERVEUR — c'est ce qui rend la mémoire d'Ava indépendante du
@@ -237,51 +391,40 @@ export function useDaemonChat() {
 
   useEffect(() => {
     let annule = false;
-    lireConversation().then((lignes) => {
-      // ⚠ `null` = serveur muet → on garde le cache. `[]` = le serveur AFFIRME qu'il n'y
-      //   a pas d'historique → on vide, y compris le contexte modèle. Confondre les deux
-      //   faisait hériter un nouvel utilisateur de la conversation du précédent.
-      if (annule || lignes === null) return;
-      const s = useImmersiveStore.getState();
-      s.hydraterDepuisServeur(
-        lignes.map((l, i) => ({
-          id: -(lignes.length - i), // ids négatifs : jamais en collision avec le compteur local
-          role: (l.role === 'assistant' ? 'ava' : l.role) as 'user' | 'ava' | 'system',
-          text: l.texte,
-          at: new Date(l.horodatage * 1000).toLocaleTimeString('fr-FR', {
-            hour: '2-digit', minute: '2-digit',
-          }),
-        })),
-      );
-      history.current = chargerHistoriqueModele() as Message[];
-    });
-    return () => { annule = true; };
+    const gate = hydrationGate.current;
+    void (async () => {
+      try {
+        const lignes = await lireConversation();
+        // ⚠ `null` = serveur muet → on garde le cache. `[]` = le serveur AFFIRME qu'il n'y
+        //   a pas d'historique → on vide, y compris le contexte modèle. Confondre les deux
+        //   faisait hériter un nouvel utilisateur de la conversation du précédent.
+        if (annule || lignes === null) return;
+        const s = useImmersiveStore.getState();
+        s.hydraterDepuisServeur(
+          lignes.map((l, i) => ({
+            id: -(lignes.length - i), // ids négatifs : jamais en collision avec le compteur local
+            role: (l.role === 'assistant' ? 'ava' : l.role) as 'user' | 'ava' | 'system',
+            text: l.texte,
+            at: new Date(l.horodatage * 1000).toLocaleTimeString('fr-FR', {
+              hour: '2-digit', minute: '2-digit',
+            }),
+          })),
+        );
+        history.current = chargerHistoriqueModele() as Message[];
+      } finally {
+        // Success, empty history, HTTP failure and network failure all make an
+        // explicit decision before the first request can consume history.current.
+        gate.complete();
+      }
+    })();
+    return () => {
+      annule = true;
+      gate.complete();
+    };
   }, []);
   const inFlight = useRef(false);
   const currentSource = useRef<AudioBufferSourceNode | null>(null);
   const mutedRef = useRef(false);
-  // Persona loaded once from /v1/ava/persona — injected as a system message
-  // because OpenJarvis's streaming /v1/chat/completions path does not apply
-  // the agent's configured system prompt.
-  const personaRef = useRef<string | null>(null);
-  const personaPromise = useRef<Promise<string> | null>(null);
-
-  function loadPersona(): Promise<string> {
-    if (personaRef.current !== null) return Promise.resolve(personaRef.current);
-    if (personaPromise.current) return personaPromise.current;
-    personaPromise.current = fetch('/v1/ava/persona')
-      .then((r) => (r.ok ? r.json() : { system_prompt: '' }))
-      .then((d) => {
-        const text = (d?.system_prompt as string) || '';
-        personaRef.current = text;
-        return text;
-      })
-      .catch(() => {
-        personaRef.current = '';
-        return '';
-      });
-    return personaPromise.current;
-  }
 
   function setMuted(muted: boolean) {
     mutedRef.current = muted;
@@ -294,6 +437,12 @@ export function useDaemonChat() {
   async function ask(userText: string) {
     if (!userText.trim() || inFlight.current) return;
     inFlight.current = true;
+
+    // The first message must not race the asynchronous replacement of
+    // history.current by the server history. A failed hydration still
+    // releases this gate explicitly and preserves the local cache.
+    await hydrationGate.current.wait();
+    if (!inFlight.current) return; // reset/unmount while hydration was pending
 
     abortCtrl.current?.abort();
     abortCtrl.current = new AbortController();
@@ -317,21 +466,12 @@ export function useDaemonChat() {
     s.setState('thinking');
     s.setCognitive({
       intent: 'processing',
-      focus: 'adrien',
+      focus: 'interlocuteur',
       tool: null,
       reflection: `${Math.floor(history.current.length / 2)} tours retenus`,
       tone: 'attentive',
       memory: `${history.current.length} messages`,
     });
-
-    history.current.push({ role: 'user', content: userText });
-
-    // Build the messages array sent to the daemon. Prepend the persona as a
-    // system message if available (streaming path does not auto-inject it).
-    const persona = await loadPersona();
-    const messages = persona
-      ? [{ role: 'system' as const, content: persona }, ...history.current]
-      : [...history.current];
 
     // Sentence speech pipeline
     // Kokoro is CPU-bound — parallel synthesis saturates the backend and makes
@@ -389,7 +529,7 @@ export function useDaemonChat() {
        *   étaient enregistrés, répondaient parfaitement quand on les appelait
        *   directement… et n'étaient jamais proposés au modèle.
        *   Mesuré après bascule : « 97/100, deux points qui grattent : ansible… grafana… »
-       *   et « il fait 26,7 °C dehors, Adrien et Aurélie sont présents ».
+       *   et « il fait 26,7 °C dehors, deux personnes sont présentes ».
        *
        * ⚠ CE QUE ÇA COÛTE, ASSUMÉ : plus d'affichage token par token. La réponse arrive
        *   d'un bloc, après ~19 s quand un outil est appelé. C'est le bon compromis : une
@@ -401,27 +541,18 @@ export function useDaemonChat() {
        *   retour en arrière serait une Ava redevenue amnésique sur son environnement,
        *   sans qu'aucune erreur n'apparaisse nulle part.
        */
-      const resp = await fetch('/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal,
-        body: JSON.stringify({
-          model: MODEL,
-          messages,
-          stream: false,
-          max_tokens: MAX_TOKENS,
-        }),
-      });
-
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-
-      // ── Réponse non-streamée : un seul objet JSON ────────────────────────────────
-      const data = await resp.json();
-      const contenu: string = data?.choices?.[0]?.message?.content ?? '';
-      if (contenu) {
+      const turnId = creerTurnId();
+      // Identity and the private overlay are server-owned. The client contributes
+      // only a stable idempotency key; it enters model history only after the same
+      // HTTP response has been committed under the verified principal.
+      assembled = await completerTourDurable(
+        history.current,
+        userText,
+        (messages) => demanderChatDurable({ messages, turnId, signal }),
+      );
+      if (assembled) {
         s.setState('speaking');
         s.setUserMsg('');
-        assembled = contenu;
         s.setAvaMsg(assembled);
         s.streamAva(assembled);
         // Le texte arrive d'un bloc : on découpe pour que le TTS parle par phrases
@@ -434,7 +565,7 @@ export function useDaemonChat() {
         //   dérive d'un caractère par séparateur, et **cumule**.
         //
         //   Mesuré sur une vraie réponse d'Ava :
-        //     « Il fait 26,7 degrés dehors.⏎⏎Adrien est présent…⏎⏎La baie serveur… »
+        //     « Il fait 26,7 degrés dehors.⏎⏎Une personne est présente…⏎⏎La baie serveur… »
         //     newEnd = 67, join(' ').length = 64
         //     → Ava prononçait « . La baie serveur tire 738 watts » — donc un point
         //       isolé, puis la répétition de la fin de la phrase précédente.
@@ -446,15 +577,8 @@ export function useDaemonChat() {
         if (reste) enqueueSentence(reste);
       }
       if (assembled) {
-        history.current.push({ role: 'assistant', content: assembled });
-        // ⚠ On persiste les DEUX lignes en un seul appel : la question et la réponse
-        //   forment un tour. Les envoyer séparément laisserait, en cas de coupure entre
-        //   les deux, une question sans réponse dans la mémoire d'Ava — elle croirait
-        //   n'avoir jamais répondu.
-        ajouterConversation([
-          { role: 'user', texte: userText },
-          { role: 'assistant', texte: assembled },
-        ]);
+        // The server persisted the pair before returning it. There is deliberately
+        // no second frontend POST: it would reintroduce the close/retry race.
       } else {
         // ⚠ Une réponse vide doit se VOIR. Sans ce cas, l'interface resterait figée sur
         //   « réfléchit » sans rien afficher, et l'on croirait à un blocage réseau.

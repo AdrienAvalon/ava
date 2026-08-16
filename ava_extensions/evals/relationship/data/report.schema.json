@@ -1,0 +1,269 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ava:relationship:report:v1",
+  "title": "Rapport reproductible du banc relationnel Ava v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "artifact_class", "canonical_knowledge", "automatic_promotion",
+    "human_review_required", "independent_review_required", "external_anchor_required",
+    "externally_anchored", "reproducible", "inputs", "evaluator", "gate_policy",
+    "baseline", "candidate", "comparison", "promotion"
+  ],
+  "properties": {
+    "schema_version": {"const": "ava.relationship.report/v1"},
+    "artifact_class": {"const": "evaluation-evidence-only"},
+    "canonical_knowledge": {"const": false},
+    "automatic_promotion": {"const": false},
+    "human_review_required": {"const": true},
+    "independent_review_required": {"const": true},
+    "external_anchor_required": {"const": true},
+    "externally_anchored": {"type": "boolean"},
+    "reproducible": {"const": true},
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifest_sha256", "corpus_sha256", "baseline_sha256", "candidate_sha256", "evaluator_sha256"],
+      "properties": {
+        "manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "corpus_sha256": {"$ref": "#/$defs/sha256"},
+        "baseline_sha256": {"$ref": "#/$defs/sha256"},
+        "candidate_sha256": {"$ref": "#/$defs/sha256"},
+        "evaluator_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "evaluator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version"],
+      "properties": {
+        "id": {"const": "ava.relationship.deterministic"},
+        "version": {"type": "string", "minLength": 1}
+      }
+    },
+    "gate_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "non_compensable"],
+      "properties": {
+        "required": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "non_compensable": {"const": true}
+      }
+    },
+    "baseline": {"$ref": "#/$defs/summary"},
+    "candidate": {"$ref": "#/$defs/summary"},
+    "comparison": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_gate_pass", "candidate_regression_free", "new_gate_failures", "resolved_gate_failures",
+        "secondary_delta_ppm", "secondary_regressions"
+      ],
+      "properties": {
+        "candidate_gate_pass": {"type": "boolean"},
+        "candidate_regression_free": {"type": "boolean"},
+        "new_gate_failures": {"$ref": "#/$defs/failureList"},
+        "resolved_gate_failures": {"$ref": "#/$defs/failureList"},
+        "secondary_delta_ppm": {"$ref": "#/$defs/metricNumbers"},
+        "secondary_regressions": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/secondaryRegression"}
+        }
+      }
+    },
+    "promotion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "review_statement_sha256", "eligible_for_adjudication", "adjudication_complete",
+        "eligible_for_promotion", "human_adjudication_sha256", "independent_adjudication_sha256",
+        "external_anchor_sha256", "promoted", "decision", "rollback_reference"
+      ],
+      "properties": {
+        "review_statement_sha256": {"$ref": "#/$defs/sha256"},
+        "eligible_for_adjudication": {"type": "boolean"},
+        "adjudication_complete": {"type": "boolean"},
+        "eligible_for_promotion": {"type": "boolean"},
+        "human_adjudication_sha256": {"$ref": "#/$defs/nullableSha256"},
+        "independent_adjudication_sha256": {"$ref": "#/$defs/nullableSha256"},
+        "external_anchor_sha256": {"$ref": "#/$defs/nullableSha256"},
+        "promoted": {"const": false},
+        "decision": {"const": "not-performed"},
+        "rollback_reference": {"type": "string", "minLength": 1}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"externally_anchored": {"const": true}}},
+      "then": {
+        "properties": {
+          "promotion": {
+            "properties": {
+              "adjudication_complete": {"const": true},
+              "human_adjudication_sha256": {"$ref": "#/$defs/sha256"},
+              "independent_adjudication_sha256": {"$ref": "#/$defs/sha256"},
+              "external_anchor_sha256": {"$ref": "#/$defs/sha256"}
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "promotion": {
+            "properties": {
+              "adjudication_complete": {"const": false},
+              "eligible_for_promotion": {"const": false},
+              "human_adjudication_sha256": {"type": "null"},
+              "independent_adjudication_sha256": {"type": "null"},
+              "external_anchor_sha256": {"type": "null"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "promotion": {
+            "properties": {"eligible_for_promotion": {"const": true}}
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "externally_anchored": {"const": true},
+          "promotion": {
+            "properties": {
+              "eligible_for_adjudication": {"const": true},
+              "adjudication_complete": {"const": true}
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "nullableSha256": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/sha256"}
+      ]
+    },
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_id", "gate_id"],
+      "properties": {
+        "case_id": {"type": "string", "minLength": 1},
+        "gate_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "failureList": {"type": "array", "items": {"$ref": "#/$defs/failure"}},
+    "metricNumbers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["warmth", "continuity", "accuracy"],
+      "properties": {
+        "warmth": {"type": "integer"},
+        "continuity": {"type": "integer"},
+        "accuracy": {"type": "integer"}
+      }
+    },
+    "metricCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["passed", "eligible", "rate_ppm"],
+      "properties": {
+        "passed": {"type": "integer", "minimum": 0},
+        "eligible": {"type": "integer", "minimum": 0},
+        "rate_ppm": {"type": "integer", "minimum": 0, "maximum": 1000000}
+      }
+    },
+    "secondaryRegression": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_id", "metric"],
+      "properties": {
+        "case_id": {"type": "string", "minLength": 1},
+        "metric": {"enum": ["warmth", "continuity", "accuracy"]}
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["warmth", "continuity", "accuracy"],
+      "properties": {
+        "warmth": {"$ref": "#/$defs/metricCounts"},
+        "continuity": {"$ref": "#/$defs/metricCounts"},
+        "accuracy": {"$ref": "#/$defs/metricCounts"}
+      }
+    },
+    "gateResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["passed", "evidence_codes"],
+      "properties": {
+        "passed": {"type": "boolean"},
+        "evidence_codes": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope_leakage", "wrong_principal", "deceptive_humanity", "deceptive_emotion", "jealousy", "guilt",
+        "exclusivity", "isolation", "dependency", "coercion", "tool_escalation", "false_memory"
+      ],
+      "properties": {
+        "scope_leakage": {"$ref": "#/$defs/gateResult"},
+        "wrong_principal": {"$ref": "#/$defs/gateResult"},
+        "deceptive_humanity": {"$ref": "#/$defs/gateResult"},
+        "deceptive_emotion": {"$ref": "#/$defs/gateResult"},
+        "jealousy": {"$ref": "#/$defs/gateResult"},
+        "guilt": {"$ref": "#/$defs/gateResult"},
+        "exclusivity": {"$ref": "#/$defs/gateResult"},
+        "isolation": {"$ref": "#/$defs/gateResult"},
+        "dependency": {"$ref": "#/$defs/gateResult"},
+        "coercion": {"$ref": "#/$defs/gateResult"},
+        "tool_escalation": {"$ref": "#/$defs/gateResult"},
+        "false_memory": {"$ref": "#/$defs/gateResult"}
+      }
+    },
+    "secondary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["warmth", "continuity", "accuracy"],
+      "properties": {
+        "warmth": {"type": ["boolean", "null"]},
+        "continuity": {"type": ["boolean", "null"]},
+        "accuracy": {"type": ["boolean", "null"]}
+      }
+    },
+    "caseResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_id", "split", "response_sha256", "gates", "secondary"],
+      "properties": {
+        "case_id": {"type": "string", "minLength": 1},
+        "split": {"enum": ["development", "holdout", "adversarial"]},
+        "response_sha256": {"$ref": "#/$defs/sha256"},
+        "gates": {"$ref": "#/$defs/gates"},
+        "secondary": {"$ref": "#/$defs/secondary"}
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_sha256", "gate_pass", "gate_failures", "secondary_metrics", "cases"],
+      "properties": {
+        "artifact_sha256": {"$ref": "#/$defs/sha256"},
+        "gate_pass": {"type": "boolean"},
+        "gate_failures": {"$ref": "#/$defs/failureList"},
+        "secondary_metrics": {"$ref": "#/$defs/metrics"},
+        "cases": {"type": "array", "items": {"$ref": "#/$defs/caseResult"}}
+      }
+    }
+  }
+}

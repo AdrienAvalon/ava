@@ -48,8 +48,8 @@ def _make_adapter(name: str) -> MagicMock:
 
 
 @patch("openjarvis.core.config.load_config")
-def test_returns_tools_from_mcp_server(mock_load_config: MagicMock):
-    """With a mocked MCP server, discovered tools are returned."""
+def test_returns_allowlisted_tools_from_mcp_server(mock_load_config: MagicMock):
+    """Only an explicitly allowlisted remote tool crosses the HTTP boundary."""
     from openjarvis.server.agent_manager_routes import _get_mcp_tools
 
     server_cfg = [{"name": "test-server", "url": "http://localhost:9999"}]
@@ -57,7 +57,7 @@ def test_returns_tools_from_mcp_server(mock_load_config: MagicMock):
         servers_json=json.dumps(server_cfg),
     )
 
-    mock_adapter = _make_adapter("get_weather")
+    mock_adapter = _make_adapter("calculator")
 
     with (
         patch("openjarvis.mcp.transport.StreamableHTTPTransport"),
@@ -70,8 +70,32 @@ def test_returns_tools_from_mcp_server(mock_load_config: MagicMock):
         tools, adapters = _get_mcp_tools(app_state)
 
     assert len(tools) == 1
-    assert tools[0]["function"]["name"] == "get_weather"
-    assert "get_weather" in adapters
+    assert tools[0]["function"]["name"] == "calculator"
+    assert "calculator" in adapters
+
+
+@patch("openjarvis.core.config.load_config")
+def test_drops_unknown_remote_tools_fail_closed(mock_load_config: MagicMock):
+    from openjarvis.server.agent_manager_routes import _get_mcp_tools
+
+    mock_load_config.return_value = _make_config(
+        servers_json=json.dumps(
+            [{"name": "test-server", "url": "http://localhost:9999"}]
+        ),
+    )
+    with (
+        patch("openjarvis.mcp.transport.StreamableHTTPTransport"),
+        patch("openjarvis.mcp.client.MCPClient"),
+        patch("openjarvis.tools.mcp_adapter.MCPToolProvider") as provider,
+    ):
+        provider.return_value.discover.return_value = [
+            _make_adapter("get_weather"),
+            _make_adapter("memoire"),
+        ]
+        tools, adapters = _get_mcp_tools(_FakeAppState())
+
+    assert tools == []
+    assert adapters == {}
 
 
 @patch("openjarvis.core.config.load_config")
@@ -84,7 +108,7 @@ def test_caches_successful_discovery(mock_load_config: MagicMock):
         servers_json=json.dumps(server_cfg),
     )
 
-    mock_adapter = _make_adapter("cached_tool")
+    mock_adapter = _make_adapter("calculator")
 
     with (
         patch("openjarvis.mcp.transport.StreamableHTTPTransport"),
@@ -132,12 +156,12 @@ def test_does_not_cache_empty_results(mock_load_config: MagicMock):
         assert getattr(app_state, "_mcp_tools_cache", None) is None
 
         # Second call: discovery now returns something
-        mock_adapter = _make_adapter("retry_tool")
+        mock_adapter = _make_adapter("calculator")
         MockProvider.return_value.discover.return_value = [mock_adapter]
 
         tools2, _ = _get_mcp_tools(app_state)
         assert len(tools2) == 1
-        assert tools2[0]["function"]["name"] == "retry_tool"
+        assert tools2[0]["function"]["name"] == "calculator"
 
 
 @patch("openjarvis.core.config.load_config")

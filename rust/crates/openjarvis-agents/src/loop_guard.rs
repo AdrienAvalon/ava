@@ -1,11 +1,11 @@
 //! Loop guard — detect and prevent agent loops.
 
 use sha2::{Digest, Sha256};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 #[allow(dead_code)]
 pub struct LoopGuard {
-    seen_hashes: HashSet<String>,
+    call_counts: HashMap<String, usize>,
     recent_calls: VecDeque<String>,
     poll_budget: usize,
     poll_count: usize,
@@ -16,7 +16,7 @@ pub struct LoopGuard {
 impl LoopGuard {
     pub fn new(max_identical: usize, max_ping_pong: usize, poll_budget: usize) -> Self {
         Self {
-            seen_hashes: HashSet::new(),
+            call_counts: HashMap::new(),
             recent_calls: VecDeque::new(),
             poll_budget,
             poll_count: 0,
@@ -30,12 +30,14 @@ impl LoopGuard {
         let hash = self.hash_call(tool_name, arguments);
 
         // Check identical calls
-        if self.seen_hashes.contains(&hash) {
+        let count = self.call_counts.entry(hash).or_insert(0);
+        *count += 1;
+        if *count >= self.max_identical {
             return Some(format!(
-                "Loop detected: identical call to '{tool_name}' with same arguments"
+                "Loop detected: identical call to '{tool_name}' repeated {} times (max {})",
+                *count, self.max_identical
             ));
         }
-        self.seen_hashes.insert(hash);
 
         // Check ping-pong pattern (A-B-A-B)
         self.recent_calls.push_back(tool_name.to_string());
@@ -72,7 +74,7 @@ impl LoopGuard {
     }
 
     pub fn reset(&mut self) {
-        self.seen_hashes.clear();
+        self.call_counts.clear();
         self.recent_calls.clear();
         self.poll_count = 0;
     }
@@ -98,8 +100,17 @@ mod tests {
 
     #[test]
     fn test_identical_call_detection() {
-        let mut guard = LoopGuard::default();
+        let mut guard = LoopGuard::new(2, 4, 100);
         assert!(guard.check("calc", r#"{"expr":"2+2"}"#).is_none());
+        assert!(guard.check("calc", r#"{"expr":"2+2"}"#).is_some());
+    }
+
+    #[test]
+    fn test_identical_call_respects_configured_threshold() {
+        let mut guard = LoopGuard::new(4, 10, 100);
+        for _ in 0..3 {
+            assert!(guard.check("calc", r#"{"expr":"2+2"}"#).is_none());
+        }
         assert!(guard.check("calc", r#"{"expr":"2+2"}"#).is_some());
     }
 

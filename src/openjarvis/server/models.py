@@ -6,7 +6,12 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+# One API request may not ask a backend for an unbounded completion.  This is also
+# the envelope used by Ava's durable conversation store: 32k tokens at a conservative
+# four characters per token fit exactly below its 128 KiB per-message limit.
+MAX_COMPLETION_TOKENS = 32_768
 
 # ---------------------------------------------------------------------------
 # Request models
@@ -20,12 +25,24 @@ class ChatMessage(BaseModel):
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_call_id: Optional[str] = None
 
+    @model_validator(mode="after")
+    def validate_role_shape(self) -> "ChatMessage":
+        if self.role not in {"system", "user", "assistant", "tool"}:
+            raise ValueError("unsupported chat message role")
+        if self.tool_calls is not None and self.role != "assistant":
+            raise ValueError("tool_calls are only valid on assistant messages")
+        if self.role == "tool" and not self.tool_call_id:
+            raise ValueError("tool messages require tool_call_id")
+        if self.role != "tool" and self.tool_call_id is not None:
+            raise ValueError("tool_call_id is only valid on tool messages")
+        return self
+
 
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
-    temperature: float = 0.7
-    max_tokens: int = 1024
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0, allow_inf_nan=False)
+    max_tokens: int = Field(default=1024, ge=1, le=MAX_COMPLETION_TOKENS)
     stream: bool = False
     tools: Optional[List[Dict[str, Any]]] = None
     #: ⚠ QUI POSE LA QUESTION — champ standard de l'API OpenAI, et le PRÉREQUIS de la
@@ -37,10 +54,29 @@ class ChatCompletionRequest(BaseModel):
     #: que l'admin a dit des choses que j'ai inventées pour la tester — « le chauffage
     #: des parents est coupé depuis ce matin » figure dans le registre à côté de « c'est
     #: bien le port 1 de l'Aruba », l'un fabriqué et l'autre réel.
-    #: ⚠ D'où l'ordre : la provenance D'ABORD, la mémoire épisodique ENSUITE. Un registre
+    #: ⚠ D'où l'ordre : la provenance D'ABORD, la mémoire épisodique ENSUITE.
+    #: Un registre
     #: qu'on ne peut pas attribuer est pire qu'un registre absent — il a l'autorité du
     #: verbatim.
     user: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_tool_declarations(self) -> "ChatCompletionRequest":
+        """Accept only the OpenAI function-tool shape at the HTTP boundary."""
+
+        for tool in self.tools or []:
+            function = tool.get("function")
+            if (
+                tool.get("type") != "function"
+                or not isinstance(function, dict)
+                or not isinstance(function.get("name"), str)
+                or not function["name"].strip()
+                or "name" in tool
+            ):
+                raise ValueError("invalid HTTP tool declaration")
+            if function["name"] == "memoire":
+                raise ValueError("legacy Ava memory tool is unavailable over HTTP")
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +188,7 @@ __all__ = [
     "DeltaMessage",
     "ModelListResponse",
     "ModelObject",
+    "MAX_COMPLETION_TOKENS",
     "StreamChoice",
     "UsageInfo",
 ]

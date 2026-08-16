@@ -11,6 +11,7 @@ applique sa modification au runtime (monkey-patch ou hook).
 |---|---|---|---|
 | `anthropic_enhancements.py` | SDK `anthropic` (`Messages.create`) | Active **adaptive thinking** + **prompt caching** sur Claude (Sonnet/Opus). Forçage `temperature=1.0` quand thinking actif et neutralisation `temperature/top_p/top_k` sur les modèles qui refusent ces paramètres. | Pas de PR upstream — comportement spécifique à Ava |
 | `system_prompt_loader.py` | OpenJarvis agent loader | Charge la persona Ava depuis `ava_extensions/identity/system_prompts/ava.md` au démarrage de l'agent. | À évaluer pour upstream |
+| `learning_guard.py` | Chargeur de configuration et `SystemBuilder` | Force les optimiseurs upstream non évalués à rester inactifs ; l'évolution Ava utilisera un chemin GitOps évalué séparé. | Spécifique à la politique Avalon |
 
 ## Format attendu
 

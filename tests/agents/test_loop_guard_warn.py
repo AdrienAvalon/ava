@@ -66,3 +66,24 @@ def test_default_behavior_unchanged():
     v = guard.check_call("search", '{"q": "test"}')
     assert v.blocked
     assert not v.warned
+
+
+def test_python_fallback_uses_a_stable_warning_key(monkeypatch):
+    config = LoopGuardConfig(
+        enabled=True,
+        max_identical_calls=2,
+        warn_before_block=True,
+    )
+    guard = LoopGuard(config)
+    monkeypatch.setattr(guard, "_rust_impl", None)
+
+    first = guard.check_call("write", '{"value":1}')
+    warning = guard.check_call("write", '{"value":1}')
+    blocked = guard.check_call("write", '{"value":1}')
+    blocked_again = guard.check_call("write", '{"value":1}')
+
+    assert first == LoopVerdict()
+    assert warning.warned and not warning.blocked
+    assert blocked.blocked and not blocked.warned
+    assert blocked_again.blocked and not blocked_again.warned
+    assert warning.cycle_key == blocked.cycle_key == blocked_again.cycle_key

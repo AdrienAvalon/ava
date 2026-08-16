@@ -128,6 +128,13 @@ class MemoryService:
     def _on_completed_exchange(self, event: Event) -> None:
         """Queue a completed chat exchange published on the event bus."""
         data = event.data or {}
+        # Relationship-profile exchanges are private and must never enter the
+        # historical mono-tenant ``memory_facts.jsonl`` store.  The event is
+        # still published for observability; this explicit gate keeps the
+        # legacy extractor from consuming it without enabling the governed
+        # memory ledger, which remains a separate shadow capability.
+        if data.get("allow_legacy_memory") is False:
+            return
         self.submit(
             str(data.get("user_text", "") or ""),
             str(data.get("assistant_text", "") or ""),
@@ -219,6 +226,7 @@ def publish_completed_exchange(
     assistant_text: str = "",
     *,
     source: str = "",
+    allow_legacy_memory: bool = True,
 ) -> bool:
     """Publish a completed chat exchange for lifecycle subscribers."""
     if bus is None or not user_text or not user_text.strip():
@@ -229,6 +237,7 @@ def publish_completed_exchange(
             "user_text": user_text,
             "assistant_text": assistant_text or "",
             "source": source,
+            "allow_legacy_memory": allow_legacy_memory,
         },
     )
     return True

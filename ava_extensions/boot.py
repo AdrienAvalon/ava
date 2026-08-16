@@ -1,7 +1,8 @@
 """Ava — boot loader.
 
-Importé depuis `src/openjarvis/__init__.py` dans un `try/except ImportError` pour rester
-optionnel (le paquet amont fonctionne toujours sans `ava_extensions`).
+Importé depuis `src/openjarvis/__init__.py` comme composant obligatoire de ce fork. Une
+distribution Ava sans ses extensions doit échouer, pas redevenir silencieusement un
+OpenJarvis générique.
 
 ⚠ CE FICHIER EST LE POINT UNIQUE OÙ LES EXTENSIONS S'ENREGISTRENT. Un backend, un outil
   ou un patch présent sur le disque mais jamais importé ici est du **code mort que rien
@@ -20,7 +21,8 @@ optionnel (le paquet amont fonctionne toujours sans `ava_extensions`).
   STT, les deux outils, le TTS français. Ce n'est pas théorique : le 2026-08-03, un
   `uv sync` aux extras incomplets a retiré le SDK `anthropic`, exactement la dépendance
   qu'importe `patches/anthropic_enhancements.py`. Il aurait suffi que le moteur démarre
-  par ailleurs pour qu'Ava tourne **sans aucun de ses outils**, en répondant normalement.
+  par ailleurs pour qu'Ava tourne **sans aucun de ses outils**, en répondant
+  normalement.
   Une panne qui se présente comme un fonctionnement normal est la pire de toutes.
 
   Désormais chaque groupe a son propre `try`, journalise ce qu'il perd, et laisse les
@@ -31,8 +33,10 @@ optionnel (le paquet amont fonctionne toujours sans `ava_extensions`).
 from __future__ import annotations
 
 import logging
+import sys
 
 logger = logging.getLogger(__name__)
+_BOOT_COMPLETE = False
 
 
 def _charger(description: str, importer) -> None:  # noqa: ANN001 - callable d'import
@@ -51,8 +55,27 @@ def _charger(description: str, importer) -> None:  # noqa: ANN001 - callable d'i
         )
 
 
+def _charger_obligatoire(description: str, importer) -> None:  # noqa: ANN001
+    """Charge une frontiere de securite ou interdit le demarrage d'Ava.
+
+    L'import racine d'OpenJarvis ignore les ``ImportError`` des extensions optionnelles.
+    On encapsule donc toute panne dans ``RuntimeError`` : un renommage upstream ne peut
+    jamais transformer le garde en fonctionnalite facultative.
+    """
+
+    try:
+        importer()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Ava refuse de demarrer sans {description}: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
 def _backends() -> None:
-    from ava_extensions.backends import kokoro_fr_tts, openai_whisper_ava_stt  # noqa: F401
+    from ava_extensions.backends import (  # noqa: F401
+        kokoro_fr_tts,
+        openai_whisper_ava_stt,
+    )
 
 
 def _patches() -> None:
@@ -61,21 +84,95 @@ def _patches() -> None:
     from ava_extensions.patches import (  # noqa: F401
         anthropic_enhancements,
         file_read_oriente,
-        system_prompt_loader,
         traces_observabilite,
     )
+
+
+def _safety_guards() -> None:
+    """Charge identite et gardes fail-closed hors des SDK optionnels.
+
+    La persona ne doit pas disparaitre parce que le SDK Anthropic est absent : elle
+    fait partie de l'identite d'Ava, pas d'un groupe d'optimisations cloud.
+    """
+
+    from ava_extensions.patches import (  # noqa: F401
+        learning_guard,
+        system_prompt_loader,
+    )
+
+
+def finalize_security_guards() -> None:
+    """Finalise et revalide les gardes après les imports SDK.
+
+    Une permutation d'import peut rendre ``system_prompt_loader`` visible dans
+    ``sys.modules`` alors que son corps n'a pas encore atteint sa validation. Importer
+    le module ne suffit donc pas : la fonction de preuve doit exister et repasser la
+    persona embarquée avant que l'import racine d'OpenJarvis puisse aboutir.
+    """
+
+    def finaliser_apprentissage() -> None:
+        module = sys.modules.get("ava_extensions.patches.learning_guard")
+        if module is not None and not hasattr(module, "finalize"):
+            # Import direct du garde : ``openjarvis.core`` nous rappelle pendant
+            # que le module n'a pas encore fini de definir ses fonctions. Le
+            # garde rappellera cette finalisation juste apres son installation.
+            return
+        from ava_extensions.patches.learning_guard import finalize
+
+        finalize()
+
+    def verifier_persona() -> None:
+        module = sys.modules.get("ava_extensions.patches.system_prompt_loader")
+        if (
+            module is not None
+            and getattr(module, "_PERSONA_VALIDATED", False)
+            and not hasattr(module, "assert_installed")
+        ):
+            # Import direct du loader : la persona a déjà été lue avant le
+            # cycle, mais le wrapper ne peut être posé qu'au retour d'OpenJarvis.
+            return
+        from ava_extensions.patches.system_prompt_loader import assert_installed
+
+        assert_installed()
+
+    _charger_obligatoire(
+        "finalisation du garde d'apprentissage", finaliser_apprentissage
+    )
+    _charger_obligatoire("validation de la persona Ava", verifier_persona)
+
+
+def boot_complete() -> bool:
+    """Indique si tous les groupes du boot ont fini leur initialisation."""
+
+    return _BOOT_COMPLETE
+
+
+def normalize_config(config):  # noqa: ANN001, ANN201 - type upstream
+    """Impose identite et non-mutation a une config chargee ou injectee."""
+
+    from ava_extensions.patches.learning_guard import enforce
+    from ava_extensions.patches.system_prompt_loader import apply_identity
+
+    apply_identity(config)
+    changed = enforce(config)
+    if changed:
+        logger.error(
+            "Ava: configuration injectee normalisee; mutations refusees (%s)",
+            ", ".join(changed),
+        )
+    return config
 
 
 def _skills() -> None:
     # ⚠ TOUT NOUVEL OUTIL DOIT ÊTRE AJOUTÉ ICI (et la CI le vérifie).
     from ava_extensions.skills import (  # noqa: F401
-        journal,
-        logs,
         avalon_status,
         camera,
         evolutions,
         home_assistant,
         introspection,
+        journal,
+        logs,
         memoire,
         proposer,
     )
@@ -147,6 +244,7 @@ def _sonde_routage() -> None:
 #   groupes suivants. Un `_charger` qui journalise un warning que personne ne voit
 #   equivaut a un echec silencieux.
 _charger("journalisation", _journalisation)
+_charger_obligatoire("gardes de securite", _safety_guards)
 _charger("backends voix (TTS/STT)", _backends)
 _charger("patches SDK Anthropic", _patches)
 _charger("outils Avalon", _skills)
@@ -155,3 +253,10 @@ _charger("sonde de routage", _sonde_routage)
 #   ce qui precede (voix, outils, patches) doit deja etre en place. Une Ava qui ne
 #   percoit pas reste une Ava qui parle ; l'inverse ne serait pas vrai.
 _charger("perception continue", _perception)
+
+_BOOT_COMPLETE = True
+# Un import direct de ``ava_extensions.boot`` peut charger ``openjarvis`` de facon
+# reentrante via les patches. Dans ce cas, l'init racine ne doit pas finaliser un
+# module partiellement construit ; le boot termine lui-meme le garde ici.
+if "openjarvis.system.builder" in sys.modules:
+    finalize_security_guards()

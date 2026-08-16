@@ -227,10 +227,12 @@ def _get_memory_backend(config):
     tool is the hallucination vector.
     """
     try:
-        import openjarvis.tools.storage  # noqa: F401
+        key = config.memory.default_backend
+        from openjarvis.tools.storage import register_optional_backends
+
+        register_optional_backends(key)
         from openjarvis.core.registry import MemoryRegistry
 
-        key = config.memory.default_backend
         if not MemoryRegistry.contains(key):
             return None
 

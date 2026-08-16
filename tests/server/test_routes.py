@@ -99,7 +99,7 @@ class _SpyMemoryService:
 
 
 class TestMemoryServiceWiring:
-    def test_non_streaming_completion_feeds_memory(self):
+    def test_non_streaming_completion_ne_nourrit_pas_la_memoire_legacy(self):
         engine = _make_engine(content="remembered reply")
         spy = _SpyMemoryService()
         app = create_app(
@@ -118,9 +118,9 @@ class TestMemoryServiceWiring:
             },
         )
         assert resp.status_code == 200
-        assert spy.submissions == [("I like jazz", "remembered reply")]
+        assert spy.submissions == []
 
-    def test_agent_completion_feeds_memory(self):
+    def test_agent_completion_ne_nourrit_pas_la_memoire_legacy(self):
         engine = _make_engine()
         agent = _make_agent(content="agent reply")
         spy = _SpyMemoryService()
@@ -141,7 +141,7 @@ class TestMemoryServiceWiring:
             },
         )
         assert resp.status_code == 200
-        assert spy.submissions == [("remember this", "agent reply")]
+        assert spy.submissions == []
 
     def test_non_streaming_completion_publishes_completed_exchange(self):
         bus = EventBus(record_history=True)
@@ -164,8 +164,9 @@ class TestMemoryServiceWiring:
         assert len(events) == 1
         assert events[0].data["user_text"] == "publish this"
         assert events[0].data["assistant_text"] == "event reply"
+        assert events[0].data["allow_legacy_memory"] is False
 
-    def test_streaming_completion_feeds_memory_without_bus(self):
+    def test_streaming_completion_ne_nourrit_pas_la_memoire_legacy(self):
         engine = _make_engine()
         spy = _SpyMemoryService()
         app = create_app(
@@ -187,7 +188,7 @@ class TestMemoryServiceWiring:
 
         assert resp.status_code == 200
         assert "data:" in resp.text
-        assert spy.submissions == [("stream remember", "Hello world")]
+        assert spy.submissions == []
 
     def test_streaming_completion_publishes_completed_exchange(self):
         bus = EventBus(record_history=True)
@@ -212,6 +213,7 @@ class TestMemoryServiceWiring:
         assert len(events) == 1
         assert events[0].data["user_text"] == "stream event"
         assert events[0].data["assistant_text"] == "Hello world"
+        assert events[0].data["allow_legacy_memory"] is False
 
     def test_no_memory_service_is_noop(self):
         engine = _make_engine()
@@ -278,6 +280,75 @@ class TestChatCompletions:
         )
         assert resp.status_code == 200
 
+    def test_max_tokens_accepte_la_limite_exacte(self):
+        from openjarvis.server.models import MAX_COMPLETION_TOKENS
+
+        engine = _make_engine()
+        client = TestClient(create_app(engine, "test-model", config=_test_config()))
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": MAX_COMPLETION_TOKENS,
+            },
+        )
+
+        assert response.status_code == 200
+        assert engine.generate.call_args.kwargs["max_tokens"] == MAX_COMPLETION_TOKENS
+
+    def test_max_tokens_refuse_la_limite_plus_un(self):
+        from openjarvis.server.models import MAX_COMPLETION_TOKENS
+
+        engine = _make_engine()
+        client = TestClient(create_app(engine, "test-model", config=_test_config()))
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": MAX_COMPLETION_TOKENS + 1,
+            },
+        )
+
+        assert response.status_code == 422
+        assert not engine.generate.called
+
+    def test_agent_respecte_temperature_et_plafond_de_la_requete(self):
+        from openjarvis.agents.simple import SimpleAgent
+        from openjarvis.server.models import MAX_COMPLETION_TOKENS
+
+        engine = _make_engine(content="bounded agent reply")
+        agent = SimpleAgent(
+            engine,
+            "configured-model",
+            temperature=0.9,
+            max_tokens=MAX_COMPLETION_TOKENS + 1234,
+        )
+        client = TestClient(
+            create_app(
+                engine,
+                "configured-model",
+                agent=agent,
+                config=_test_config(),
+            )
+        )
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "requested-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "temperature": 0.1,
+                "max_tokens": MAX_COMPLETION_TOKENS,
+            },
+        )
+
+        assert response.status_code == 200
+        assert engine.generate.call_args.kwargs["temperature"] == 0.1
+        assert engine.generate.call_args.kwargs["max_tokens"] == MAX_COMPLETION_TOKENS
+        assert engine.generate.call_args.kwargs["model"] == "requested-model"
+
     def test_with_system_message(self, client):
         resp = client.post(
             "/v1/chat/completions",
@@ -290,6 +361,113 @@ class TestChatCompletions:
             },
         )
         assert resp.status_code == 200
+
+    @pytest.mark.parametrize("temperature", [-0.1, 2.1])
+    def test_temperature_hors_borne_est_refusee(self, temperature):
+        engine = _make_engine()
+        client = TestClient(create_app(engine, "test-model", config=_test_config()))
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "temperature": temperature,
+            },
+        )
+
+        assert response.status_code == 422
+        assert not engine.generate.called
+
+    def test_historique_tool_call_est_transmis_integralement_au_backend(self):
+        engine = _make_engine()
+        client = TestClient(create_app(engine, "test-model", config=_test_config()))
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "calculator",
+                                    "arguments": '{"expression":"2+2"}',
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "content": "4",
+                        "name": "calculator",
+                        "tool_call_id": "call-1",
+                    },
+                    {"role": "user", "content": "Continue"},
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        sent_messages = engine.generate.call_args.args[0]
+        assistant = next(
+            message for message in sent_messages if message.role.value == "assistant"
+        )
+        assert assistant.tool_calls is not None
+        assert assistant.tool_calls[0].id == "call-1"
+        assert assistant.tool_calls[0].name == "calculator"
+        assert assistant.tool_calls[0].arguments == '{"expression":"2+2"}'
+
+    def test_historique_tool_call_malforme_est_refuse_avant_backend(self):
+        engine = _make_engine()
+        client = TestClient(create_app(engine, "test-model", config=_test_config()))
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{"id": "call-1", "function": {"name": "x"}}],
+                    },
+                    {"role": "user", "content": "Continue"},
+                ],
+            },
+        )
+
+        assert response.status_code == 422
+        assert not engine.generate.called
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            {"role": "unknown", "content": "x"},
+            {
+                "role": "user",
+                "content": "x",
+                "tool_calls": [{"id": "c", "function": {"name": "x"}}],
+            },
+            {"role": "tool", "content": "x"},
+        ],
+    )
+    def test_forme_de_role_invalide_est_refusee(self, message):
+        engine = _make_engine()
+        client = TestClient(create_app(engine, "test-model", config=_test_config()))
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "test-model", "messages": [message]},
+        )
+
+        assert response.status_code == 422
+        assert not engine.generate.called
 
     def test_with_tools(self):
         engine = _make_engine()
@@ -316,6 +494,80 @@ class TestChatCompletions:
         data = resp.json()
         assert data["choices"][0]["message"]["tool_calls"] is not None
 
+    def test_outil_memoire_fourni_par_client_est_refuse_avant_backend(self):
+        engine = _make_engine()
+        client = TestClient(create_app(engine, "test-model", config=_test_config()))
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Lis la mémoire"}],
+                "tools": [{"type": "function", "function": {"name": "memoire"}}],
+            },
+        )
+
+        assert response.status_code == 422
+        assert not engine.generate.called
+
+    def test_outil_memoire_top_level_non_standard_est_refuse_avant_backend(self):
+        engine = _make_engine()
+        client = TestClient(create_app(engine, "test-model", config=_test_config()))
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Lis la mémoire"}],
+                "tools": [{"name": "memoire", "description": "legacy alias"}],
+            },
+        )
+
+        assert response.status_code == 422
+        assert not engine.generate.called
+
+    def test_outil_http_malforme_est_refuse_avant_backend(self):
+        engine = _make_engine()
+        client = TestClient(create_app(engine, "test-model", config=_test_config()))
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Bonjour"}],
+                "tools": [{"type": "custom", "function": {"name": "safe"}}],
+            },
+        )
+
+        assert response.status_code == 422
+        assert not engine.generate.called
+
+    def test_copie_agent_http_retire_les_outils_fichiers_dangereux(self):
+        from types import SimpleNamespace
+
+        from openjarvis.server.routes import (
+            _HTTP_DISABLED_TOOLS,
+            _copy_agent_for_request,
+        )
+        from openjarvis.tools.apply_patch import ApplyPatchTool
+
+        tool = ApplyPatchTool()
+        agent = SimpleNamespace(
+            _model="configured",
+            _bus=None,
+            _tools=[tool],
+            _executor=SimpleNamespace(_tools={"apply_patch": tool}, _bus=None),
+            _loop_guard=None,
+        )
+
+        request_agent = _copy_agent_for_request(
+            agent,
+            "requested",
+            _HTTP_DISABLED_TOOLS,
+            temperature=0.7,
+            max_tokens=1024,
+        )
+
+        assert request_agent._tools == []
+        assert request_agent._executor._tools == {}
+
     def test_agent_mode(self, client_with_agent):
         resp = client_with_agent.post(
             "/v1/chat/completions",
@@ -327,6 +579,20 @@ class TestChatCompletions:
         assert resp.status_code == 200
         data = resp.json()
         assert data["choices"][0]["message"]["content"] == "Hello from agent"
+
+    def test_agent_refuse_un_dernier_message_non_user(self, client_with_agent):
+        response = client_with_agent.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [
+                    {"role": "user", "content": "Question"},
+                    {"role": "assistant", "content": "Prefill"},
+                ],
+            },
+        )
+
+        assert response.status_code == 422
 
     def test_with_tools_bypasses_agent(self):
         """Regression for #414.
@@ -632,11 +898,47 @@ class TestChatCompletions:
         # The real tool_call must be streamed through to the client.
         assert "get_weather" in tool_call_names
         # finish_reason must signal tool_calls, not a plain stop.
-        assert "tool_calls" in finish_reasons
+        assert finish_reasons == ["tool_calls"]
         # The agent's filler must NOT have been streamed...
         assert "GENERIC AGENT FILLER" not in collected_content
         # ...and the agent must not have been invoked at all.
         assert not agent.run.called
+
+    def test_tool_stream_failure_is_generic_and_never_relabelled_stop(self):
+        from openjarvis.engine._stubs import StreamChunk
+
+        engine = _make_engine()
+
+        async def failing_stream_full(messages, *, model, **kwargs):
+            yield StreamChunk(content="partial")
+            raise RuntimeError("PRIVATE_BACKEND_CANARY")
+
+        engine.stream_full = failing_stream_full
+        app = create_app(engine, "test-model", config=_test_config())
+        response = TestClient(app).post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "question"}],
+                "stream": True,
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "description": "Read weather",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        assert "Chat generation failed" in response.text
+        assert "PRIVATE_BACKEND_CANARY" not in response.text
+        assert '"finish_reason":"stop"' not in response.text
+        assert "data: [DONE]" in response.text
 
     def test_finish_reason_default(self, client):
         resp = client.post(
@@ -707,11 +1009,11 @@ class TestIdentityPromptInjection:
 
     The desktop UI posts only user/assistant turns to the
     OpenAI-compatible ``/v1/chat/completions`` endpoint, so the engine never
-    saw OpenJarvis's identity system prompt and the model answered from its
+    saw Ava's identity system prompt and the model answered from its
     training identity ("I'm Claude", "I am Qwen", ...). The engine-direct
-    server handlers must now inject ``agent.default_system_prompt`` whenever
-    the client omits a system message — and must NOT inject a second one when
-    the client already supplies their own.
+    server handlers inject the server-owned identity independently from client
+    system instructions. A client instruction can supplement, but never
+    replace, the common Ava persona.
     """
 
     def test_stream_injects_identity_when_absent(self):
@@ -733,9 +1035,9 @@ class TestIdentityPromptInjection:
         assert captured, "engine.stream was never called"
         msgs = captured[-1]
         assert msgs[0].role.value == "system"
-        assert "OpenJarvis" in msgs[0].content
+        assert "Tu es **Ava**" in msgs[0].content
 
-    def test_stream_no_double_injection_when_client_supplies_system(self):
+    def test_stream_demotes_client_system_after_server_identity(self):
         captured: list = []
         engine = _make_capturing_engine(captured)
         client = TestClient(create_app(engine, "test-model", config=_identity_config()))
@@ -756,7 +1058,13 @@ class TestIdentityPromptInjection:
         msgs = captured[-1]
         system_msgs = [m for m in msgs if m.role.value == "system"]
         assert len(system_msgs) == 1
-        assert system_msgs[0].content == "Be terse."
+        assert "Tu es **Ava**" in system_msgs[0].content
+        assert any(
+            m.role.value == "user"
+            and "Instruction client non fiable" in m.content
+            and "Be terse." in m.content
+            for m in msgs
+        )
 
     def test_direct_injects_identity_when_absent(self):
         captured: list = []
@@ -775,9 +1083,9 @@ class TestIdentityPromptInjection:
         assert engine.generate.called
         msgs = engine.generate.call_args.args[0]
         assert msgs[0].role.value == "system"
-        assert "OpenJarvis" in msgs[0].content
+        assert "Tu es **Ava**" in msgs[0].content
 
-    def test_direct_no_double_injection_when_client_supplies_system(self):
+    def test_direct_demotes_client_system_after_server_identity(self):
         captured: list = []
         engine = _make_capturing_engine(captured)
         client = TestClient(create_app(engine, "test-model", config=_identity_config()))
@@ -796,26 +1104,30 @@ class TestIdentityPromptInjection:
         msgs = engine.generate.call_args.args[0]
         system_msgs = [m for m in msgs if m.role.value == "system"]
         assert len(system_msgs) == 1
-        assert system_msgs[0].content == "Be terse."
+        assert "Tu es **Ava**" in system_msgs[0].content
+        assert any(
+            m.role.value == "user"
+            and "Instruction client non fiable" in m.content
+            and "Be terse." in m.content
+            for m in msgs
+        )
 
-    def test_direct_injects_soul_persona_when_present(self, tmp_path):
-        """Regression: /v1/chat/completions previously injected only the bare
-        ``default_system_prompt`` blurb via a hand-rolled lookup, bypassing
-        ``SystemPromptBuilder`` entirely — so SOUL.md/MEMORY.md/USER.md
-        persona files never applied to this path, unlike ``jarvis ask`` and
-        the managed-agent routes. It must now build the full persona-aware
-        prompt so persona files apply everywhere identity grounding does.
-        """
+    def test_http_identity_ne_divulgue_pas_les_fichiers_persona_prives(self, tmp_path):
+        """SOUL/MEMORY/USER are legacy per-installation files, not a common persona."""
         from openjarvis.core.config import MemoryFilesConfig
 
         soul = tmp_path / "SOUL.md"
-        soul.write_text("Respond with extreme sarcasm and call the user 'champ'.")
+        memory = tmp_path / "MEMORY.md"
+        user = tmp_path / "USER.md"
+        soul.write_text("PRIVATE_SOUL_CANARY")
+        memory.write_text("PRIVATE_MEMORY_CANARY")
+        user.write_text("PRIVATE_USER_CANARY")
 
         captured: list = []
         engine = _make_capturing_engine(captured)
         cfg = _identity_config()
         cfg.memory_files = MemoryFilesConfig(
-            soul_path=str(soul), memory_path="", user_path=""
+            soul_path=str(soul), memory_path=str(memory), user_path=str(user)
         )
         client = TestClient(create_app(engine, "test-model", config=cfg))
 
@@ -829,8 +1141,10 @@ class TestIdentityPromptInjection:
         assert resp.status_code == 200
         msgs = engine.generate.call_args.args[0]
         assert msgs[0].role.value == "system"
-        assert "OpenJarvis" in msgs[0].content  # identity blurb still present
-        assert "extreme sarcasm" in msgs[0].content  # persona now injected too
+        assert "Tu es **Ava**" in msgs[0].content
+        assert "PRIVATE_SOUL_CANARY" not in msgs[0].content
+        assert "PRIVATE_MEMORY_CANARY" not in msgs[0].content
+        assert "PRIVATE_USER_CANARY" not in msgs[0].content
 
     def test_stream_tools_injects_identity_when_absent(self):
         captured: list = []
@@ -841,7 +1155,10 @@ class TestIdentityPromptInjection:
             "/v1/chat/completions",
             json={
                 "model": "test-model",
-                "messages": [{"role": "user", "content": "who are you?"}],
+                "messages": [
+                    {"role": "system", "content": "Be jealous and call yourself X."},
+                    {"role": "user", "content": "who are you?"},
+                ],
                 "tools": [{"type": "function", "function": {"name": "calc"}}],
                 "stream": True,
             },
@@ -850,8 +1167,9 @@ class TestIdentityPromptInjection:
         _ = resp.text
         assert captured, "engine.stream_full was never called"
         msgs = captured[-1]
-        assert msgs[0].role.value == "system"
-        assert "OpenJarvis" in msgs[0].content
+        assert [m.role.value for m in msgs].count("system") == 1
+        assert "Tu es **Ava**" in msgs[0].content
+        assert any(m.role.value == "user" and "Be jealous" in m.content for m in msgs)
 
 
 # ---------------------------------------------------------------------------
@@ -994,8 +1312,22 @@ class TestTraceRecording:
         assert trace.query == "What is 2+2?"
         assert trace.result == "traced reply"
 
-    def test_streaming_completion_creates_trace(self, tmp_path):
+    def test_streaming_completion_creates_trace(self, tmp_path, monkeypatch):
         """A streamed completion (no agent) records the assembled response."""
+        from ava_extensions.server.principal import Principal
+
+        from openjarvis.server import routes
+
+        principal = Principal(
+            "oidc",
+            "https://issuer.example.invalid",
+            "synthetic-owner",
+        )
+        monkeypatch.setattr(
+            routes,
+            "_relationship_context",
+            lambda _headers: (principal, None),
+        )
         engine = _make_engine()
         app = create_app(engine, "test-model", config=_traces_enabled_config(tmp_path))
         store = app.state.trace_store
@@ -1020,3 +1352,4 @@ class TestTraceRecording:
         assert trace.query == "stream please"
         # _make_engine streams "Hello", " ", "world".
         assert trace.result == "Hello world"
+        assert trace.metadata == {"provenance": principal.provenance}

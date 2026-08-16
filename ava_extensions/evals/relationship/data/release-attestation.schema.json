@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ava:release:attestation:v1",
+  "title": "Attestation de release Ava pour shadow v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "attestation_id", "release", "engine", "artifact", "canonical_knowledge"],
+  "properties": {
+    "schema_version": {"const": "ava.release.attestation/v1"},
+    "attestation_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._:-]{2,127}$"},
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "git_sha"],
+      "properties": {
+        "repository": {"type": "string", "pattern": "^repo:[A-Za-z0-9._:/+-]+$"},
+        "git_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+      }
+    },
+    "engine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "model", "revision", "adapter", "config_sha256"],
+      "properties": {
+        "provider": {"type": "string", "minLength": 1},
+        "model": {"type": "string", "minLength": 1},
+        "revision": {"type": "string", "minLength": 1},
+        "adapter": {"type": "string", "minLength": 1},
+        "config_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifest_sha256"],
+      "properties": {"manifest_sha256": {"$ref": "#/$defs/sha256"}}
+    },
+    "canonical_knowledge": {"const": false}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  }
+}

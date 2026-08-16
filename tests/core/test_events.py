@@ -91,6 +91,33 @@ class TestEventBus:
 
         assert len(bus.history) == 4 * n
 
+    def test_scoped_subscribers_ne_voient_pas_les_evenements_dune_autre_requete(
+        self,
+    ) -> None:
+        parent = EventBus(record_history=True)
+        global_events: list[Event] = []
+        left_events: list[Event] = []
+        right_events: list[Event] = []
+        parent.subscribe(EventType.TOOL_CALL_END, global_events.append)
+        left = parent.scoped("request-left")
+        right = parent.scoped("request-right")
+        left.subscribe(EventType.TOOL_CALL_END, left_events.append)
+        right.subscribe(EventType.TOOL_CALL_END, right_events.append)
+
+        left.publish(EventType.TOOL_CALL_END, {"result": "left-private"})
+        right.publish(EventType.TOOL_CALL_END, {"result": "right-private"})
+
+        assert [event.data["result"] for event in left_events] == ["left-private"]
+        assert [event.data["result"] for event in right_events] == ["right-private"]
+        assert [event.data["result"] for event in global_events] == [
+            "left-private",
+            "right-private",
+        ]
+        assert [event.correlation_id for event in parent.history] == [
+            "request-left",
+            "request-right",
+        ]
+
 
 class TestAgentEventTypes:
     def test_agent_tick_events_exist(self):

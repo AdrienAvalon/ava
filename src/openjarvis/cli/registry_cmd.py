@@ -9,6 +9,11 @@ from rich.table import Table
 
 def _load_registry_map() -> tuple[dict[str, object], dict[str, object]]:
     """Import all registries and return (by_name, aliases) lookup dicts."""
+    from openjarvis.speech import register_builtin_backends
+    from openjarvis.tools.storage import register_optional_backends
+
+    register_builtin_backends()
+    register_optional_backends()
     from openjarvis.core.registry import (
         AgentRegistry,
         BenchmarkRegistry,

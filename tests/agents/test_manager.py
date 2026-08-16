@@ -58,6 +58,19 @@ class TestAgentCRUD:
         updated = manager.update_agent(created["id"], name="new")
         assert updated["name"] == "new"
 
+    def test_invalid_update_does_not_poison_the_connection(self, manager):
+        created = manager.create_agent(name="safe", agent_type="simple")
+
+        with pytest.raises(TypeError):
+            manager.update_agent(
+                created["id"],
+                status="error",
+                config={"not-json": object()},
+            )
+
+        token = manager.start_tick(created["id"])
+        assert manager.end_tick(created["id"], token) is True
+
     def test_delete_agent_soft(self, manager):
         created = manager.create_agent(name="doomed", agent_type="simple")
         manager.delete_agent(created["id"])
@@ -162,10 +175,84 @@ class TestConcurrency:
     def test_run_tick_guard(self, manager):
         agent = manager.create_agent(name="busy", agent_type="simple")
         # Simulate agent running
-        manager._set_status(agent["id"], "running")
+        manager.start_tick(agent["id"])
         # Trying to run again should raise
-        with pytest.raises(ValueError, match="already executing"):
+        with pytest.raises(ValueError, match="cannot execute a tick"):
             manager.start_tick(agent["id"])
+
+    @pytest.mark.parametrize(
+        "operation",
+        ["pause_agent", "resume_agent", "delete_agent", "recover_agent"],
+    )
+    def test_control_transitions_never_release_a_running_tick(self, manager, operation):
+        agent = manager.create_agent(name=f"running-{operation}", agent_type="simple")
+        manager.start_tick(agent["id"])
+
+        with pytest.raises(ValueError):
+            getattr(manager, operation)(agent["id"])
+
+        assert manager.get_agent(agent["id"])["status"] == "running"
+        with pytest.raises(ValueError, match="cannot execute a tick"):
+            manager.start_tick(agent["id"])
+
+    @pytest.mark.parametrize(
+        "status",
+        ["paused", "archived", "error", "needs_attention", "budget_exceeded"],
+    )
+    def test_tick_starts_only_from_idle(self, manager, status):
+        agent = manager.create_agent(name=f"blocked-{status}", agent_type="simple")
+        manager.update_agent(agent["id"], status=status)
+
+        with pytest.raises(ValueError, match=rf"status '{status}'.*cannot execute"):
+            manager.start_tick(agent["id"])
+
+        assert manager.get_agent(agent["id"])["status"] == status
+
+    def test_tick_guard_is_atomic_across_manager_instances(self, tmp_path):
+        import threading
+
+        from openjarvis.agents.manager import AgentManager
+
+        database = tmp_path / "shared.db"
+        first = AgentManager(str(database))
+        agent = first.create_agent(name="shared", agent_type="simple")
+        second = AgentManager(str(database))
+        barrier = threading.Barrier(2)
+        outcomes: list[str] = []
+        tokens: list[str] = []
+
+        def start(manager: AgentManager) -> None:
+            barrier.wait(timeout=5)
+            try:
+                tokens.append(manager.start_tick(agent["id"]))
+                outcomes.append("started")
+            except ValueError:
+                outcomes.append("rejected")
+
+        workers = [
+            threading.Thread(target=start, args=(instance,))
+            for instance in (first, second)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=5)
+
+        assert sorted(outcomes) == ["rejected", "started"]
+        assert first.end_tick(agent["id"], tokens[0]) is True
+        first.close()
+        second.close()
+
+    def test_stale_owner_cannot_release_a_replacement_tick(self, manager):
+        agent = manager.create_agent(name="lease", agent_type="simple")
+        stale_token = manager.start_tick(agent["id"])
+        assert manager.end_tick(agent["id"], stale_token, status="error") is True
+        manager.recover_agent(agent["id"])
+        replacement_token = manager.start_tick(agent["id"])
+
+        assert manager.end_tick(agent["id"], stale_token) is False
+        assert manager.get_agent(agent["id"])["status"] == "running"
+        assert manager.end_tick(agent["id"], replacement_token) is True
 
 
 class TestCheckpoints:
@@ -282,6 +369,98 @@ class TestMessageQueue:
         messages = manager.list_messages(agent["id"])
         assert messages[0]["tool_calls"] is None
 
+    def test_claim_and_completion_are_one_durable_pair(self, manager):
+        agent = manager.create_agent(name="paired", agent_type="simple")
+        source = manager.send_message(agent["id"], "question")
+
+        claimed = manager.claim_message(agent["id"], source["id"])
+        assert claimed["status"] == "processing"
+        response = manager.complete_message_turn(agent["id"], source["id"], "answer")
+
+        assert response["reply_to_id"] == source["id"]
+        rows = manager.list_messages(agent["id"])
+        user = next(row for row in rows if row["id"] == source["id"])
+        assert user["status"] == "delivered"
+
+    def test_send_claimed_has_no_scheduler_visible_pending_window(self, manager):
+        agent = manager.create_agent(name="direct-claim", agent_type="simple")
+
+        source = manager.send_claimed_message(agent["id"], "question")
+
+        assert source["status"] == "processing"
+        assert manager.get_pending_messages(agent["id"]) == []
+        assert manager.claim_next_message(agent["id"]) is None
+
+    def test_empty_or_oversized_messages_are_refused(self, manager):
+        from openjarvis.agents.manager import MAX_AGENT_MESSAGE_CHARS
+
+        agent = manager.create_agent(name="bounded", agent_type="simple")
+        with pytest.raises(ValueError):
+            manager.send_message(agent["id"], "   ")
+        with pytest.raises(ValueError):
+            manager.send_message(agent["id"], "x" * (MAX_AGENT_MESSAGE_CHARS + 1))
+
+        source = manager.send_claimed_message(agent["id"], "valid")
+        with pytest.raises(ValueError):
+            manager.complete_message_turn(agent["id"], source["id"], "")
+        assert manager.list_messages(agent["id"])[0]["status"] == "processing"
+
+    def test_only_one_concurrent_worker_can_claim_a_message(self, manager):
+        import threading
+
+        agent = manager.create_agent(name="claimed-once", agent_type="simple")
+        source = manager.send_message(agent["id"], "question")
+        outcomes: list[str] = []
+
+        def claim() -> None:
+            try:
+                manager.claim_message(agent["id"], source["id"])
+                outcomes.append("claimed")
+            except ValueError:
+                outcomes.append("rejected")
+
+        workers = [threading.Thread(target=claim) for _ in range(8)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=5)
+
+        assert outcomes.count("claimed") == 1
+        assert outcomes.count("rejected") == 7
+
+    def test_shared_sqlite_connection_is_serialized_across_threads(self, manager):
+        import threading
+
+        agent = manager.create_agent(name="thread-stress", agent_type="simple")
+        errors: list[Exception] = []
+
+        def complete_many(worker_id: int) -> None:
+            try:
+                for index in range(40):
+                    source = manager.send_message(
+                        agent["id"], f"question-{worker_id}-{index}"
+                    )
+                    manager.claim_message(agent["id"], source["id"])
+                    manager.complete_message_turn(
+                        agent["id"], source["id"], f"answer-{worker_id}-{index}"
+                    )
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        workers = [
+            threading.Thread(target=complete_many, args=(worker_id,))
+            for worker_id in range(8)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=15)
+
+        assert errors == []
+        rows = manager.list_messages(agent["id"], limit=1_000)
+        assert len(rows) == 8 * 40 * 2
+        assert sum(row["status"] == "delivered" for row in rows) == len(rows)
+
 
 def test_update_agent_budget_fields(tmp_path):
     """update_agent() accepts budget and stall kwargs."""
@@ -346,6 +525,36 @@ def test_learning_log_crud(tmp_path):
 
 
 class TestSchemaAndThreading:
+    def test_legacy_message_schema_is_migrated_before_reply_index(self, tmp_path):
+        import sqlite3
+
+        from openjarvis.agents.manager import AgentManager
+
+        database = tmp_path / "legacy.db"
+        connection = sqlite3.connect(database)
+        connection.execute(
+            "CREATE TABLE agent_messages ("
+            "id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, direction TEXT NOT NULL,"
+            "content TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'queued',"
+            "status TEXT NOT NULL DEFAULT 'pending', created_at REAL NOT NULL)"
+        )
+        connection.commit()
+        connection.close()
+
+        migrated = AgentManager(str(database))
+        columns = {
+            row[1]
+            for row in migrated._conn.execute("PRAGMA table_info(agent_messages)")
+        }
+        indexes = {
+            row[1]
+            for row in migrated._conn.execute("PRAGMA index_list(agent_messages)")
+        }
+        migrated.close()
+
+        assert {"tool_calls", "reply_to_id"} <= columns
+        assert "idx_agent_messages_reply" in indexes
+
     def test_agent_has_runtime_columns(self, manager):
         """New columns from ALTER TABLE migration should exist."""
         agent = manager.create_agent(name="test", agent_type="simple")
@@ -357,6 +566,25 @@ class TestSchemaAndThreading:
         assert agent["total_tokens"] == 0
         assert agent["total_cost"] == 0.0
         assert agent["total_runs"] == 0
+
+    def test_authoritative_restart_terminally_fails_orphaned_claim(self, tmp_path):
+        from openjarvis.agents.manager import AgentManager
+
+        database = tmp_path / "restart.db"
+        before = AgentManager(str(database))
+        agent = before.create_agent(name="restart", agent_type="simple")
+        source = before.send_claimed_message(agent["id"], "question")
+        before.close()
+
+        after = AgentManager(str(database), clear_stale_running=True)
+        row = next(
+            message
+            for message in after.list_messages(agent["id"])
+            if message["id"] == source["id"]
+        )
+        after.close()
+
+        assert row["status"] == "failed"
 
     def test_thread_safety(self, manager):
         """AgentManager should be usable from a different thread."""

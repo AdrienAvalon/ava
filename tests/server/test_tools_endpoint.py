@@ -40,25 +40,34 @@ def test_tools_includes_channels():
     assert channel_names & names
 
 
-def test_browser_meta_group():
+def test_tools_excludes_quarantined_legacy_memory():
+    """The shared legacy JSONL must not be exposed to managed agents."""
+    from openjarvis.server.agent_manager_routes import build_tools_list
+
+    names = {tool["name"] for tool in build_tools_list()}
+    assert "memoire" not in names
+    assert "shell_exec" not in names
+    assert "code_interpreter" not in names
+    assert "file_write" not in names
+
+
+def test_browser_meta_group_is_not_offered_at_the_http_boundary():
     from openjarvis.server.agent_manager_routes import build_tools_list
 
     tools = build_tools_list()
     names = {t["name"] for t in tools}
-    assert "browser" in names
+    assert "browser" not in names
     assert "browser_navigate" not in names
 
 
-def test_web_search_available_without_tavily_key(monkeypatch):
-    """DuckDuckGo fallback keeps web search usable without Tavily."""
+def test_web_search_is_not_offered_to_unauthenticated_managed_agents(monkeypatch):
+    """A network tool without an enforceable capability contract stays hidden."""
     from openjarvis.server.agent_manager_routes import build_tools_list
 
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
-    tools = build_tools_list()
-    web_search = next(t for t in tools if t["name"] == "web_search")
+    names = {tool["name"] for tool in build_tools_list()}
 
-    assert web_search["configured"] is True
-    assert web_search["requires_credentials"] is False
+    assert "web_search" not in names
 
 
 def test_tool_credentials_browser_lifecycle(tmp_path, monkeypatch):

@@ -121,14 +121,15 @@ class TestChatAgents:
         assert "simple ok" in result.output
         assert "failed" not in result.output.lower()
 
-    def test_memory_service_started_fed_and_stopped(self) -> None:
-        """The REPL starts memory, publishes each turn, and stops it."""
+    def test_memory_service_started_but_cli_exchange_is_quarantined(self) -> None:
+        """The REPL publishes turns without feeding the shared legacy store."""
 
         class _SpyMemoryService:
             def __init__(self, bus: EventBus) -> None:
                 self.bus = bus
                 self.started = False
                 self.stopped = False
+                self.events: list[dict[str, object]] = []
                 self.submissions: list[tuple[str, str]] = []
 
             def start(self) -> None:
@@ -139,6 +140,9 @@ class TestChatAgents:
                 )
 
             def _on_completed_exchange(self, event: Event) -> None:
+                self.events.append(dict(event.data))
+                if event.data.get("allow_legacy_memory") is False:
+                    return
                 self.submissions.append(
                     (
                         event.data["user_text"],
@@ -188,7 +192,11 @@ class TestChatAgents:
         assert spy is not None
         assert spy.started is True
         assert spy.stopped is True
-        assert spy.submissions == [("hello", "simple ok")]
+        assert spy.submissions == []
+        assert len(spy.events) == 1
+        assert spy.events[0]["user_text"] == "hello"
+        assert spy.events[0]["assistant_text"] == "simple ok"
+        assert spy.events[0]["allow_legacy_memory"] is False
 
     def test_tool_agent_uses_legacy_agent_tools_and_prompts_confirmation(self) -> None:
         engine = MagicMock()

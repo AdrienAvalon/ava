@@ -19,6 +19,7 @@ PYPROJECT = ROOT / "pyproject.toml"
 DESKTOP_LIB_RS = ROOT / "frontend" / "src-tauri" / "src" / "lib.rs"
 WINDOWS_INSTALL_PS1 = ROOT / "deploy" / "windows" / "install.ps1"
 QUICKSTART_SH = ROOT / "scripts" / "quickstart.sh"
+DOCKER_DIR = ROOT / "deploy" / "docker"
 
 
 def _pyproject() -> dict:
@@ -41,6 +42,20 @@ def test_openjarvis_rust_lives_in_uv_dependency_group() -> None:
 def test_openjarvis_rust_has_local_uv_path_source() -> None:
     src = _pyproject()["tool"]["uv"]["sources"]["openjarvis-rust"]
     assert src["path"] == "rust/crates/openjarvis-python"
+
+
+def test_ava_extensions_are_packaged_without_the_test_suite() -> None:
+    wheel = _pyproject()["tool"]["hatch"]["build"]["targets"]["wheel"]
+    assert "ava_extensions" in wheel["packages"]
+    assert "ava_extensions/tests" in wheel["exclude"]
+
+
+def test_explicit_docker_build_contexts_copy_ava_extensions() -> None:
+    for dockerfile in sorted(DOCKER_DIR.glob("Dockerfile*")):
+        content = dockerfile.read_text()
+        if "COPY src/ src/" not in content:
+            continue
+        assert "COPY ava_extensions/ ava_extensions/" in content, dockerfile.name
 
 
 def test_desktop_app_syncs_the_native_group() -> None:

@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import logging
+import math
+import os
 import re as _re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from openjarvis.agents.manager import AgentManager
+from openjarvis.agents.manager import MAX_AGENT_MESSAGE_CHARS, AgentManager
+from openjarvis.server.models import MAX_COMPLETION_TOKENS
 
 try:
     from fastapi import APIRouter, HTTPException, Request
     from fastapi.responses import StreamingResponse
-    from pydantic import BaseModel
+    from pydantic import BaseModel, Field, field_validator
 except ImportError:
     raise ImportError("fastapi and pydantic are required for server routes")
 
@@ -49,9 +52,16 @@ class BindChannelRequest(BaseModel):
 
 
 class SendMessageRequest(BaseModel):
-    content: str
-    mode: str = "queued"
+    content: str = Field(min_length=1, max_length=MAX_AGENT_MESSAGE_CHARS)
+    mode: Literal["queued", "immediate"] = "queued"
     stream: bool = False  # SSE streaming mode
+
+    @field_validator("content")
+    @classmethod
+    def content_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("managed-agent message cannot be blank")
+        return value
 
 
 class FeedbackRequest(BaseModel):
@@ -68,6 +78,165 @@ _BROWSER_SUB_TOOLS = {
     "browser_axtree",
 }
 
+# Ava's historical JSONL memory is shared and unauthenticated.  Reject its name
+# even when a managed-agent template supplies a raw OpenAI function dictionary:
+# unregistering the local class alone would still expose the capability to the
+# model and to any remote tool bridge using the same name.
+_QUARANTINED_TOOL_NAMES = frozenset({"memoire"})
+_MANAGED_AGENT_DENIED_TOOL_NAMES = frozenset(
+    {
+        "agent_kill",
+        "agent_list",
+        "agent_send",
+        "agent_spawn",
+        "apply_patch",
+        "code_interpreter",
+        "code_interpreter_docker",
+        "db_query",
+        "docker_shell_exec",
+        "execute_pending_actions",
+        "file_write",
+        "git_commit",
+        "kg_add_entity",
+        "kg_add_relation",
+        "kg_neighbors",
+        "kg_query",
+        "memory_index",
+        "memory_manage",
+        "memory_retrieve",
+        "memory_search",
+        "memory_store",
+        "pdf_extract",
+        "queue_action",
+        "record_decision",
+        "retrieval",
+        "repl",
+        "scan_chunks",
+        "shell_exec",
+        "skill_manage",
+        "user_profile_manage",
+    }
+)
+_MANAGED_AGENT_ALLOWED_TOOL_NAMES = frozenset(
+    {
+        "calculator",
+        "think",
+    }
+)
+_MANAGED_AGENT_ALLOWED_CAPABILITIES: frozenset[str] = frozenset()
+_MANAGED_AGENT_MAX_TURNS = 50
+_MANAGED_HISTORY_TURNS = 25
+
+
+def _managed_runtime_values(config: Dict[str, Any]) -> Tuple[float, int, int]:
+    """Validate bounded sampler values before any managed-agent effect."""
+
+    temperature = config.get("temperature", 0.7)
+    max_tokens = config.get("max_tokens", 1024)
+    max_turns = config.get("max_turns", 10)
+    max_total_tokens = config.get("max_total_tokens", 0)
+    if (
+        isinstance(temperature, bool)
+        or not isinstance(temperature, (int, float))
+        or not math.isfinite(float(temperature))
+        or not 0.0 <= float(temperature) <= 2.0
+    ):
+        raise ValueError("managed-agent temperature must be between 0 and 2")
+    if (
+        isinstance(max_tokens, bool)
+        or not isinstance(max_tokens, int)
+        or not 1 <= max_tokens <= MAX_COMPLETION_TOKENS
+    ):
+        raise ValueError(
+            f"managed-agent max_tokens must be between 1 and {MAX_COMPLETION_TOKENS}"
+        )
+    if (
+        isinstance(max_turns, bool)
+        or not isinstance(max_turns, int)
+        or not 1 <= max_turns <= _MANAGED_AGENT_MAX_TURNS
+    ):
+        raise ValueError(
+            f"managed-agent max_turns must be between 1 and {_MANAGED_AGENT_MAX_TURNS}"
+        )
+    if (
+        isinstance(max_total_tokens, bool)
+        or not isinstance(max_total_tokens, int)
+        or max_total_tokens < 0
+    ):
+        raise ValueError(
+            "managed-agent max_total_tokens must be a non-negative integer"
+        )
+    return float(temperature), max_tokens, max_turns
+
+
+def _validate_managed_tool_config(config: Dict[str, Any]) -> None:
+    """Reject capabilities unavailable at the managed HTTP boundary."""
+
+    if "tools" not in config:
+        return
+    tools = config["tools"]
+    if not isinstance(tools, list):
+        raise ValueError("managed-agent tools must be a list")
+    rejected: list[str] = []
+    for entry in tools:
+        if isinstance(entry, str):
+            name = entry
+        elif isinstance(entry, dict):
+            function = entry.get("function")
+            name = function.get("name") if isinstance(function, dict) else None
+        else:
+            name = None
+        if not isinstance(name, str) or name not in _MANAGED_AGENT_ALLOWED_TOOL_NAMES:
+            rejected.append(str(name or "<invalid>"))
+    if rejected:
+        raise ValueError(
+            "managed-agent tools are unavailable at the HTTP boundary: "
+            + ", ".join(sorted(set(rejected)))
+        )
+
+
+def _managed_remote_tool_name_allowed(name: Any) -> bool:
+    """Apply the local quarantine to explicitly enabled remote adapters too."""
+
+    return (
+        isinstance(name, str)
+        and bool(name)
+        and name in _MANAGED_AGENT_ALLOWED_TOOL_NAMES
+        and name not in _QUARANTINED_TOOL_NAMES
+        and name not in _MANAGED_AGENT_DENIED_TOOL_NAMES
+    )
+
+
+def _managed_tool_allowed(tool_cls: Any) -> bool:
+    """Allow only non-interactive, read-bounded tools in managed HTTP agents."""
+
+    try:
+        spec = tool_cls().spec
+    except Exception:
+        return False
+    if spec.name in _QUARANTINED_TOOL_NAMES | _MANAGED_AGENT_DENIED_TOOL_NAMES:
+        return False
+    if spec.name not in _MANAGED_AGENT_ALLOWED_TOOL_NAMES:
+        return False
+    if spec.requires_confirmation:
+        return False
+    return set(spec.required_capabilities) <= _MANAGED_AGENT_ALLOWED_CAPABILITIES
+
+
+def _trace_has_disallowed_managed_tool(trace: Any) -> bool:
+    """Hide legacy trace payloads created before the HTTP tool quarantine."""
+
+    for step in getattr(trace, "steps", ()):
+        raw_step_type = getattr(step, "step_type", None)
+        step_type = getattr(raw_step_type, "value", raw_step_type)
+        if step_type != "tool_call":
+            continue
+        step_input = getattr(step, "input", None)
+        name = step_input.get("tool") if isinstance(step_input, dict) else None
+        if name not in _MANAGED_AGENT_ALLOWED_TOOL_NAMES:
+            return True
+    return False
+
 
 def _resolve_memory_backend(config: Any) -> Any:
     """Instantiate the configured memory backend, or None if unavailable.
@@ -79,10 +248,12 @@ def _resolve_memory_backend(config: Any) -> Any:
     if config is None or not getattr(config.agent, "context_from_memory", False):
         return None
     try:
-        import openjarvis.tools.storage  # noqa: F401
+        key = config.memory.default_backend
+        from openjarvis.tools.storage import register_optional_backends
+
+        register_optional_backends(key)
         from openjarvis.core.registry import MemoryRegistry
 
-        key = config.memory.default_backend
         if MemoryRegistry.contains(key):
             return MemoryRegistry.create(key, db_path=config.memory.db_path)
     except Exception:
@@ -94,22 +265,32 @@ class _LightweightSystem:
     """Minimal system facade for the executor — avoids rebuilding the
     full JarvisSystem (which picks a random model from Ollama)."""
 
-    def __init__(self, engine: Any, model: str, config: Any = None):
+    def __init__(
+        self,
+        engine: Any,
+        model: str,
+        config: Any = None,
+        *,
+        http_boundary: bool = False,
+    ):
         self.engine = engine
         self.model = model
         self.config = config
+        self.http_boundary = http_boundary
         # Wire the configured memory backend so an agent's memory_store /
         # memory_retrieve tools work when the tick runs through the server.
         # The executor injects system.memory_backend into those tools; this
         # facade previously left it None, so they reported "No memory backend
         # configured" even though the backend was configured and active.
-        self.memory_backend = _resolve_memory_backend(config)
+        self.memory_backend = None if http_boundary else _resolve_memory_backend(config)
 
 
 def _make_lightweight_system(
     engine: Any,
     model: str,
     config: Any = None,
+    *,
+    http_boundary: bool = False,
 ) -> _LightweightSystem:
     """Build a minimal system with a fresh inference engine.
 
@@ -154,10 +335,20 @@ def _make_lightweight_system(
             )
         except Exception:
             pass  # telemetry is optional
-        return _LightweightSystem(plain_engine, model, cfg)
+        return _LightweightSystem(
+            plain_engine,
+            model,
+            cfg,
+            http_boundary=http_boundary,
+        )
     except Exception:
         pass
-    return _LightweightSystem(engine, model, config)
+    return _LightweightSystem(
+        engine,
+        model,
+        config,
+        http_boundary=http_boundary,
+    )
 
 
 def _parse_param_count(model_name: str) -> float:
@@ -262,8 +453,6 @@ def _ensure_registries_populated() -> None:
 
 def build_tools_list() -> List[Dict[str, Any]]:
     """Build unified tools list from ToolRegistry + ChannelRegistry."""
-    import os
-
     from openjarvis.core.credentials import TOOL_CREDENTIALS
     from openjarvis.core.registry import ChannelRegistry, ToolRegistry
 
@@ -273,6 +462,8 @@ def build_tools_list() -> List[Dict[str, Any]]:
 
     for name, tool_cls in ToolRegistry.items():
         if name in _BROWSER_SUB_TOOLS:
+            continue
+        if not _managed_tool_allowed(tool_cls):
             continue
         # `spec` is an instance @property on BaseTool subclasses, so
         # we have to instantiate the tool to read it. The earlier
@@ -301,25 +492,6 @@ def build_tools_list() -> List[Dict[str, Any]]:
                 ),
             }
         )
-
-    try:
-        if any(ToolRegistry.contains(n) for n in _BROWSER_SUB_TOOLS):
-            items.append(
-                {
-                    "name": "browser",
-                    "description": (
-                        "Web browser automation"
-                        " (navigate, click, type, screenshot, extract)"
-                    ),
-                    "category": "browser",
-                    "source": "tool",
-                    "requires_credentials": False,
-                    "credential_keys": [],
-                    "configured": True,
-                }
-            )
-    except Exception:
-        pass
 
     try:
         for name, _cls in ChannelRegistry.items():
@@ -357,8 +529,7 @@ def _resolve_tool_specs(
     ``{"type": "function", "function": {"name, description, parameters"}}``.
 
     Special handling:
-      * Dict entries pass through as-is (allows advanced configs to
-        supply fully-formed specs).
+      * Dict entries pass through as-is, except quarantined capability names.
       * ``browser`` is a synthetic display-only meta-tool that expands
         to the 6 real browser sub-tools (browser_navigate, click, …).
       * Channel names (``slack``, ``gmail``, …) come from the
@@ -374,8 +545,14 @@ def _resolve_tool_specs(
     _ensure_registries_populated()
 
     def _spec_dict_for(name: str) -> Optional[Dict[str, Any]]:
+        if not ToolRegistry.contains(name):
+            return None
+        tool_cls = ToolRegistry.get(name)
+        if not _managed_tool_allowed(tool_cls):
+            logger.warning("Unsafe managed-agent tool '%s' was dropped", name)
+            return None
         try:
-            spec = ToolRegistry.get(name)().spec
+            spec = tool_cls().spec
         except Exception as exc:
             logger.warning(
                 "Could not build spec for tool '%s' (%s) — dropping",
@@ -397,9 +574,21 @@ def _resolve_tool_specs(
 
     for entry in tool_config:
         if isinstance(entry, dict):
+            function = entry.get("function")
+            name = function.get("name") if isinstance(function, dict) else None
+            if (
+                not isinstance(name, str)
+                or not ToolRegistry.contains(name)
+                or not _managed_tool_allowed(ToolRegistry.get(name))
+            ):
+                logger.warning("Unsafe managed-agent tool '%s' was dropped", name)
+                continue
             resolved.append(entry)
             continue
         if not isinstance(entry, str):
+            continue
+        if entry in _QUARANTINED_TOOL_NAMES:
+            logger.warning("Quarantined tool '%s' dropped from agent config", entry)
             continue
 
         # Expand the synthetic "browser" meta-tool into its sub-tools.
@@ -452,23 +641,18 @@ _SAMPLER_PARAM_KEYS = (
 
 
 def _build_managed_system_prompt(system_prompt: str, app_config: Any) -> str:
-    """Build the streaming managed-agent system prompt via SystemPromptBuilder.
+    """Compose managed HTTP prompts without private installation persona files."""
 
-    Routes the agent's own ``system_prompt`` through the same builder the
-    CLI/ask path uses, so SOUL.md / MEMORY.md / USER.md persona files are
-    injected for streaming chat too (#431). Returns the assembled prompt
-    (caller decides whether to append a SYSTEM message); an agent with
-    neither persona nor template yields an empty string, preserving the
-    prior no-SYSTEM-message behavior.
-    """
-    from openjarvis.prompt.builder import SystemPromptBuilder
+    del app_config
+    from ava_extensions.patches.system_prompt_loader import load_common_persona
 
-    builder = SystemPromptBuilder(
-        agent_template=system_prompt or "",
-        memory_files_config=getattr(app_config, "memory_files", None),
-        system_prompt_config=getattr(app_config, "system_prompt", None),
-    )
-    return builder.build()
+    common = load_common_persona().strip()
+    if not common:
+        raise RuntimeError("Ava common identity is unavailable")
+    template = str(system_prompt or "").strip()
+    if not template:
+        return common
+    return f"{common}\n\n## Mission de l'agent géré\n{template}"
 
 
 def _sampler_kwargs(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -479,6 +663,33 @@ def _sampler_kwargs(config: Dict[str, Any]) -> Dict[str, Any]:
         if val is not None:
             out[key] = val
     return out
+
+
+def _sanitize_managed_history(
+    history: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Remove legacy tool results no longer allowed at the HTTP boundary."""
+
+    unsafe_reply_ids: set[str] = set()
+    sanitized: List[Dict[str, Any]] = []
+    for message in history:
+        stored = message.get("tool_calls")
+        if stored:
+            if not isinstance(stored, list) or any(
+                not isinstance(call, dict)
+                or not _managed_remote_tool_name_allowed(call.get("tool"))
+                for call in stored
+            ):
+                reply_to_id = message.get("reply_to_id")
+                if reply_to_id:
+                    unsafe_reply_ids.add(str(reply_to_id))
+                continue
+        sanitized.append(dict(message))
+    return [
+        message
+        for message in sanitized
+        if str(message.get("id") or "") not in unsafe_reply_ids
+    ]
 
 
 def _replay_history_messages(
@@ -495,47 +706,79 @@ def _replay_history_messages(
     """
     from openjarvis.core.types import Message, Role, ToolCall
 
-    messages: List[Any] = []
-    for m in reversed(history):
-        if m.get("id") == exclude_id:
-            continue
-        direction = m.get("direction")
+    chronological = [
+        message
+        for message in reversed(_sanitize_managed_history(history))
+        if message.get("id") != exclude_id
+    ]
+    users = {
+        str(message.get("id")): message
+        for message in chronological
+        if message.get("direction") == "user_to_agent"
+        and message.get("status", "delivered") == "delivered"
+        and message.get("id")
+    }
+    pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    legacy_user: Dict[str, Any] | None = None
+    used_users: set[str] = set()
+    for message in chronological:
+        direction = message.get("direction")
         if direction == "user_to_agent":
-            messages.append(Message(role=Role.USER, content=m.get("content") or ""))
-        elif direction == "agent_to_user":
-            stored = m.get("tool_calls")
-            if stored:
-                calls = []
-                results = []
-                for i, tc in enumerate(stored):
-                    call_id = f"hist-{m.get('id', '')}-{i}"
-                    calls.append(
-                        ToolCall(
-                            id=call_id,
-                            name=tc.get("tool", ""),
-                            arguments=tc.get("arguments") or "",
-                        )
+            if message.get("status", "delivered") == "delivered":
+                legacy_user = message
+            continue
+        if (
+            direction != "agent_to_user"
+            or message.get("status", "delivered") != "delivered"
+        ):
+            continue
+        reply_to_id = message.get("reply_to_id")
+        user = users.get(str(reply_to_id)) if reply_to_id else legacy_user
+        user_id = str(user.get("id")) if user is not None else ""
+        if user is None or not user_id or user_id in used_users:
+            continue
+        pairs.append((user, message))
+        used_users.add(user_id)
+        if not reply_to_id:
+            legacy_user = None
+
+    messages: List[Any] = []
+    for user, assistant_message in pairs[-_MANAGED_HISTORY_TURNS:]:
+        messages.append(Message(role=Role.USER, content=user.get("content") or ""))
+        m = assistant_message
+        stored = m.get("tool_calls")
+        if stored:
+            calls = []
+            results = []
+            for i, tc in enumerate(stored):
+                call_id = f"hist-{m.get('id', '')}-{i}"
+                calls.append(
+                    ToolCall(
+                        id=call_id,
+                        name=tc.get("tool", ""),
+                        arguments=tc.get("arguments") or "",
                     )
-                    results.append(
-                        Message(
-                            role=Role.TOOL,
-                            content=str(tc.get("result", "")),
-                            tool_call_id=call_id,
-                            name=tc.get("tool", ""),
-                        )
-                    )
-                messages.append(
+                )
+                results.append(
                     Message(
-                        role=Role.ASSISTANT,
-                        content=m.get("content") or None,
-                        tool_calls=calls,
+                        role=Role.TOOL,
+                        content=str(tc.get("result", "")),
+                        tool_call_id=call_id,
+                        name=tc.get("tool", ""),
                     )
                 )
-                messages.extend(results)
-            else:
-                messages.append(
-                    Message(role=Role.ASSISTANT, content=m.get("content") or "")
+            messages.append(
+                Message(
+                    role=Role.ASSISTANT,
+                    content=m.get("content") or None,
+                    tool_calls=calls,
                 )
+            )
+            messages.extend(results)
+        else:
+            messages.append(
+                Message(role=Role.ASSISTANT, content=m.get("content") or "")
+            )
     return messages
 
 
@@ -593,11 +836,18 @@ def _build_deep_research_tools(
     engine: Any,
     model: str,
     knowledge_db_path: str = "",
+    *,
+    allow_personal_knowledge: bool = True,
 ) -> list:
     """Build the 4 DeepResearch tools from a KnowledgeStore.
 
     Returns an empty list if the knowledge DB does not exist.
     """
+    from openjarvis.tools.think import ThinkTool
+
+    if not allow_personal_knowledge:
+        return [ThinkTool()]
+
     from pathlib import Path
 
     if not knowledge_db_path:
@@ -613,7 +863,6 @@ def _build_deep_research_tools(
     from openjarvis.tools.knowledge_search import KnowledgeSearchTool
     from openjarvis.tools.knowledge_sql import KnowledgeSQLTool
     from openjarvis.tools.scan_chunks import ScanChunksTool
-    from openjarvis.tools.think import ThinkTool
 
     store = KnowledgeStore(knowledge_db_path)
     retriever = TwoStageRetriever(store)
@@ -733,6 +982,12 @@ def _get_mcp_tools(app_state: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]
 
             for adapter in discovered:
                 spec = adapter.spec
+                if not _managed_remote_tool_name_allowed(spec.name):
+                    logger.warning(
+                        "Unsafe managed-agent MCP tool '%s' was dropped",
+                        spec.name,
+                    )
+                    continue
                 openai_tools.append(
                     {
                         "type": "function",
@@ -811,6 +1066,7 @@ async def _stream_managed_agent(
     agent_record: Dict[str, Any],
     user_content: str,
     message_id: str,
+    tick_token: str,
     engine: Any,
     bus: Any,
     app_state: Any = None,
@@ -839,9 +1095,7 @@ async def _stream_managed_agent(
         or getattr(engine, "_model", "")
     )
     system_prompt = config.get("system_prompt")
-    temperature = config.get("temperature", 0.7)
-    max_tokens = config.get("max_tokens", 1024)
-    max_turns = config.get("max_turns", 10)
+    temperature, max_tokens, max_turns = _managed_runtime_values(config)
 
     # Build conversation messages from history + current input
     llm_messages: List[Message] = []
@@ -863,33 +1117,28 @@ async def _stream_managed_agent(
 
     # Resolve agent type and class for DeepResearch tool wiring
     agent_type = agent_record.get("agent_type", "")
+    deep_research_tools: list[Any] = []
     if agent_type == "deep_research":
-        dr_tools = _build_deep_research_tools(
+        deep_research_tools = _build_deep_research_tools(
             engine=engine,
             model=model,
+            allow_personal_knowledge=False,
         )
-        # Store on app_state so streaming loop can access them
-        if app_state is not None and dr_tools:
-            app_state._dr_tools = dr_tools
 
     # Load prior conversation context (DESC order, reverse for chronological).
     # Replaying recorded tool_calls (assistant tool-use + tool results) keeps
     # multi-turn tool behaviour from regressing to fabricated output (#382).
-    history = manager.list_messages(agent_id, limit=50)
+    history = manager.list_messages(agent_id, limit=(2 * _MANAGED_HISTORY_TURNS) + 1)
     llm_messages.extend(_replay_history_messages(history, message_id))
 
     # Append the current user message
     llm_messages.append(Message(role=Role.USER, content=user_content))
 
-    # Mark the user message as delivered
-    manager.mark_message_delivered(message_id)
-
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
     # For deep_research agents: run the full agent loop, not raw streaming
     if agent_type == "deep_research" and app_state is not None:
-        dr_tools = getattr(app_state, "_dr_tools", None)
-        if dr_tools:
+        if deep_research_tools:
 
             async def generate_deep_research():
                 """Run DeepResearchAgent in thread, stream progress + result."""
@@ -898,9 +1147,11 @@ async def _stream_managed_agent(
                 import threading
                 import time as _dr_time
 
+                from openjarvis.agents._stubs import AgentContext
                 from openjarvis.agents.deep_research import DeepResearchAgent
 
                 progress_q: queue.Queue = queue.Queue()
+                dr_tool_calls: List[Dict[str, Any]] = []
 
                 # Log query start
                 _dr_start = _dr_time.time()
@@ -921,11 +1172,19 @@ async def _stream_managed_agent(
                 dr_agent = DeepResearchAgent(
                     engine=engine,
                     model=model,
-                    tools=dr_tools,
-                    max_turns=int(config.get("max_turns", 8)),
-                    temperature=float(config.get("temperature", 0.3)),
+                    tools=deep_research_tools,
+                    max_turns=max_turns,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
                     interactive=True,
                     confirm_callback=lambda _prompt: True,
+                )
+                dr_context = AgentContext()
+                dr_context.metadata["server_identity_prompt"] = final_system_prompt
+                dr_context.conversation.messages.extend(
+                    message
+                    for message in llm_messages[:-1]
+                    if message.role != Role.SYSTEM
                 )
 
                 # Wrap the executor to capture tool calls
@@ -941,7 +1200,7 @@ async def _stream_managed_agent(
                             agent_id,
                             "tool_call",
                             f"Calling {tool_name}: {args_str}",
-                            {"tool": tool_name, "arguments": full_args},
+                            {"tool": tool_name, "arguments": full_args[:4096]},
                         )
                     except Exception as _tc_exc:
                         logger.warning("Log tool_call failed: %s", _tc_exc)
@@ -957,6 +1216,20 @@ async def _stream_managed_agent(
                     _tool_start = _dr_time.monotonic()
                     result = original_execute(tc)
                     _tool_latency_ms = (_dr_time.monotonic() - _tool_start) * 1000
+                    if not result.success:
+                        # Tool internals may contain exception text, paths or
+                        # credentials.  Managed HTTP turns receive only a
+                        # stable failure marker; details stay in server logs.
+                        result.content = f"Tool '{tool_name}' failed."
+                    dr_tool_calls.append(
+                        {
+                            "tool": tool_name,
+                            "arguments": full_args[:4096],
+                            "result": (result.content or "")[:1024],
+                            "success": bool(result.success),
+                            "latency": float(_tool_latency_ms),
+                        }
+                    )
 
                     # Log tool result
                     try:
@@ -979,10 +1252,10 @@ async def _stream_managed_agent(
                         {
                             "type": "tool_end",
                             "tool": tool_name,
-                            "arguments": full_args,
+                            "arguments": full_args[:4096],
                             "success": result.success,
                             "latency": _tool_latency_ms,
-                            "result": result.content or "",
+                            "result": (result.content or "")[:1024],
                         }
                     )
                     return result
@@ -991,12 +1264,25 @@ async def _stream_managed_agent(
 
                 def _run_agent():
                     agent_metadata = {}
+                    terminal_status = "error"
                     try:
-                        result = dr_agent.run(user_content)
+                        result = dr_agent.run(user_content, context=dr_context)
                         content = result.content or "No results found."
                         agent_metadata = result.metadata or {}
-                    except Exception as exc:
-                        content = f"Error: {exc}"
+                        manager.complete_message_turn(
+                            agent_id,
+                            message_id,
+                            content,
+                            tool_calls=dr_tool_calls or None,
+                        )
+                        terminal_status = "idle"
+                    except Exception:
+                        manager.mark_message_failed(message_id)
+                        logger.error(
+                            "Deep-research managed turn failed",
+                            exc_info=True,
+                        )
+                        content = "Error: managed deep-research generation failed"
 
                     elapsed = _dr_time.time() - _dr_start
 
@@ -1019,6 +1305,11 @@ async def _stream_managed_agent(
                             _qc_exc,
                         )
 
+                    manager.end_tick(
+                        agent_id,
+                        tick_token,
+                        status=terminal_status,
+                    )
                     progress_q.put(
                         {
                             "type": "error" if content.startswith("Error:") else "done",
@@ -1029,12 +1320,22 @@ async def _stream_managed_agent(
                     )
 
                 thread = threading.Thread(target=_run_agent, daemon=True)
-                thread.start()
+                try:
+                    thread.start()
+                except Exception:
+                    manager.mark_message_failed(message_id)
+                    manager.end_tick(agent_id, tick_token, status="error")
+                    logger.error(
+                        "Deep-research managed worker could not start",
+                        exc_info=True,
+                    )
+                    yield (
+                        'data: {"error":{"type":"worker_unavailable",'
+                        '"message":"Managed deep-research worker unavailable"}}\n\n'
+                    )
+                    yield "data: [DONE]\n\n"
+                    return
 
-                # Collect tool calls from deep-research so we can persist them
-                # alongside the final response (and the UI can re-render them
-                # after a page reload).
-                dr_tool_calls: List[Dict[str, Any]] = []
                 _pending_dr_starts: Dict[str, str] = {}
 
                 # Stream progress events and final content
@@ -1043,8 +1344,13 @@ async def _stream_managed_agent(
                         event = await asyncio.to_thread(progress_q.get, timeout=600)
                     except Exception:
                         # Timeout
-                        yield _sse_chunk(chunk_id, model, "Agent timed out.")
-                        break
+                        manager.mark_message_failed(message_id)
+                        yield (
+                            'data: {"error":{"type":"generation_timeout",'
+                            '"message":"Managed deep-research agent timed out"}}\n\n'
+                        )
+                        yield "data: [DONE]\n\n"
+                        return
 
                     if event["type"] == "tool_start":
                         tool = event["tool"]
@@ -1077,17 +1383,6 @@ async def _stream_managed_agent(
 
                     elif event["type"] == "tool_end":
                         tool = event["tool"]
-                        dr_tool_calls.append(
-                            {
-                                "tool": tool,
-                                "arguments": event.get(
-                                    "arguments", _pending_dr_starts.get(tool, "")
-                                ),
-                                "result": event.get("result", ""),
-                                "success": bool(event.get("success", False)),
-                                "latency": float(event.get("latency", 0.0)),
-                            }
-                        )
                         _pending_dr_starts.pop(tool, None)
                         _end_payload = json.dumps(
                             {
@@ -1103,6 +1398,15 @@ async def _stream_managed_agent(
                         content = event["content"]
                         meta = event.get("metadata", {})
                         elapsed_s = event.get("elapsed", 0)
+
+                        if event["type"] == "error":
+                            manager.mark_message_failed(message_id)
+                            yield (
+                                'data: {"error":{"type":"generation_error",'
+                                '"message":"Managed agent generation failed"}}\n\n'
+                            )
+                            yield "data: [DONE]\n\n"
+                            break
 
                         # Stream content word-by-word
                         words = content.split(" ")
@@ -1144,14 +1448,6 @@ async def _stream_managed_agent(
                         }
                         yield f"data: {json.dumps(finish_data)}\n\n"
                         yield "data: [DONE]\n\n"
-
-                        # Persist (with the tool calls captured during
-                        # the deep-research turn so they survive reload).
-                        manager.store_agent_response(
-                            agent_id,
-                            content,
-                            tool_calls=dr_tool_calls or None,
-                        )
                         break
 
             return StreamingResponse(
@@ -1175,22 +1471,13 @@ async def _stream_managed_agent(
     # locally-hosted models can be tuned per agent (#386).
     stream_kwargs.update(_sampler_kwargs(config))
 
-    # Discover MCP tools and merge into stream_kwargs
+    # Remote MCP adapters have no enforceable local path/capability contract.
+    # Even an adapter named ``file_read`` can behave differently from the
+    # locally audited tool and reach the quarantined legacy memory. Managed
+    # HTTP conversations therefore never expose MCP tools; MCP remains
+    # available to explicitly constructed non-HTTP systems with their own
+    # authority boundary.
     mcp_adapters: Dict[str, Any] = {}
-    if app_state is not None:
-        try:
-            mcp_openai_tools, mcp_adapters = _get_mcp_tools(app_state)
-            if mcp_openai_tools:
-                existing_tools = stream_kwargs.get("tools", [])
-                stream_kwargs["tools"] = existing_tools + mcp_openai_tools
-                logger.info(
-                    "Added %d MCP tools to streaming request",
-                    len(mcp_openai_tools),
-                )
-        except Exception as exc:
-            logger.warning(
-                "Failed to get MCP tools for streaming: %s", exc, exc_info=True
-            )
 
     # Shared state between the generator and the BackgroundTask that
     # runs after the SSE response completes (or the client disconnects
@@ -1200,41 +1487,81 @@ async def _stream_managed_agent(
         "content": "",
         "tool_calls": [],
         "persisted": False,
+        "terminal_success": False,
+        "persistence_error": False,
+        "tick_released": False,
     }
+
+    import threading as _persist_threading
+
+    finalize_lock = _persist_threading.Lock()
 
     def _persist_final() -> None:
         if persist_state["persisted"]:
             return
         persist_state["persisted"] = True
-        if persist_state["content"]:
+        if persist_state["terminal_success"] and persist_state["content"]:
             try:
-                manager.store_agent_response(
+                manager.complete_message_turn(
                     agent_id,
+                    message_id,
                     persist_state["content"],
                     tool_calls=persist_state["tool_calls"] or None,
                 )
             except Exception as store_exc:
+                persist_state["terminal_success"] = False
+                persist_state["persistence_error"] = True
                 logger.error(
                     "Failed to store agent response: %s",
                     store_exc,
                     exc_info=True,
                 )
+                try:
+                    manager.mark_message_failed(message_id)
+                except Exception:
+                    logger.error(
+                        "Failed to mark uncommitted agent message as failed",
+                        exc_info=True,
+                    )
+        else:
+            try:
+                manager.mark_message_failed(message_id)
+            except Exception as store_exc:
+                logger.error(
+                    "Failed to mark agent message as failed: %s",
+                    store_exc,
+                    exc_info=True,
+                )
         try:
             content = persist_state["content"] or ""
+            succeeded = bool(
+                persist_state["terminal_success"]
+                and not persist_state["persistence_error"]
+            )
+            failure_reason = (
+                "persistence_error"
+                if persist_state["persistence_error"]
+                else "incomplete_response"
+            )
             manager.add_learning_log(
                 agent_id,
-                "query_complete",
-                f"Response: {len(content)} chars, "
-                f"{len(persist_state['tool_calls'])} tool calls",
+                "query_complete" if succeeded else "query_error",
+                (
+                    f"Response: {len(content)} chars, "
+                    f"{len(persist_state['tool_calls'])} tool calls"
+                    if succeeded
+                    else f"Managed turn failed: {failure_reason}"
+                ),
                 {
                     "response_length": len(content),
                     "tool_calls": len(persist_state["tool_calls"]),
+                    "failure_reason": None if succeeded else failure_reason,
                 },
             )
         except Exception as _qc_exc:
-            logger.warning("Log query_complete failed: %s", _qc_exc)
+            logger.warning("Log terminal managed-query state failed: %s", _qc_exc)
 
-    async def generate():
+    async def _generate_body():
         """Async generator yielding SSE-formatted chunks with real token streaming."""
 
         collected_content = ""
@@ -1302,16 +1629,10 @@ async def _stream_managed_agent(
             except Exception as exc:
                 logger.error("Managed agent stream error: %s", exc, exc_info=True)
                 error_data = {
-                    "id": chunk_id,
-                    "object": "chat.completion.chunk",
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"content": f"Error: {exc}"},
-                            "finish_reason": "stop",
-                        }
-                    ],
+                    "error": {
+                        "type": "generation_error",
+                        "message": "Managed agent generation failed",
+                    }
                 }
                 yield f"data: {json.dumps(error_data)}\n\n"
                 yield "data: [DONE]\n\n"
@@ -1371,13 +1692,21 @@ async def _stream_managed_agent(
                     try:
                         # Try MCP adapter first (external tools)
                         mcp_adapter = mcp_adapters.get(tool_name)
-                        if mcp_adapter is not None:
+                        if (
+                            mcp_adapter is not None
+                            and _managed_remote_tool_name_allowed(tool_name)
+                        ):
                             try:
                                 parsed_args = json.loads(tool_args) if tool_args else {}
                             except (json.JSONDecodeError, TypeError):
                                 parsed_args = {}
                             result = mcp_adapter.execute(**parsed_args)
-                            tool_result_content = result.content
+                            tool_succeeded = bool(result.success)
+                            tool_result_content = (
+                                result.content
+                                if tool_succeeded
+                                else f"Tool '{tool_name}' failed."
+                            )
                         else:
                             # Try to use ToolExecutor if tools are configured
                             from openjarvis.core.registry import ToolRegistry
@@ -1389,7 +1718,7 @@ async def _stream_managed_agent(
                             )
 
                             tool_cls = ToolRegistry.get(tool_name)
-                            if tool_cls is not None:
+                            if tool_cls is not None and _managed_tool_allowed(tool_cls):
                                 # Inject backend / channel / engine the same
                                 # way cli/ask.py does, else memory_* / channel_*
                                 # / llm tools fail with "No backend configured"
@@ -1401,19 +1730,11 @@ async def _stream_managed_agent(
                                     model=model,
                                     app_state=app_state,
                                 )
-                                # Tools the user explicitly added to this
-                                # agent's toolkit are considered pre-approved —
-                                # selecting them in the wizard is the
-                                # confirmation. Without this, tools that have
-                                # `requires_confirmation=True` (shell_exec,
-                                # apply_patch) would fail with "requires
-                                # confirmation but no callback available" on
-                                # every call.
                                 executor = ToolExecutor(
                                     tools=[tool_instance],
                                     bus=bus,
-                                    interactive=True,
-                                    confirm_callback=lambda _prompt: True,
+                                    interactive=False,
+                                    confirm_callback=None,
                                 )
                                 result = executor.execute(
                                     StubToolCall(
@@ -1422,13 +1743,17 @@ async def _stream_managed_agent(
                                         arguments=tool_args,
                                     ),
                                 )
-                                tool_result_content = result.content
+                                tool_succeeded = bool(result.success)
+                                tool_result_content = (
+                                    result.content
+                                    if tool_succeeded
+                                    else f"Tool '{tool_name}' failed."
+                                )
                             else:
                                 logger.warning(
                                     "Tool '%s' not found in registry or MCP adapters",
                                     tool_name,
                                 )
-                        tool_succeeded = True
                     except Exception as tool_exc:
                         logger.error(
                             "Tool execution error for %s: %s",
@@ -1436,14 +1761,14 @@ async def _stream_managed_agent(
                             tool_exc,
                             exc_info=True,
                         )
-                        tool_result_content = f"Error executing {tool_name}: {tool_exc}"
+                        tool_result_content = f"Tool '{tool_name}' failed."
 
                     tool_latency_ms = (_time.monotonic() * 1000) - tool_start_ms
                     collected_tool_calls.append(
                         {
                             "tool": tool_name,
-                            "arguments": tool_args,
-                            "result": tool_result_content,
+                            "arguments": tool_args[:4096],
+                            "result": tool_result_content[:1024],
                             "success": tool_succeeded,
                             "latency": tool_latency_ms,
                         }
@@ -1471,7 +1796,7 @@ async def _stream_managed_agent(
                             "tool": tool_name,
                             "success": tool_succeeded,
                             "latency": tool_latency_ms,
-                            "result": tool_result_content,
+                            "result": tool_result_content[:1024],
                         }
                     )
                     yield f"event: tool_call_end\ndata: {_end_payload}\n\n"
@@ -1498,7 +1823,23 @@ async def _stream_managed_agent(
             collected_content += turn_content
             persist_state["content"] = collected_content
             persist_state["tool_calls"] = list(collected_tool_calls)
+            persist_state["terminal_success"] = bool(
+                collected_content.strip() and current_finish_reason == "stop"
+            )
             break
+
+        # Commit before the completion marker. The BackgroundTask remains the
+        # disconnect fallback for partial streams, while the normal path never
+        # acknowledges completion before its exact user/assistant link exists.
+        _persist_final()
+
+        if not persist_state["terminal_success"]:
+            yield (
+                'data: {"error":{"type":"empty_or_incomplete_response",'
+                '"message":"Managed agent returned no complete response"}}\n\n'
+            )
+            yield "data: [DONE]\n\n"
+            return
 
         # Final chunk with finish_reason
         final_data = {
@@ -1516,9 +1857,47 @@ async def _stream_managed_agent(
         yield f"data: {json.dumps(final_data)}\n\n"
         yield "data: [DONE]\n\n"
 
+    async def generate():
+        """Guarantee terminal persistence even when ASGI raises ClientDisconnect."""
+
+        try:
+            async for event in _generate_body():
+                yield event
+        finally:
+            _finalize_request()
+
+    def _finalize_request() -> None:
+        """Persist and release the tick once across EOF, error and disconnect."""
+
+        with finalize_lock:
+            _persist_final()
+            if not persist_state["tick_released"]:
+                manager.end_tick(
+                    agent_id,
+                    tick_token,
+                    status=("idle" if persist_state["terminal_success"] else "error"),
+                )
+                persist_state["tick_released"] = True
+
     from starlette.background import BackgroundTask
 
-    return StreamingResponse(
+    class _DisconnectSafeStreamingResponse(StreamingResponse):
+        async def __call__(self, scope, receive, send) -> None:
+            try:
+                await super().__call__(scope, receive, send)
+            finally:
+                close = getattr(self.body_iterator, "aclose", None)
+                if close is not None:
+                    try:
+                        await close()
+                    except Exception:
+                        logger.warning(
+                            "Failed to close managed-agent stream iterator",
+                            exc_info=True,
+                        )
+                _finalize_request()
+
+    return _DisconnectSafeStreamingResponse(
         generate(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
@@ -1545,6 +1924,29 @@ def create_agent_manager_router(
 
     @agents_router.post("")
     async def create_agent(req: CreateAgentRequest, request: Request):
+        effective_config = dict(req.config or {})
+        if req.template_id:
+            template = next(
+                (
+                    item
+                    for item in manager.list_templates()
+                    if item.get("id") == req.template_id
+                ),
+                None,
+            )
+            if template is None:
+                raise HTTPException(status_code=404, detail="Template not found")
+            effective_config = {
+                key: value
+                for key, value in template.items()
+                if key not in {"id", "name", "description", "source"}
+            }
+            effective_config.update(req.config or {})
+        try:
+            _managed_runtime_values(effective_config)
+            _validate_managed_tool_config(effective_config)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         if req.template_id:
             agent = manager.create_from_template(
                 req.template_id, req.name, overrides=req.config
@@ -1579,6 +1981,11 @@ def create_agent_manager_router(
         if req.agent_type is not None:
             kwargs["agent_type"] = req.agent_type
         if req.config is not None:
+            try:
+                _managed_runtime_values(req.config)
+                _validate_managed_tool_config(req.config)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
             kwargs["config"] = req.config
         return manager.update_agent(agent_id, **kwargs)
 
@@ -1586,21 +1993,30 @@ def create_agent_manager_router(
     async def delete_agent(agent_id: str):
         if not manager.get_agent(agent_id):
             raise HTTPException(status_code=404, detail="Agent not found")
-        manager.delete_agent(agent_id)
+        try:
+            manager.delete_agent(agent_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"status": "archived"}
 
     @agents_router.post("/{agent_id}/pause")
     async def pause_agent(agent_id: str):
         if not manager.get_agent(agent_id):
             raise HTTPException(status_code=404, detail="Agent not found")
-        manager.pause_agent(agent_id)
+        try:
+            manager.pause_agent(agent_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"status": "paused"}
 
     @agents_router.post("/{agent_id}/resume")
     async def resume_agent(agent_id: str):
         if not manager.get_agent(agent_id):
             raise HTTPException(status_code=404, detail="Agent not found")
-        manager.resume_agent(agent_id)
+        try:
+            manager.resume_agent(agent_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"status": "idle"}
 
     @agents_router.post("/{agent_id}/run")
@@ -1610,18 +2026,11 @@ def create_agent_manager_router(
         agent = manager.get_agent(agent_id)
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
-        if agent["status"] == "archived":
-            raise HTTPException(status_code=400, detail="Agent is archived")
-
-        # Auto-recover from error/needs_attention state
-        if agent["status"] in ("error", "needs_attention"):
-            manager.update_agent(agent_id, status="idle")
-
         # Acquire tick BEFORE spawning thread — prevents race
         try:
-            manager.start_tick(agent_id)
-        except ValueError:
-            raise HTTPException(status_code=409, detail="Agent is already running")
+            tick_token = manager.start_tick(agent_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
         # Re-use the server's engine + model so we don't pick a
         # random model from Ollama's list.
@@ -1644,13 +2053,18 @@ def create_agent_manager_router(
                     server_engine,
                     server_model,
                     server_config,
+                    http_boundary=True,
                 )
                 executor.set_system(system)
                 # The route handler above already called start_tick() to
                 # serialize concurrent POSTs; tell the executor not to
                 # re-acquire, otherwise it bails on its own guard and the
                 # tick never runs.
-                executor.execute_tick(agent_id, lock_already_held=True)
+                executor.execute_tick(
+                    agent_id,
+                    lock_already_held=True,
+                    tick_token=tick_token,
+                )
             except Exception as exc:
                 logger.error(
                     "Run-tick failed for agent %s: %s",
@@ -1658,17 +2072,17 @@ def create_agent_manager_router(
                     exc,
                     exc_info=True,
                 )
-                try:
-                    manager.end_tick(agent_id)
-                except Exception:
-                    pass
-                manager.update_agent(agent_id, status="error")
-                manager.update_summary_memory(
-                    agent_id,
-                    f"ERROR: {exc}",
-                )
+                manager.end_tick(agent_id, tick_token, status="error")
 
-        threading.Thread(target=_run_tick, daemon=True).start()
+        worker = threading.Thread(target=_run_tick, daemon=True)
+        try:
+            worker.start()
+        except Exception as exc:
+            manager.end_tick(agent_id, tick_token, status="error")
+            raise HTTPException(
+                status_code=503,
+                detail="Managed-agent worker unavailable",
+            ) from exc
         return {"status": "running", "agent_id": agent_id}
 
     # ── Recover ──────────────────────────────────────────────
@@ -1677,7 +2091,10 @@ def create_agent_manager_router(
     def recover_agent(agent_id: str):
         if not manager.get_agent(agent_id):
             raise HTTPException(status_code=404, detail="Agent not found")
-        checkpoint = manager.recover_agent(agent_id)
+        try:
+            checkpoint = manager.recover_agent(agent_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"recovered": True, "checkpoint": checkpoint}
 
     # ── Tasks ────────────────────────────────────────────────
@@ -1946,114 +2363,126 @@ def create_agent_manager_router(
 
     @agents_router.get("/{agent_id}/messages")
     def list_messages(agent_id: str):
-        return {"messages": manager.list_messages(agent_id)}
+        return {"messages": _sanitize_managed_history(manager.list_messages(agent_id))}
 
     @agents_router.post("/{agent_id}/messages")
     async def send_message(agent_id: str, req: SendMessageRequest, request: Request):
         agent_record = manager.get_agent(agent_id)
         if not agent_record:
             raise HTTPException(status_code=404, detail="Agent not found")
+        if agent_record["status"] == "archived":
+            raise HTTPException(status_code=409, detail="Agent is archived")
 
-        # Auto-recover error-state agents on immediate messages
-        if req.mode == "immediate" and agent_record["status"] in (
-            "error",
-            "needs_attention",
-        ):
-            manager.update_agent(agent_id, status="idle")
+        if req.stream or req.mode == "immediate":
+            try:
+                _managed_runtime_values(agent_record.get("config", {}))
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-        # Store user message in DB (always, regardless of stream mode)
-        msg = manager.send_message(agent_id, req.content, mode=req.mode)
-
-        if not req.stream and req.mode != "immediate":
-            return msg
-
-        if not req.stream and req.mode == "immediate":
-            # Non-streaming immediate: trigger a background tick so the
-            # agent processes the message, then return the stored msg.
-            # Re-use the server's existing system (correct model/engine).
-            import threading
-            import time as _time
-
-            from openjarvis.agents.executor import AgentExecutor
-            from openjarvis.core.events import get_event_bus
-
-            _srv_engine = getattr(request.app.state, "engine", None)
-            _srv_model = getattr(request.app.state, "model", "")
-            _srv_config = getattr(request.app.state, "config", None)
-
-            def _immediate_tick():
-                _start = _time.time()
-                logger.info(
-                    "Immediate tick starting for agent %s (model=%s)",
-                    agent_id,
-                    _srv_model,
-                )
-                try:
-                    _ts2 = getattr(request.app.state, "trace_store", None)
-                    executor = AgentExecutor(
-                        manager=manager,
-                        event_bus=get_event_bus(),
-                        trace_store=_ts2,
-                    )
-                    system = _make_lightweight_system(
-                        _srv_engine,
-                        _srv_model,
-                        _srv_config,
-                    )
-                    executor.set_system(system)
-                    logger.info(
-                        "Immediate tick: system ready in %.1fs, "
-                        "executing tick for agent %s",
-                        _time.time() - _start,
-                        agent_id,
-                    )
-                    executor.execute_tick(agent_id)
-                    logger.info(
-                        "Immediate tick completed for agent %s in %.1fs",
-                        agent_id,
-                        _time.time() - _start,
-                    )
-                except Exception as exc:
-                    logger.error(
-                        "Immediate tick failed for agent %s: %s",
-                        agent_id,
-                        exc,
-                        exc_info=True,
-                    )
-                    try:
-                        manager.end_tick(agent_id)
-                    except Exception:
-                        pass
-                    manager.update_agent(agent_id, status="error")
-                    manager.update_summary_memory(
-                        agent_id,
-                        f"ERROR: {exc}",
-                    )
-
-            threading.Thread(
-                target=_immediate_tick,
-                daemon=True,
-            ).start()
-            return msg
-
-        # --- Streaming mode: run agent and return SSE response ---
-        engine = getattr(request.app.state, "engine", None)
-        bus = getattr(request.app.state, "bus", None)
-        if engine is None:
+        executes_now = req.stream or req.mode == "immediate"
+        engine = getattr(request.app.state, "engine", None) if executes_now else None
+        bus = getattr(request.app.state, "bus", None) if executes_now else None
+        if executes_now and engine is None:
             raise HTTPException(
                 status_code=503,
                 detail="Engine not available for streaming",
             )
 
-        return await _stream_managed_agent(
-            manager=manager,
-            agent_record=agent_record,
-            user_content=req.content,
-            message_id=msg["id"],
-            engine=engine,
-            bus=bus,
-            app_state=request.app.state,
-        )
+        tick_token: str | None = None
+        if executes_now:
+            try:
+                tick_token = manager.start_tick(agent_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        try:
+            # Immediate execution enters the DB directly as ``processing``;
+            # there is no observable pending window for the scheduler to steal.
+            if executes_now:
+                msg = manager.send_claimed_message(
+                    agent_id,
+                    req.content,
+                    mode=req.mode,
+                )
+                claimed = msg
+            else:
+                msg = manager.send_message(agent_id, req.content, mode=req.mode)
+                claimed = None
+        except Exception:
+            if tick_token is not None:
+                manager.end_tick(agent_id, tick_token)
+            raise
+
+        if not executes_now:
+            return msg
+        assert tick_token is not None
+
+        if not req.stream:
+            import threading
+
+            from openjarvis.agents.executor import AgentExecutor
+            from openjarvis.core.events import get_event_bus
+
+            def _immediate_tick() -> None:
+                try:
+                    executor = AgentExecutor(
+                        manager=manager,
+                        event_bus=bus or get_event_bus(),
+                        trace_store=getattr(request.app.state, "trace_store", None),
+                    )
+                    executor.set_system(
+                        _make_lightweight_system(
+                            engine,
+                            getattr(request.app.state, "model", ""),
+                            getattr(request.app.state, "config", None),
+                            http_boundary=True,
+                        )
+                    )
+                    executor.execute_tick(
+                        agent_id,
+                        lock_already_held=True,
+                        tick_token=tick_token,
+                        claimed_message=claimed,
+                    )
+                except Exception:
+                    logger.error(
+                        "Immediate managed-agent tick failed",
+                        exc_info=True,
+                    )
+                    manager.mark_message_failed(msg["id"])
+                    manager.end_tick(agent_id, tick_token)
+
+            worker = threading.Thread(target=_immediate_tick, daemon=True)
+            try:
+                worker.start()
+            except Exception as exc:
+                manager.mark_message_failed(msg["id"])
+                manager.end_tick(agent_id, tick_token)
+                raise HTTPException(
+                    status_code=503,
+                    detail="Immediate managed-agent worker unavailable",
+                ) from exc
+            return msg
+
+        try:
+            return await _stream_managed_agent(
+                manager=manager,
+                agent_record=agent_record,
+                user_content=req.content,
+                message_id=msg["id"],
+                tick_token=tick_token,
+                engine=engine,
+                bus=bus,
+                app_state=request.app.state,
+            )
+        except ValueError as exc:
+            manager.mark_message_failed(msg["id"])
+            manager.end_tick(agent_id, tick_token, status="error")
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception:
+            manager.mark_message_failed(msg["id"])
+            manager.end_tick(agent_id, tick_token, status="error")
+            raise
 
     # ── State inspection ─────────────────────────────────────
 
@@ -2066,7 +2495,7 @@ def create_agent_manager_router(
             "agent": agent,
             "tasks": manager.list_tasks(agent_id),
             "channels": manager.list_channel_bindings(agent_id),
-            "messages": manager.list_messages(agent_id),
+            "messages": _sanitize_managed_history(manager.list_messages(agent_id)),
             "checkpoint": manager.get_latest_checkpoint(agent_id),
         }
 
@@ -2122,6 +2551,8 @@ def create_agent_manager_router(
 
     @agents_router.get("/{agent_id}/traces/{trace_id}")
     def get_trace(agent_id: str, trace_id: str):
+        if not manager.get_agent(agent_id):
+            raise HTTPException(status_code=404, detail="Agent not found")
         try:
             from openjarvis.core.config import load_config
             from openjarvis.core.paths import get_config_dir
@@ -2132,7 +2563,11 @@ def create_agent_manager_router(
                 config.traces.db_path or str(get_config_dir() / "traces.db")
             )
             trace = store.get(trace_id)
-            if trace is None:
+            if (
+                trace is None
+                or trace.agent != agent_id
+                or _trace_has_disallowed_managed_tool(trace)
+            ):
                 raise HTTPException(status_code=404, detail="Trace not found")
             return {
                 "id": trace.trace_id,
@@ -2164,6 +2599,24 @@ def create_agent_manager_router(
 
     @templates_router.post("/{template_id}/instantiate")
     async def instantiate_template(template_id: str, req: CreateAgentRequest):
+        templates = manager.list_templates()
+        template = next(
+            (item for item in templates if item.get("id") == template_id),
+            None,
+        )
+        if template is None:
+            raise HTTPException(status_code=404, detail="Template not found")
+        merged = {
+            key: value
+            for key, value in template.items()
+            if key not in {"id", "name", "description", "source"}
+        }
+        merged.update(req.config or {})
+        try:
+            _managed_runtime_values(merged)
+            _validate_managed_tool_config(merged)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return manager.create_from_template(template_id, req.name, overrides=req.config)
 
     # ── Global agent endpoints ───────────────────────────────
@@ -2208,25 +2661,11 @@ def create_agent_manager_router(
 
     @tools_router.get("")
     def list_tools(request: Request):
-        items = build_tools_list()
-        try:
-            mcp_tools, _ = _get_mcp_tools(request.app.state)
-            for tool in mcp_tools:
-                fn = tool.get("function", {})
-                items.append(
-                    {
-                        "name": fn.get("name", ""),
-                        "description": fn.get("description", ""),
-                        "category": "mcp",
-                        "source": "mcp",
-                        "requires_credentials": False,
-                        "credential_keys": [],
-                        "configured": True,
-                    }
-                )
-        except Exception:
-            pass
-        return {"tools": items}
+        del request
+        # Remote MCP and browser meta-tools are disabled at this unauthenticated
+        # HTTP boundary. Advertising them would let the UI persist a capability
+        # that execution then silently drops.
+        return {"tools": build_tools_list()}
 
     @tools_router.post("/{tool_name}/credentials")
     async def save_tool_credentials(tool_name: str, request: Request):

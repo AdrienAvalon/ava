@@ -160,6 +160,36 @@ class TestAgentManagerRoutes:
         resp = client.get(f"/v1/managed-agents/{agent_id}")
         assert resp.json()["status"] == "idle"
 
+    @pytest.mark.parametrize(
+        ("method", "suffix"),
+        [("post", "pause"), ("post", "resume"), ("delete", "")],
+    )
+    def test_control_transition_cannot_release_running_agent(
+        self, manager, client, method, suffix
+    ):
+        agent = manager.create_agent(name=f"running-{method}-{suffix}")
+        manager.start_tick(agent["id"])
+        url = f"/v1/managed-agents/{agent['id']}"
+        if suffix:
+            url += f"/{suffix}"
+
+        response = getattr(client, method)(url)
+
+        assert response.status_code == 409
+        assert manager.get_agent(agent["id"])["status"] == "running"
+
+    @pytest.mark.parametrize(
+        "status", ["paused", "archived", "error", "needs_attention", "budget_exceeded"]
+    )
+    def test_run_requires_explicit_idle_state(self, manager, client, status):
+        agent = manager.create_agent(name=f"blocked-{status}")
+        manager.update_agent(agent["id"], status=status)
+
+        response = client.post(f"/v1/managed-agents/{agent['id']}/run")
+
+        assert response.status_code == 409
+        assert manager.get_agent(agent["id"])["status"] == status
+
     def test_create_task(self, client):
         create_resp = client.post("/v1/managed-agents", json={"name": "worker"})
         agent_id = create_resp.json()["id"]
@@ -242,6 +272,63 @@ class TestAgentManagerRoutes:
         assert len(agents) == 1
         assert agents[0]["name"] == "broken"
 
+    def test_trace_detail_is_scoped_to_the_requested_agent(self, manager, client):
+        owner = manager.create_agent(name="trace-owner", agent_type="simple")
+        decoy = manager.create_agent(name="trace-decoy", agent_type="simple")
+        trace = SimpleNamespace(
+            trace_id="owner-private-trace",
+            agent=owner["id"],
+            outcome="success",
+            total_latency_seconds=0.1,
+            started_at=1.0,
+            steps=[
+                SimpleNamespace(
+                    step_type=SimpleNamespace(value="tool_call"),
+                    input="public",
+                    output="PRIVATE_TOOL_RESULT_CANARY",
+                    duration_seconds=0.01,
+                    metadata={},
+                )
+            ],
+        )
+
+        with patch("openjarvis.traces.store.TraceStore") as store_class:
+            store_class.return_value.get.return_value = trace
+            response = client.get(
+                f"/v1/managed-agents/{decoy['id']}/traces/{trace.trace_id}"
+            )
+
+        assert response.status_code == 404
+        assert "PRIVATE_TOOL_RESULT_CANARY" not in response.text
+
+    def test_trace_detail_hides_legacy_disallowed_tool_results(self, manager, client):
+        agent = manager.create_agent(name="legacy-trace", agent_type="simple")
+        trace = SimpleNamespace(
+            trace_id="legacy-memory-trace",
+            agent=agent["id"],
+            outcome="success",
+            total_latency_seconds=0.1,
+            started_at=1.0,
+            steps=[
+                SimpleNamespace(
+                    step_type=SimpleNamespace(value="tool_call"),
+                    input={"tool": "memoire", "arguments": {}},
+                    output={"result": "LEGACY_MEMORY_FACT_CANARY"},
+                    duration_seconds=0.01,
+                    metadata={},
+                )
+            ],
+        )
+
+        with patch("openjarvis.traces.store.TraceStore") as store_class:
+            store_class.return_value.get.return_value = trace
+            response = client.get(
+                f"/v1/managed-agents/{agent['id']}/traces/{trace.trace_id}"
+            )
+
+        assert response.status_code == 404
+        assert "LEGACY_MEMORY_FACT_CANARY" not in response.text
+
     def test_send_and_list_messages(self, manager, client):
         agent = manager.create_agent(name="chat", agent_type="simple")
 
@@ -254,6 +341,38 @@ class TestAgentManagerRoutes:
         res = client.get(f"/v1/managed-agents/{agent['id']}/messages")
         assert res.status_code == 200
         assert len(res.json()["messages"]) == 1
+
+    def test_http_history_hides_disallowed_legacy_tool_results(
+        self,
+        manager,
+        client,
+    ):
+        agent = manager.create_agent(name="private-history", agent_type="simple")
+        source = manager.send_claimed_message(agent["id"], "recall")
+        manager.complete_message_turn(
+            agent["id"],
+            source["id"],
+            "legacy result",
+            tool_calls=[
+                {
+                    "tool": "memoire",
+                    "arguments": "{}",
+                    "result": "PRIVATE_MEMORY_FACT_CANARY",
+                    "success": True,
+                }
+            ],
+        )
+
+        messages = client.get(f"/v1/managed-agents/{agent['id']}/messages").json()[
+            "messages"
+        ]
+        state_messages = client.get(f"/v1/managed-agents/{agent['id']}/state").json()[
+            "messages"
+        ]
+
+        assert messages == []
+        assert state_messages == []
+        assert "PRIVATE_MEMORY_FACT_CANARY" not in json.dumps(messages)
 
     def test_get_agent_state(self, manager, client):
         agent = manager.create_agent(name="stateful", agent_type="simple")
@@ -278,6 +397,23 @@ class TestAgentManagerRoutes:
         assert data["content"] == "hello"
         assert data["direction"] == "user_to_agent"
 
+    def test_managed_message_size_is_bounded_before_storage(self, manager, client):
+        from openjarvis.agents.manager import MAX_AGENT_MESSAGE_CHARS
+
+        agent = manager.create_agent(name="bounded", agent_type="simple")
+        accepted = client.post(
+            f"/v1/managed-agents/{agent['id']}/messages",
+            json={"content": "x" * MAX_AGENT_MESSAGE_CHARS},
+        )
+        rejected = client.post(
+            f"/v1/managed-agents/{agent['id']}/messages",
+            json={"content": "x" * (MAX_AGENT_MESSAGE_CHARS + 1)},
+        )
+
+        assert accepted.status_code == 200
+        assert rejected.status_code == 422
+        assert len(manager.list_messages(agent["id"])) == 1
+
     def test_send_message_stream_not_found(self, manager, client):
         """Streaming to a non-existent agent returns 404."""
         res = client.post(
@@ -285,6 +421,64 @@ class TestAgentManagerRoutes:
             json={"content": "hello", "stream": True},
         )
         assert res.status_code == 404
+
+    def test_run_worker_start_failure_releases_tick(self, manager, client):
+        import threading
+
+        agent = manager.create_agent(name="worker-failure", agent_type="simple")
+        original_start = threading.Thread.start
+
+        def fail_only_managed_worker(thread):
+            if getattr(getattr(thread, "_target", None), "__name__", "") == "_run_tick":
+                raise RuntimeError("cannot start")
+            return original_start(thread)
+
+        with patch.object(threading.Thread, "start", new=fail_only_managed_worker):
+            response = client.post(f"/v1/managed-agents/{agent['id']}/run")
+
+        assert response.status_code == 503
+        assert manager.get_agent(agent["id"])["status"] == "error"
+
+    def test_run_uses_http_boundary_without_writing_private_summary(
+        self, manager, client, monkeypatch
+    ):
+        import threading
+        import time
+
+        from openjarvis.agents.executor import AgentExecutor
+        from openjarvis.server import agent_manager_routes as routes
+
+        agent = manager.create_agent(name="http-run", agent_type="simple")
+        manager.update_summary_memory(agent["id"], "PRIVATE_LEGACY_CANARY")
+        captured = {}
+        entered = threading.Event()
+
+        def fake_system(engine, model, config=None, *, http_boundary=False):
+            captured["http_boundary"] = http_boundary
+            return SimpleNamespace(http_boundary=http_boundary)
+
+        def failing_tick(self, agent_id, **kwargs):
+            captured["system"] = self._system
+            entered.set()
+            raise RuntimeError("worker failure")
+
+        monkeypatch.setattr(routes, "_make_lightweight_system", fake_system)
+        monkeypatch.setattr(AgentExecutor, "execute_tick", failing_tick)
+
+        response = client.post(f"/v1/managed-agents/{agent['id']}/run")
+
+        assert response.status_code == 200
+        assert entered.wait(timeout=2)
+        for _ in range(100):
+            if manager.get_agent(agent["id"])["status"] == "error":
+                break
+            time.sleep(0.01)
+        assert captured["http_boundary"] is True
+        assert captured["system"].http_boundary is True
+        assert manager.get_agent(agent["id"])["summary_memory"] == (
+            "PRIVATE_LEGACY_CANARY"
+        )
+        assert manager.get_agent(agent["id"])["status"] == "error"
 
 
 def test_run_agent_concurrent_returns_409(tmp_path):
@@ -296,13 +490,13 @@ def test_run_agent_concurrent_returns_409(tmp_path):
     aid = agent["id"]
 
     # Simulate first click acquiring the tick
-    mgr.start_tick(aid)
+    tick_token = mgr.start_tick(aid)
 
     # Second click should fail
-    with pytest.raises(ValueError, match="already executing a tick"):
+    with pytest.raises(ValueError, match="cannot execute a tick"):
         mgr.start_tick(aid)
 
-    mgr.end_tick(aid)
+    mgr.end_tick(aid, tick_token)
 
 
 @pytest.mark.skipif(not HAS_FASTAPI, reason="fastapi not installed")
@@ -338,6 +532,60 @@ class TestAgentManagerStreaming:
 
         engine.stream_full = _stream_full
         return engine
+
+    def test_asgi_24_disconnect_terminally_closes_claim(self, manager, _mock_engine):
+        import asyncio
+
+        from starlette.requests import ClientDisconnect
+
+        from openjarvis.server.agent_manager_routes import _stream_managed_agent
+
+        agent = manager.create_agent(name="disconnect", agent_type="simple")
+        tick_token = manager.start_tick(agent["id"])
+        claimed = manager.send_claimed_message(agent["id"], "private question")
+
+        async def scenario() -> None:
+            response = await _stream_managed_agent(
+                manager=manager,
+                agent_record=agent,
+                user_content="private question",
+                message_id=claimed["id"],
+                tick_token=tick_token,
+                engine=_mock_engine,
+                bus=None,
+                app_state=SimpleNamespace(model="test-model"),
+            )
+
+            async def receive():
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            async def send(message):
+                if message["type"] == "http.response.body":
+                    raise OSError("client disappeared")
+
+            scope = {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.4"},
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/managed",
+                "raw_path": b"/managed",
+                "query_string": b"",
+                "headers": [],
+                "client": ("127.0.0.1", 1),
+                "server": ("testserver", 80),
+                "root_path": "",
+            }
+            with pytest.raises(ClientDisconnect):
+                await response(scope, receive, send)
+
+        asyncio.run(scenario())
+
+        assert manager.get_agent(agent["id"])["status"] == "error"
+        messages = manager.list_messages(agent["id"])
+        assert len(messages) == 1
+        assert messages[0]["status"] == "failed"
 
     @pytest.fixture
     def stream_client(self, manager, _mock_engine):
@@ -425,8 +673,54 @@ class TestAgentManagerStreaming:
         directions = {m["direction"] for m in messages}
         assert "user_to_agent" in directions
         assert "agent_to_user" in directions
+        user_msg = next(m for m in messages if m["direction"] == "user_to_agent")
         agent_msg = next(m for m in messages if m["direction"] == "agent_to_user")
         assert "persist me" in agent_msg["content"]
+        assert agent_msg["reply_to_id"] == user_msg["id"]
+        assert user_msg["status"] == "delivered"
+
+    def test_immediate_non_stream_keeps_ui_contract_with_exact_claim(
+        self, manager, stream_client
+    ):
+        import threading
+
+        from openjarvis.agents.executor import AgentExecutor
+
+        agent = manager.create_agent(name="immediate", agent_type="simple")
+        completed = threading.Event()
+
+        def execute_claimed(
+            executor,
+            agent_id,
+            *,
+            lock_already_held=False,
+            tick_token=None,
+            claimed_message=None,
+        ):
+            assert lock_already_held is True
+            assert tick_token is not None
+            assert claimed_message is not None
+            manager.complete_message_turn(
+                agent_id,
+                claimed_message["id"],
+                "immediate answer",
+            )
+            manager.end_tick(agent_id, tick_token)
+            completed.set()
+
+        with patch.object(AgentExecutor, "execute_tick", new=execute_claimed):
+            response = stream_client.post(
+                f"/v1/managed-agents/{agent['id']}/messages",
+                json={"content": "immediate question", "mode": "immediate"},
+            )
+            assert response.status_code == 200
+            assert completed.wait(timeout=5)
+
+        messages = manager.list_messages(agent["id"])
+        source = next(m for m in messages if m["direction"] == "user_to_agent")
+        answer = next(m for m in messages if m["direction"] == "agent_to_user")
+        assert source["status"] == "delivered"
+        assert answer["reply_to_id"] == source["id"]
 
     def test_send_message_stream_finish_reason(self, manager, stream_client):
         """The final chunk before [DONE] has finish_reason='stop'."""
@@ -450,6 +744,113 @@ class TestAgentManagerStreaming:
 
         # Last chunk should have finish_reason="stop"
         assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+    def test_truncated_stream_is_failed_instead_of_relabelled_stop(self, manager):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient as TC
+
+        from openjarvis.engine._stubs import StreamChunk
+        from openjarvis.server.agent_manager_routes import create_agent_manager_router
+
+        engine = MagicMock(engine_id="truncated", _model="test-model")
+
+        async def truncated_stream(messages, *, model, **kwargs):
+            yield StreamChunk(
+                content="TRUNCATED_OUTPUT",
+                finish_reason="length",
+            )
+
+        engine.stream_full = truncated_stream
+        app = FastAPI()
+        app.state.engine = engine
+        app.state.bus = None
+        for router in create_agent_manager_router(manager):
+            app.include_router(router)
+        client = TC(app)
+        agent = manager.create_agent(name="truncated", agent_type="simple")
+
+        response = client.post(
+            f"/v1/managed-agents/{agent['id']}/messages",
+            json={"content": "question", "stream": True},
+        )
+
+        assert response.status_code == 200
+        assert "empty_or_incomplete_response" in response.text
+        assert '"finish_reason": "stop"' not in response.text
+        messages = manager.list_messages(agent["id"])
+        assert len(messages) == 1
+        assert messages[0]["status"] == "failed"
+
+    def test_stream_holds_agent_tick_lock_until_terminal_commit(self, manager):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient as TC
+
+        from openjarvis.engine._stubs import StreamChunk
+        from openjarvis.server.agent_manager_routes import create_agent_manager_router
+
+        engine = MagicMock(engine_id="locked", _model="test-model")
+        agent = manager.create_agent(name="locked", agent_type="simple")
+
+        async def locked_stream(messages, *, model, **kwargs):
+            with pytest.raises(ValueError, match="cannot execute a tick"):
+                manager.start_tick(agent["id"])
+            yield StreamChunk(content="complete")
+            yield StreamChunk(finish_reason="stop")
+
+        engine.stream_full = locked_stream
+        app = FastAPI()
+        app.state.engine = engine
+        app.state.bus = None
+        for router in create_agent_manager_router(manager):
+            app.include_router(router)
+
+        response = TC(app).post(
+            f"/v1/managed-agents/{agent['id']}/messages",
+            json={"content": "question", "stream": True},
+        )
+
+        assert response.status_code == 200
+        assert manager.get_agent(agent["id"])["status"] == "idle"
+
+    def test_oversized_stream_response_is_a_terminal_storage_error(self, manager):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient as TC
+
+        from openjarvis.agents.manager import MAX_AGENT_MESSAGE_CHARS
+        from openjarvis.engine._stubs import StreamChunk
+        from openjarvis.server.agent_manager_routes import create_agent_manager_router
+
+        engine = MagicMock(engine_id="oversized", _model="test-model")
+
+        async def oversized_stream(messages, *, model, **kwargs):
+            yield StreamChunk(content="x" * (MAX_AGENT_MESSAGE_CHARS + 1))
+            yield StreamChunk(finish_reason="stop")
+
+        engine.stream_full = oversized_stream
+        app = FastAPI()
+        app.state.engine = engine
+        app.state.bus = None
+        for router in create_agent_manager_router(manager):
+            app.include_router(router)
+        agent = manager.create_agent(name="oversized", agent_type="simple")
+
+        response = TC(app).post(
+            f"/v1/managed-agents/{agent['id']}/messages",
+            json={"content": "question", "stream": True},
+        )
+
+        assert response.status_code == 200
+        assert "empty_or_incomplete_response" in response.text
+        assert '"finish_reason": "stop"' not in response.text
+        messages = manager.list_messages(agent["id"])
+        assert len(messages) == 1
+        assert messages[0]["status"] == "failed"
+        logs = manager.list_learning_log(agent["id"])
+        assert any(
+            row["event_type"] == "query_error"
+            and row["data"].get("failure_reason") == "persistence_error"
+            for row in logs
+        )
 
     def test_send_message_stream_error_handling(self, manager):
         """Engine errors are reported gracefully via SSE."""
@@ -485,6 +886,262 @@ class TestAgentManagerStreaming:
         assert resp.status_code == 200
         assert "Error:" in resp.text or "error" in resp.text.lower()
         assert "data: [DONE]" in resp.text
+        messages = manager.list_messages(agent["id"])
+        assert len(messages) == 1
+        assert messages[0]["direction"] == "user_to_agent"
+        assert messages[0]["status"] == "failed"
+
+    def test_partial_stream_error_is_never_replayed_as_completed(self, manager):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient as TC
+
+        from openjarvis.engine._stubs import StreamChunk
+        from openjarvis.server.agent_manager_routes import create_agent_manager_router
+
+        engine = MagicMock(engine_id="error", _model="test-model")
+
+        async def _partial_then_error(messages, *, model, **kwargs):
+            yield StreamChunk(content="PARTIAL_CANARY")
+            raise RuntimeError("backend failed")
+
+        engine.stream_full = _partial_then_error
+        app = FastAPI()
+        app.state.engine = engine
+        app.state.bus = None
+        for router in create_agent_manager_router(manager):
+            app.include_router(router)
+        client = TC(app)
+        agent = manager.create_agent(name="partial", agent_type="simple")
+
+        response = client.post(
+            f"/v1/managed-agents/{agent['id']}/messages",
+            json={"content": "fail after partial", "stream": True},
+        )
+
+        assert response.status_code == 200
+        messages = manager.list_messages(agent["id"])
+        assert len(messages) == 1
+        assert messages[0]["status"] == "failed"
+        assert "PARTIAL_CANARY" not in messages[0]["content"]
+
+    def test_tool_exception_is_generic_for_model_sse_and_history(
+        self, manager, monkeypatch
+    ):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient as TC
+
+        from openjarvis.core.registry import ToolRegistry
+        from openjarvis.engine._stubs import StreamChunk
+        from openjarvis.server.agent_manager_routes import create_agent_manager_router
+        from openjarvis.tools._stubs import BaseTool, ToolSpec
+
+        class ExplodingCalculator(BaseTool):
+            tool_id = "calculator"
+
+            @property
+            def spec(self):
+                return ToolSpec(name="calculator", description="test")
+
+            def execute(self, **params):
+                raise RuntimeError("PRIVATE_MANAGED_TOOL_CANARY")
+
+        monkeypatch.setitem(ToolRegistry._entries(), "calculator", ExplodingCalculator)
+        captured = {}
+        engine = MagicMock(engine_id="tool-error", _model="test-model")
+        calls = 0
+
+        async def tool_then_answer(messages, *, model, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                yield StreamChunk(
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "id": "call-error",
+                            "function": {
+                                "name": "calculator",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                    finish_reason="tool_calls",
+                )
+                return
+            captured["messages"] = messages
+            yield StreamChunk(content="safe final answer")
+            yield StreamChunk(finish_reason="stop")
+
+        engine.stream_full = tool_then_answer
+        app = FastAPI()
+        app.state.engine = engine
+        app.state.bus = None
+        for router in create_agent_manager_router(manager):
+            app.include_router(router)
+        agent = manager.create_agent(
+            name="tool-error",
+            agent_type="simple",
+            config={"tools": ["calculator"]},
+        )
+
+        response = TC(app).post(
+            f"/v1/managed-agents/{agent['id']}/messages",
+            json={"content": "calculate", "stream": True},
+        )
+
+        assert response.status_code == 200
+        assert "PRIVATE_MANAGED_TOOL_CANARY" not in response.text
+        tool_message = next(
+            message for message in captured["messages"] if message.role.value == "tool"
+        )
+        assert tool_message.content == "Tool 'calculator' failed."
+        stored = next(
+            message
+            for message in manager.list_messages(agent["id"])
+            if message["direction"] == "agent_to_user"
+        )
+        assert stored["tool_calls"][0]["success"] is False
+        assert stored["tool_calls"][0]["result"] == "Tool 'calculator' failed."
+
+    @pytest.mark.parametrize("exhaust_tools", [False, True])
+    def test_empty_or_incomplete_stream_is_an_explicit_terminal_error(
+        self, manager, exhaust_tools
+    ):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient as TC
+
+        from openjarvis.engine._stubs import StreamChunk
+        from openjarvis.server.agent_manager_routes import create_agent_manager_router
+
+        engine = MagicMock(engine_id="incomplete", _model="test-model")
+
+        async def incomplete_stream(messages, *, model, **kwargs):
+            if exhaust_tools:
+                yield StreamChunk(
+                    content="PARTIAL_BEFORE_TOOL",
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "id": "call-1",
+                            "function": {"name": "think", "arguments": "{}"},
+                        }
+                    ],
+                    finish_reason="tool_calls",
+                )
+            else:
+                yield StreamChunk(finish_reason="stop")
+
+        engine.stream_full = incomplete_stream
+        app = FastAPI()
+        app.state.engine = engine
+        app.state.bus = None
+        for router in create_agent_manager_router(manager):
+            app.include_router(router)
+        client = TC(app)
+        config = {"max_turns": 1}
+        if exhaust_tools:
+            config["tools"] = ["think"]
+        agent = manager.create_agent(
+            name="incomplete",
+            agent_type="simple",
+            config=config,
+        )
+
+        response = client.post(
+            f"/v1/managed-agents/{agent['id']}/messages",
+            json={"content": "question", "stream": True},
+        )
+
+        assert response.status_code == 200
+        assert "empty_or_incomplete_response" in response.text
+        assert '"finish_reason": "stop"' not in response.text
+        messages = manager.list_messages(agent["id"])
+        assert len(messages) == 1
+        assert messages[0]["status"] == "failed"
+
+    def test_deep_research_keeps_identity_history_bounds_and_atomic_pair(
+        self, manager, monkeypatch
+    ):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient as TC
+
+        import openjarvis.agents.deep_research as deep_research_module
+        from openjarvis.agents._stubs import AgentResult
+        from openjarvis.server import agent_manager_routes as routes
+        from openjarvis.server.agent_manager_routes import create_agent_manager_router
+
+        captured = {}
+
+        class FakeDeepResearchAgent:
+            def __init__(self, **kwargs):
+                captured["kwargs"] = kwargs
+                self._executor = SimpleNamespace(execute=lambda _call: None)
+
+            def run(self, input_text, context=None):
+                captured["input"] = input_text
+                captured["context"] = context
+                return AgentResult(content="bounded research answer")
+
+        monkeypatch.setattr(
+            deep_research_module,
+            "DeepResearchAgent",
+            FakeDeepResearchAgent,
+        )
+        monkeypatch.setattr(
+            routes,
+            "_build_deep_research_tools",
+            lambda **_kwargs: [object()],
+        )
+
+        app = FastAPI()
+        app.state.engine = MagicMock(engine_id="fake", _model="test-model")
+        app.state.bus = None
+        for router in create_agent_manager_router(manager):
+            app.include_router(router)
+        client = TC(app)
+        agent = manager.create_agent(
+            name="deep",
+            agent_type="deep_research",
+            config={
+                "model": "test-model",
+                "system_prompt": "Mission bornée",
+                "temperature": 0.2,
+                "max_tokens": 321,
+                "max_turns": 4,
+            },
+        )
+        previous = manager.send_claimed_message(agent["id"], "previous question")
+        manager.complete_message_turn(agent["id"], previous["id"], "previous answer")
+
+        response = client.post(
+            f"/v1/managed-agents/{agent['id']}/messages",
+            json={"content": "current question", "stream": True},
+        )
+
+        assert response.status_code == 200
+        assert captured["input"] == "current question"
+        assert captured["kwargs"]["max_tokens"] == 321
+        assert captured["kwargs"]["max_turns"] == 4
+        context = captured["context"]
+        assert "Ava" in context.metadata["server_identity_prompt"]
+        assert [message.content for message in context.conversation.messages] == [
+            "previous question",
+            "previous answer",
+        ]
+        messages = manager.list_messages(agent["id"])
+        current = next(
+            message
+            for message in messages
+            if message["direction"] == "user_to_agent"
+            and message["content"] == "current question"
+        )
+        answer = next(
+            message
+            for message in messages
+            if message.get("reply_to_id") == current["id"]
+        )
+        assert current["status"] == "delivered"
+        assert answer["content"] == "bounded research answer"
 
 
 @pytest.mark.skipif(not HAS_FASTAPI, reason="fastapi not installed")
@@ -517,10 +1174,10 @@ class TestResolveToolSpecs:
     def test_string_names_resolve_to_openai_specs(self, _registered_tools):
         from openjarvis.server.agent_manager_routes import _resolve_tool_specs
 
-        specs = _resolve_tool_specs(["file_read", "think"])
+        specs = _resolve_tool_specs(["calculator", "think"])
         assert len(specs) == 2
         names = [s["function"]["name"] for s in specs]
-        assert "file_read" in names
+        assert "calculator" in names
         assert "think" in names
         for s in specs:
             assert s["type"] == "function"
@@ -530,24 +1187,181 @@ class TestResolveToolSpecs:
     def test_unknown_names_dropped(self, _registered_tools):
         from openjarvis.server.agent_manager_routes import _resolve_tool_specs
 
-        specs = _resolve_tool_specs(["file_read", "nonexistent_tool_xyz"])
+        specs = _resolve_tool_specs(["calculator", "nonexistent_tool_xyz"])
         assert len(specs) == 1
-        assert specs[0]["function"]["name"] == "file_read"
+        assert specs[0]["function"]["name"] == "calculator"
 
-    def test_dict_entries_passed_through(self, _registered_tools):
+    def test_quarantined_legacy_memory_cannot_be_resolved(self, _registered_tools):
+        from openjarvis.server.agent_manager_routes import _resolve_tool_specs
+
+        assert _resolve_tool_specs(["memoire"]) == []
+
+    def test_quarantined_legacy_memory_dict_cannot_pass_through(
+        self, _registered_tools
+    ):
+        from openjarvis.server.agent_manager_routes import _resolve_tool_specs
+
+        raw = {
+            "type": "function",
+            "function": {
+                "name": "memoire",
+                "description": "legacy shared store",
+                "parameters": {"type": "object"},
+            },
+        }
+        assert _resolve_tool_specs([raw]) == []
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "shell_exec",
+            "code_interpreter",
+            "file_read",
+            "file_write",
+            "memory_manage",
+            "memory_retrieve",
+            "retrieval",
+        ],
+    )
+    def test_managed_agents_reject_unsafe_local_tools(self, _registered_tools, name):
+        from openjarvis.server.agent_manager_routes import _resolve_tool_specs
+
+        assert _resolve_tool_specs([name]) == []
+
+    def test_managed_agents_reject_unsafe_raw_tool_dict(self, _registered_tools):
+        from openjarvis.server.agent_manager_routes import _resolve_tool_specs
+
+        raw = {
+            "type": "function",
+            "function": {
+                "name": "shell_exec",
+                "description": "read arbitrary local files",
+                "parameters": {"type": "object"},
+            },
+        }
+        assert _resolve_tool_specs([raw]) == []
+
+    def test_registered_safe_dict_entries_passed_through(self, _registered_tools):
         from openjarvis.server.agent_manager_routes import _resolve_tool_specs
 
         full_spec = {
             "type": "function",
             "function": {
-                "name": "custom",
+                "name": "think",
                 "description": "x",
                 "parameters": {"type": "object"},
             },
         }
-        specs = _resolve_tool_specs([full_spec, "file_read"])
+        specs = _resolve_tool_specs([full_spec, "calculator"])
         assert len(specs) == 2
         assert specs[0] is full_spec
+
+    @pytest.mark.parametrize(
+        "tool_cls",
+        [
+            pytest.param(
+                __import__(
+                    "ava_extensions.skills.proposer",
+                    fromlist=["ProposerTool"],
+                ).ProposerTool,
+                id="proposer",
+            ),
+            pytest.param(
+                __import__(
+                    "openjarvis.tools.channel_tools",
+                    fromlist=["ChannelSendTool"],
+                ).ChannelSendTool,
+                id="channel_send",
+            ),
+        ],
+    )
+    def test_effectful_tool_without_capability_metadata_is_denied(self, tool_cls):
+        from openjarvis.server.agent_manager_routes import _managed_tool_allowed
+
+        assert _managed_tool_allowed(tool_cls) is False
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"max_tokens": 32_769},
+            {"max_tokens": True},
+            {"temperature": -1},
+            {"temperature": 3},
+            {"max_turns": 0},
+            {"max_total_tokens": True},
+        ],
+    )
+    def test_create_rejects_unbounded_runtime_config(self, manager, config):
+        from fastapi import FastAPI
+
+        from openjarvis.server.agent_manager_routes import create_agent_manager_router
+
+        app = FastAPI()
+        for router in create_agent_manager_router(manager):
+            app.include_router(router)
+        client = TestClient(app)
+        response = client.post(
+            "/v1/managed-agents",
+            json={"name": "unsafe", "agent_type": "simple", "config": config},
+        )
+        assert response.status_code == 422
+
+    def test_template_instantiation_validates_merged_runtime_config(
+        self, manager, monkeypatch
+    ):
+        from fastapi import FastAPI
+
+        from openjarvis.server.agent_manager_routes import create_agent_manager_router
+
+        monkeypatch.setattr(
+            manager,
+            "list_templates",
+            lambda: [
+                {
+                    "id": "unsafe-template",
+                    "name": "Unsafe",
+                    "max_tokens": 32_769,
+                    "agent_type": "simple",
+                    "source": "test",
+                }
+            ],
+        )
+        app = FastAPI()
+        for router in create_agent_manager_router(manager):
+            app.include_router(router)
+
+        response = TestClient(app).post(
+            "/v1/templates/unsafe-template/instantiate",
+            json={"name": "unsafe", "agent_type": "simple", "config": {}},
+        )
+
+        assert response.status_code == 422
+
+    @pytest.mark.parametrize("tool_name", ["browser", "file_read", "memoire"])
+    def test_agent_creation_rejects_tools_hidden_by_the_http_boundary(
+        self,
+        manager,
+        tool_name,
+    ):
+        from fastapi import FastAPI
+
+        from openjarvis.server.agent_manager_routes import create_agent_manager_router
+
+        app = FastAPI()
+        for router in create_agent_manager_router(manager):
+            app.include_router(router)
+
+        response = TestClient(app).post(
+            "/v1/managed-agents",
+            json={
+                "name": "unsafe",
+                "agent_type": "simple",
+                "config": {"tools": [tool_name]},
+            },
+        )
+
+        assert response.status_code == 422
+        assert tool_name in response.json()["detail"]
 
     def test_empty_and_none_return_empty_list(self):
         from openjarvis.server.agent_manager_routes import _resolve_tool_specs

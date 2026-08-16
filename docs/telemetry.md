@@ -1,13 +1,12 @@
 # Telemetry
 
-OpenJarvis ships **anonymous usage telemetry** by default so the team can
-see where the product breaks, what features people actually use, and
-how to make it better. This page documents exactly what is and isn't
-collected, where the data goes, and how to opt out.
+The Ava fork keeps external analytics **disabled by default**.  A user may
+explicitly opt in to the upstream anonymous telemetry described below; local
+performance telemetry remains a separate, non-exported subsystem.
 
 ## TL;DR
 
-- **On by default**, anonymous, no chat content.
+- **Off by default in the Ava fork**; explicit opt-in only.
 - **Anonymous** — one random UUID per install, no email, no name, no IP.
 - **No chat content, ever.** Only counts, timings, and feature names.
 - **Self-hosted backend** on the OpenJarvis team's PostHog instance —
@@ -97,9 +96,24 @@ A single UUID v4 is generated on first install and stored at
 read the same file so events across the full lifecycle tie to one
 person — without us ever knowing who that person is.
 
-Delete the file (`rm ~/.openjarvis/anon_id`) and a fresh UUID will be
-generated next time the app runs. The previous UUID and its events
-are then orphaned.
+## Opting in or out
+
+The Ava fork disables external analytics by default. Runtime analytics require
+`[analytics] enabled = true`; the installer additionally requires
+`OPENJARVIS_ENABLE_ANALYTICS=1`.  Either process-level kill switch still wins:
+
+```bash
+export DO_NOT_TRACK=1
+# or
+export OPENJARVIS_NO_ANALYTICS=1
+```
+
+Any value other than an empty string, `0`, `false`, `no`, or `off` disables external
+analytics. The environment always takes precedence over the TOML setting. Avalon sets
+`OPENJARVIS_NO_ANALYTICS=1` declaratively in addition to keeping the TOML setting false.
+
+Deleting `~/.openjarvis/anon_id` only breaks the link with the previous anonymous ID;
+it does not itself disable future events.
 
 ## For researchers and contributors
 

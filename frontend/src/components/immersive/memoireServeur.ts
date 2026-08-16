@@ -1,3 +1,5 @@
+import { OIDC_AUTHORITY, OIDC_CLIENT_ID } from '../auth/oidcIdentity';
+
 /**
  * Mémoire de conversation d'Ava — côté SERVEUR, par utilisateur.
  *
@@ -6,12 +8,12 @@
  *   l'admin : « un historique par utilisateur […] peu importe le navigateur que
  *   j'utilise, une mémoire interne à Ava ».
  *
- * ⚠ DEUX MÉMOIRES, DEUX PORTÉES, et il ne faut pas les confondre :
- *   · CE module → l'HISTORIQUE, **cloisonné par personne** : chacun retrouve sa
+ * ⚠ DEUX MÉMOIRES, DEUX STATUTS, et il ne faut pas les confondre :
+ *   · CE module → l'HISTORIQUE, **cloisonné par principal vérifié** : chacun retrouve sa
  *     conversation et ne voit jamais celle d'un autre ;
- *   · `openjarvis.memory` (natif, activé côté serveur) → les FAITS, **centraux** :
- *     Ava apprend de tout le monde, ce qui est voulu — un assistant de maison qui
- *     réapprendrait la topologie à chaque interlocuteur serait absurde.
+ *   · `memory_facts.jsonl` → ancien magasin partagé, **en quarantaine** : aucun chemin
+ *     conversationnel ne le lit ni ne l'alimente. Il reste sauvegardé uniquement pour
+ *     une future migration gouvernée et attribuée.
  */
 
 /**
@@ -21,30 +23,29 @@
  *   cycle de rendu React (dans des callbacks asynchrones). Un hook y serait invalide.
  *   La clé suit le format d'`oidc-client-ts` : `oidc.user:<authority>:<client_id>`.
  *
- * ⚠ Rend `null` plutôt que de lever : sans identité, la conversation doit continuer —
- *   le serveur rangera simplement l'échange dans un espace « anonyme », isolé.
+ * ⚠ Rend `null` plutôt que de lever : le chat peut continuer sans profil, mais les
+ *   routes d'historique refusent alors toute écriture plutôt que de créer un seau
+ *   anonyme partagé.
  */
-function jetonOidc(): string | null {
+export function jetonOidc(): string | null {
   try {
-    const prefixe = 'oidc.user:';
-    for (let i = 0; i < sessionStorage.length; i++) {
-      const cle = sessionStorage.key(i);
-      if (!cle || !cle.startsWith(prefixe)) continue;
-      const brut = sessionStorage.getItem(cle);
-      if (!brut) continue;
-      const u = JSON.parse(brut);
-      // `id_token` porte les claims d'identité (`sub`, `preferred_username`) ;
-      // `access_token` peut être opaque selon la configuration du realm.
-      return u?.id_token || u?.access_token || null;
-    }
+    const cle = `oidc.user:${OIDC_AUTHORITY}:${OIDC_CLIENT_ID}`;
+    const brut = sessionStorage.getItem(cle);
+    if (!brut) return null;
+    const u = JSON.parse(brut);
+    // `id_token` porte les claims d'identité (`sub`, `preferred_username`) ;
+    // `access_token` peut être opaque selon la configuration du realm.
+    return u?.id_token || u?.access_token || null;
   } catch {
     /* stockage indisponible (navigation privée stricte) */
   }
   return null;
 }
 
-function entetes(): Record<string, string> {
-  const h: Record<string, string> = { 'Content-Type': 'application/json' };
+export function entetesIdentite(
+  extra: Record<string, string> = {},
+): Record<string, string> {
+  const h: Record<string, string> = { ...extra };
   const jeton = jetonOidc();
   if (jeton) h['X-Ava-Identity'] = jeton;
   return h;
@@ -54,7 +55,10 @@ export interface LigneServeur {
   role: string;
   texte: string;
   horodatage: number;
+  turn_id?: string | null;
 }
+
+const DELAI_HYDRATATION_MS = 8_000;
 
 /**
  * Historique de l'utilisateur courant.
@@ -68,8 +72,13 @@ export interface LigneServeur {
  *   du précédent.
  */
 export async function lireConversation(): Promise<LigneServeur[] | null> {
+  const controleur = new AbortController();
+  const delai = globalThis.setTimeout(() => controleur.abort(), DELAI_HYDRATATION_MS);
   try {
-    const r = await fetch('/v1/ava/conversation', { headers: entetes() });
+    const r = await fetch('/v1/ava/conversation', {
+      headers: entetesIdentite(),
+      signal: controleur.signal,
+    });
     if (!r.ok) return null; // 401/500 : on ne sait rien, on garde ce qu'on a
     const d = await r.json();
     return Array.isArray(d?.lignes) ? d.lignes : [];
@@ -77,32 +86,15 @@ export async function lireConversation(): Promise<LigneServeur[] | null> {
     // ⚠ Un serveur injoignable ne doit pas empêcher de CONVERSER — on perd la mise à
     //   jour de la mémoire, pas l'usage d'Ava.
     return null;
+  } finally {
+    globalThis.clearTimeout(delai);
   }
-}
-
-/**
- * Ajoute des lignes à l'historique de l'utilisateur courant.
- *
- * ⚠ L'appel n'est PAS attendu par l'appelant (`void`) : persister est un effet de bord,
- *   et faire patienter l'affichage d'une réponse déjà reçue pour un écrit en base
- *   ajouterait de la latence là où l'utilisateur regarde.
- */
-export function ajouterConversation(lignes: { role: string; texte: string }[]): void {
-  if (!lignes.length) return;
-  const charge = lignes.map((l) => ({ ...l, horodatage: Date.now() / 1000 }));
-  fetch('/v1/ava/conversation', {
-    method: 'POST',
-    headers: entetes(),
-    body: JSON.stringify({ lignes: charge }),
-  }).catch(() => {
-    /* mémoire indisponible — la conversation continue */
-  });
 }
 
 /** Efface l'historique de l'utilisateur courant, et de lui seul. */
 export async function effacerConversation(): Promise<void> {
   try {
-    await fetch('/v1/ava/conversation', { method: 'DELETE', headers: entetes() });
+    await fetch('/v1/ava/conversation', { method: 'DELETE', headers: entetesIdentite() });
   } catch {
     /* rien à faire : l'affichage est vidé de toute façon */
   }

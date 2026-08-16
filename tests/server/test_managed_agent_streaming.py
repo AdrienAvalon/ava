@@ -17,6 +17,8 @@ from openjarvis.core.types import Role  # noqa: E402
 from openjarvis.server.agent_manager_routes import (  # noqa: E402
     _build_managed_system_prompt,
     _instantiate_managed_tool,
+    _managed_remote_tool_name_allowed,
+    _managed_runtime_values,
     _replay_history_messages,
     _sampler_kwargs,
 )
@@ -33,9 +35,9 @@ class TestReplayHistoryToolCalls:
                 "content": "",
                 "tool_calls": [
                     {
-                        "tool": "shell_exec",
-                        "arguments": '{"command":"pwd"}',
-                        "result": "/home/u",
+                        "tool": "calculator",
+                        "arguments": '{"expression":"2 + 2"}',
+                        "result": "4",
                         "success": True,
                         "latency": 1.0,
                     },
@@ -44,7 +46,7 @@ class TestReplayHistoryToolCalls:
             {
                 "id": "m1",
                 "direction": "user_to_agent",
-                "content": "run pwd",
+                "content": "calculate",
                 "tool_calls": None,
             },
         ]
@@ -53,13 +55,43 @@ class TestReplayHistoryToolCalls:
         assert [m.role for m in msgs] == [Role.USER, Role.ASSISTANT, Role.TOOL]
         assistant = msgs[1]
         assert assistant.tool_calls is not None
-        assert assistant.tool_calls[0].name == "shell_exec"
+        assert assistant.tool_calls[0].name == "calculator"
         tool_msg = msgs[2]
-        assert tool_msg.content == "/home/u"
+        assert tool_msg.content == "4"
         # The tool result must reference the assistant's tool_call id.
         assert tool_msg.tool_call_id == assistant.tool_calls[0].id
 
-    def test_plain_assistant_without_tool_calls(self):
+    def test_disallowed_legacy_tool_results_are_not_replayed(self):
+        history = [
+            {
+                "id": "a1",
+                "direction": "agent_to_user",
+                "content": "",
+                "reply_to_id": "u1",
+                "status": "delivered",
+                "tool_calls": [
+                    {
+                        "tool": "memoire",
+                        "arguments": "{}",
+                        "result": "PRIVATE_MEMORY_FACT_CANARY",
+                        "success": True,
+                    }
+                ],
+            },
+            {
+                "id": "u1",
+                "direction": "user_to_agent",
+                "content": "recall",
+                "status": "delivered",
+                "tool_calls": None,
+            },
+        ]
+
+        messages = _replay_history_messages(history, exclude_id="current")
+
+        assert messages == []
+
+    def test_orphan_assistant_without_user_is_not_replayed(self):
         history = [
             {
                 "id": "m1",
@@ -69,9 +101,7 @@ class TestReplayHistoryToolCalls:
             },
         ]
         msgs = _replay_history_messages(history, exclude_id="current")
-        assert len(msgs) == 1
-        assert msgs[0].role == Role.ASSISTANT
-        assert msgs[0].tool_calls is None
+        assert msgs == []
 
     def test_excludes_current_message(self):
         history = [
@@ -89,7 +119,59 @@ class TestReplayHistoryToolCalls:
             },
         ]
         msgs = _replay_history_messages(history, exclude_id="cur")
-        assert [m.content for m in msgs] == ["before"]
+        assert msgs == []
+
+    def test_pending_and_concurrent_users_are_not_replayed(self):
+        history = [
+            {
+                "id": "answer-a",
+                "direction": "agent_to_user",
+                "content": "answer a",
+                "status": "delivered",
+                "reply_to_id": "user-a",
+            },
+            {
+                "id": "user-b",
+                "direction": "user_to_agent",
+                "content": "concurrent b",
+                "status": "pending",
+            },
+            {
+                "id": "user-a",
+                "direction": "user_to_agent",
+                "content": "question a",
+                "status": "delivered",
+            },
+        ]
+
+        msgs = _replay_history_messages(history, exclude_id="current")
+
+        assert [message.role for message in msgs] == [Role.USER, Role.ASSISTANT]
+        assert [message.content for message in msgs] == ["question a", "answer a"]
+
+
+class TestManagedRuntimeBounds:
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"temperature": -0.1},
+            {"temperature": 2.1},
+            {"temperature": float("nan")},
+            {"max_tokens": 0},
+            {"max_tokens": 32_769},
+            {"max_tokens": True},
+            {"max_turns": 0},
+            {"max_turns": 51},
+        ],
+    )
+    def test_invalid_runtime_value_is_rejected(self, config):
+        with pytest.raises(ValueError):
+            _managed_runtime_values(config)
+
+    def test_remote_memory_and_execution_tools_stay_quarantined(self):
+        assert not _managed_remote_tool_name_allowed("memoire")
+        assert not _managed_remote_tool_name_allowed("shell_exec")
+        assert _managed_remote_tool_name_allowed("calculator")
 
 
 class TestSamplerKwargs:
@@ -175,11 +257,7 @@ class TestInstantiateManagedTool:
 
 
 class TestBuildManagedSystemPrompt:
-    """#431 — the streaming managed-agent path must run the agent's
-    system_prompt through SystemPromptBuilder so SOUL.md / MEMORY.md /
-    USER.md persona files are injected (parity with the CLI/ask path),
-    instead of using the raw config system_prompt verbatim.
-    """
+    """Managed HTTP prompts use Ava's public identity, never local persona files."""
 
     def _config_with_soul(self, tmp_path):
         from openjarvis.core.config import (
@@ -195,15 +273,14 @@ class TestBuildManagedSystemPrompt:
             system_prompt=SystemPromptConfig(),
         )
 
-    def test_injects_soul_persona(self, tmp_path):
+    def test_excludes_soul_persona(self, tmp_path):
         app_config = self._config_with_soul(tmp_path)
         result = _build_managed_system_prompt(
             system_prompt="You are a helpful assistant.",
             app_config=app_config,
         )
-        # The persona file content is injected (the #431 fix)...
-        assert "meticulous local-first assistant" in result
-        # ...alongside the agent's own template.
+        assert "Tu es **Ava**" in result
+        assert "meticulous local-first assistant" not in result
         assert "You are a helpful assistant." in result
 
     def test_agent_template_is_preserved(self, tmp_path):
@@ -221,11 +298,7 @@ class TestBuildManagedSystemPrompt:
         # The agent's own template is carried into the assembled prompt.
         assert "Plain agent." in result
 
-    def test_matches_cli_builder_output(self, tmp_path):
-        """Parity check: the helper produces exactly what a directly-
-        constructed SystemPromptBuilder produces (same path the CLI uses),
-        so streaming chat and `jarvis ask` assemble the prompt identically.
-        """
+    def test_does_not_match_private_cli_builder_output(self, tmp_path):
         from openjarvis.core.config import MemoryFilesConfig, SystemPromptConfig
         from openjarvis.prompt.builder import SystemPromptBuilder
 
@@ -239,4 +312,5 @@ class TestBuildManagedSystemPrompt:
             memory_files_config=app_config.memory_files,
             system_prompt_config=app_config.system_prompt,
         ).build()
-        assert helper_out == direct_out
+        assert helper_out != direct_out
+        assert "Tu es **Ava**" in helper_out

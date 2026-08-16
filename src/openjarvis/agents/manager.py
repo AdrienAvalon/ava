@@ -9,14 +9,35 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 import time
 import uuid
+from functools import wraps
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from openjarvis.core.paths import get_config_dir
 
 logger = logging.getLogger(__name__)
+
+
+def _serialized_database(method):
+    """Serialize access to the manager's single SQLite connection.
+
+    ``check_same_thread=False`` only permits cross-thread use; it does not make
+    one connection safe for concurrent transactions.  The manager is shared by
+    FastAPI workers, response background tasks and the scheduler, so every
+    compound operation must hold one re-entrant lock from its first statement
+    through commit/rollback.
+    """
+
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._database_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
 
 _CREATE_AGENTS = """\
 CREATE TABLE IF NOT EXISTS managed_agents (
@@ -25,6 +46,7 @@ CREATE TABLE IF NOT EXISTS managed_agents (
     agent_type      TEXT NOT NULL DEFAULT 'monitor_operative',
     config_json     TEXT NOT NULL DEFAULT '{}',
     status          TEXT NOT NULL DEFAULT 'idle',
+    tick_token      TEXT,
     summary_memory  TEXT NOT NULL DEFAULT '',
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL
@@ -73,6 +95,7 @@ CREATE TABLE IF NOT EXISTS agent_messages (
     content TEXT NOT NULL,
     mode TEXT NOT NULL DEFAULT 'queued',
     status TEXT NOT NULL DEFAULT 'pending',
+    reply_to_id TEXT,
     created_at REAL NOT NULL
 );
 """
@@ -93,20 +116,16 @@ CREATE TABLE IF NOT EXISTS agent_learning_log (
 # UI/CLI show come from here). 16k (~4k tokens) holds a full report while
 # keeping per-tick prompt growth in check.
 _SUMMARY_MAX = 16000
+MAX_AGENT_MESSAGE_CHARS = 4 * 32_768
+MAX_AGENT_TOOL_CALLS_BYTES = 2 * MAX_AGENT_MESSAGE_CHARS
 
 
 class AgentManager:
     """Persistent agent lifecycle manager with SQLite backing."""
 
-    # A tick that hasn't touched its DB row in this many seconds is treated
-    # as a zombie (its worker died without running end_tick). start_tick()
-    # will overtake such a lock instead of refusing forever. The executor
-    # bumps updated_at at start and on every tool/inference event, so a live
-    # tick stays well under this window.
-    _STALE_TICK_SECONDS = 600
-
     def __init__(self, db_path: str, *, clear_stale_running: bool = False) -> None:
         self._db_path = str(db_path)
+        self._database_lock = threading.RLock()
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -129,14 +148,22 @@ class AgentManager:
             "ALTER TABLE managed_agents ADD COLUMN current_activity TEXT DEFAULT ''",
             "ALTER TABLE managed_agents ADD COLUMN input_tokens INTEGER DEFAULT 0",
             "ALTER TABLE managed_agents ADD COLUMN output_tokens INTEGER DEFAULT 0",
+            "ALTER TABLE managed_agents ADD COLUMN tick_token TEXT",
             # JSON-encoded array of {tool, arguments, result, success, latency}
             "ALTER TABLE agent_messages ADD COLUMN tool_calls TEXT",
+            # Exact user-message linkage for concurrent streaming turns.
+            "ALTER TABLE agent_messages ADD COLUMN reply_to_id TEXT",
         ]
         for migration in _MIGRATIONS:
             try:
                 self._conn.execute(migration)
             except sqlite3.OperationalError:
                 pass  # Column already exists
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_messages_reply"
+            " ON agent_messages(agent_id, reply_to_id)"
+            " WHERE direction = 'agent_to_user' AND reply_to_id IS NOT NULL"
+        )
         self._conn.commit()
         # Only the authoritative long-running process (the API server, which
         # owns the scheduler) may sweep running→idle on boot. Short-lived CLI
@@ -144,11 +171,13 @@ class AgentManager:
         # used by `run`/`ask` MUST NOT: they share this DB with a server that
         # may be mid-tick, and an unconditional sweep here flips an actively
         # running agent back to "idle" — which is exactly why `list` reported
-        # "idle" while a tick was running elsewhere. Zombies left by a crashed
-        # worker are recovered lazily by start_tick()'s stale-lock overtake.
+        # "idle" while a tick was running elsewhere. Only the authoritative
+        # server startup may recover crash leftovers; start_tick never guesses
+        # that a slow worker is dead from elapsed time alone.
         if clear_stale_running:
             self._clear_stale_running_state()
 
+    @_serialized_database
     def _clear_stale_running_state(self) -> None:
         """Reset any agent stuck in ``status='running'`` on startup.
 
@@ -164,7 +193,8 @@ class AgentManager:
         indicator. Call this only from a process that owns tick execution.
         """
         cur = self._conn.execute(
-            "UPDATE managed_agents SET status = 'idle', current_activity = '',"
+            "UPDATE managed_agents SET status = 'idle', tick_token = NULL,"
+            " current_activity = '',"
             " updated_at = ? WHERE status = 'running'",
             (time.time(),),
         )
@@ -174,12 +204,24 @@ class AgentManager:
                 "AgentManager: cleared stale 'running' status on %d agent(s)",
                 cur.rowcount,
             )
+        orphaned = self._conn.execute(
+            "UPDATE agent_messages SET status = 'failed'"
+            " WHERE direction = 'user_to_agent' AND status = 'processing'"
+        )
+        self._conn.commit()
+        if orphaned.rowcount:
+            logger.warning(
+                "AgentManager: terminally failed %d orphaned message claim(s)",
+                orphaned.rowcount,
+            )
 
+    @_serialized_database
     def close(self) -> None:
         self._conn.close()
 
     # ── Agent CRUD ────────────────────────────────────────────────
 
+    @_serialized_database
     def create_agent(
         self,
         name: str,
@@ -209,6 +251,7 @@ class AgentManager:
         self._conn.commit()
         return self.get_agent(agent_id)  # type: ignore[return-value]
 
+    @_serialized_database
     def list_agents(self, include_archived: bool = False) -> List[Dict[str, Any]]:
         query = "SELECT * FROM managed_agents"
         if not include_archived:
@@ -217,109 +260,236 @@ class AgentManager:
         rows = self._conn.execute(query).fetchall()
         return [self._row_to_agent(r) for r in rows]
 
+    @_serialized_database
     def get_agent(self, agent_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
             "SELECT * FROM managed_agents WHERE id = ?", (agent_id,)
         ).fetchone()
         return self._row_to_agent(row) if row else None
 
+    @_serialized_database
     def update_agent(self, agent_id: str, **kwargs: Any) -> Dict[str, Any]:
-        sets: List[str] = []
-        vals: List[Any] = []
-        for key in ("name", "agent_type", "status", "current_activity"):
-            if key in kwargs:
-                sets.append(f"{key} = ?")
-                vals.append(kwargs[key])
-        if "config" in kwargs:
-            sets.append("config_json = ?")
-            vals.append(json.dumps(kwargs["config"]))
-        total_runs_increment = kwargs.get("total_runs_increment", 0)
-        if total_runs_increment:
-            sets.append("total_runs = total_runs + ?")
-            vals.append(total_runs_increment)
-            sets.append("last_run_at = ?")
+        serialized_config = json.dumps(kwargs["config"]) if "config" in kwargs else None
+        if "status" in kwargs:
+            target = kwargs["status"]
+            allowed_targets = {
+                "idle",
+                "paused",
+                "archived",
+                "error",
+                "needs_attention",
+                "budget_exceeded",
+            }
+            if target not in allowed_targets:
+                raise ValueError(
+                    "generic status updates cannot acquire or invent a tick lock"
+                )
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            current = self._conn.execute(
+                "SELECT status FROM managed_agents WHERE id = ?", (agent_id,)
+            ).fetchone()
+            if current is None:
+                raise ValueError(f"Agent {agent_id} does not exist")
+            if "status" in kwargs and current["status"] == "running":
+                raise ValueError("a live tick can only be released by its owner token")
+
+            sets: List[str] = []
+            vals: List[Any] = []
+            for key in ("name", "agent_type", "status", "current_activity"):
+                if key in kwargs:
+                    sets.append(f"{key} = ?")
+                    vals.append(kwargs[key])
+                    if key == "status":
+                        sets.append("tick_token = NULL")
+            if serialized_config is not None:
+                sets.append("config_json = ?")
+                vals.append(serialized_config)
+            total_runs_increment = kwargs.get("total_runs_increment", 0)
+            if total_runs_increment:
+                sets.append("total_runs = total_runs + ?")
+                vals.append(total_runs_increment)
+                sets.append("last_run_at = ?")
+                vals.append(time.time())
+            total_cost_increment = kwargs.get("total_cost_increment", 0)
+            if total_cost_increment:
+                sets.append("total_cost = total_cost + ?")
+                vals.append(total_cost_increment)
+            total_tokens_increment = kwargs.get("total_tokens_increment", 0)
+            if total_tokens_increment:
+                sets.append("total_tokens = total_tokens + ?")
+                vals.append(total_tokens_increment)
+            input_tokens_increment = kwargs.get("input_tokens_increment", 0)
+            if input_tokens_increment:
+                sets.append("input_tokens = input_tokens + ?")
+                vals.append(input_tokens_increment)
+            output_tokens_increment = kwargs.get("output_tokens_increment", 0)
+            if output_tokens_increment:
+                sets.append("output_tokens = output_tokens + ?")
+                vals.append(output_tokens_increment)
+            if "last_activity_at" in kwargs:
+                sets.append("last_activity_at = ?")
+                vals.append(kwargs["last_activity_at"])
+            if "stall_retries" in kwargs:
+                sets.append("stall_retries = ?")
+                vals.append(kwargs["stall_retries"])
+            sets.append("updated_at = ?")
             vals.append(time.time())
-        total_cost_increment = kwargs.get("total_cost_increment", 0)
-        if total_cost_increment:
-            sets.append("total_cost = total_cost + ?")
-            vals.append(total_cost_increment)
-        total_tokens_increment = kwargs.get("total_tokens_increment", 0)
-        if total_tokens_increment:
-            sets.append("total_tokens = total_tokens + ?")
-            vals.append(total_tokens_increment)
-        input_tokens_increment = kwargs.get("input_tokens_increment", 0)
-        if input_tokens_increment:
-            sets.append("input_tokens = input_tokens + ?")
-            vals.append(input_tokens_increment)
-        output_tokens_increment = kwargs.get("output_tokens_increment", 0)
-        if output_tokens_increment:
-            sets.append("output_tokens = output_tokens + ?")
-            vals.append(output_tokens_increment)
-        if "last_activity_at" in kwargs:
-            sets.append("last_activity_at = ?")
-            vals.append(kwargs["last_activity_at"])
-        if "stall_retries" in kwargs:
-            sets.append("stall_retries = ?")
-            vals.append(kwargs["stall_retries"])
-        sets.append("updated_at = ?")
-        vals.append(time.time())
-        vals.append(agent_id)
-        self._conn.execute(
-            f"UPDATE managed_agents SET {', '.join(sets)} WHERE id = ?", vals
-        )
-        self._conn.commit()
+            vals.append(agent_id)
+            self._conn.execute(
+                f"UPDATE managed_agents SET {', '.join(sets)} WHERE id = ?", vals
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
         return self.get_agent(agent_id)  # type: ignore[return-value]
 
+    @_serialized_database
     def delete_agent(self, agent_id: str) -> None:
-        self._set_status(agent_id, "archived")
+        self._transition_agent_status(
+            agent_id,
+            target="archived",
+            allowed={
+                "idle",
+                "paused",
+                "error",
+                "needs_attention",
+                "budget_exceeded",
+                "archived",
+            },
+            action="archived",
+        )
 
+    @_serialized_database
     def pause_agent(self, agent_id: str) -> None:
-        self._set_status(agent_id, "paused")
+        self._transition_agent_status(
+            agent_id,
+            target="paused",
+            allowed={"idle", "paused"},
+            action="paused",
+        )
 
+    @_serialized_database
     def resume_agent(self, agent_id: str) -> None:
-        self._set_status(agent_id, "idle")
+        self._transition_agent_status(
+            agent_id,
+            target="idle",
+            allowed={"paused", "idle"},
+            action="resumed",
+        )
 
+    def _transition_agent_status(
+        self,
+        agent_id: str,
+        *,
+        target: str,
+        allowed: set[str],
+        action: str,
+    ) -> None:
+        """Apply a control transition without releasing a live worker tick."""
+
+        placeholders = ", ".join("?" for _ in allowed)
+        values = (target, time.time(), agent_id, *sorted(allowed))
+        cursor = self._conn.execute(
+            "UPDATE managed_agents SET status = ?, updated_at = ?"
+            f" WHERE id = ? AND status IN ({placeholders})",
+            values,
+        )
+        if cursor.rowcount == 1:
+            self._conn.commit()
+            return
+        self._conn.rollback()
+        row = self._conn.execute(
+            "SELECT status FROM managed_agents WHERE id = ?", (agent_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Agent {agent_id} does not exist")
+        raise ValueError(f"agent in status {row['status']!r} cannot be {action}")
+
+    @_serialized_database
     def _set_status(self, agent_id: str, status: str) -> None:
+        if status == "running":
+            raise ValueError("use start_tick() to acquire a running state")
         self._conn.execute(
-            "UPDATE managed_agents SET status = ?, updated_at = ? WHERE id = ?",
+            "UPDATE managed_agents SET status = ?, tick_token = NULL,"
+            " updated_at = ? WHERE id = ? AND status != 'running'",
             (status, time.time(), agent_id),
         )
         self._conn.commit()
 
     # ── Tick concurrency guard ────────────────────────────────────
 
-    def start_tick(self, agent_id: str) -> None:
+    @_serialized_database
+    def start_tick(self, agent_id: str) -> str:
         """Mark agent as running. Raises ValueError if already running.
 
-        A row that has been ``running`` longer than ``_STALE_TICK_SECONDS``
-        without any update is treated as a zombie left by a dead worker and
-        overtaken rather than refused — otherwise a crash with no server
-        around to sweep it would wedge the agent forever.
+        The transaction is cross-process, not merely protected by this
+        instance's RLock. A ``running`` row is never overtaken from elapsed time:
+        a slow model may legitimately be silent for minutes. Crash leftovers
+        are terminally reconciled only by authoritative server startup.
         """
-        agent = self.get_agent(agent_id)
-        if agent and agent["status"] == "running":
-            age = time.time() - (agent.get("updated_at") or 0)
-            if age < self._STALE_TICK_SECONDS:
-                raise ValueError(f"Agent {agent_id} is already executing a tick")
-            logger.warning(
-                "Agent %s: overtaking stale tick lock (running, idle for %.0fs)",
-                agent_id,
-                age,
+        now = time.time()
+        tick_token = uuid4().hex
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT status, updated_at FROM managed_agents WHERE id = ?",
+                (agent_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Agent {agent_id} does not exist")
+            if row["status"] != "idle":
+                raise ValueError(
+                    f"agent in status {row['status']!r} cannot execute a tick"
+                )
+            cursor = self._conn.execute(
+                "UPDATE managed_agents SET status = 'running', tick_token = ?,"
+                " updated_at = ?"
+                " WHERE id = ? AND status = 'idle'",
+                (tick_token, now, agent_id),
             )
-        self._set_status(agent_id, "running")
+            if cursor.rowcount != 1:
+                raise RuntimeError("agent tick lock disappeared")
+            self._conn.commit()
+            return tick_token
+        except Exception:
+            self._conn.rollback()
+            raise
 
-    def end_tick(self, agent_id: str) -> None:
-        self._conn.execute(
-            "UPDATE managed_agents SET status = 'idle', "
-            "current_activity = '', updated_at = ? WHERE id = ?",
-            (time.time(), agent_id),
+    @_serialized_database
+    def end_tick(
+        self,
+        agent_id: str,
+        tick_token: str,
+        *,
+        status: str = "idle",
+    ) -> bool:
+        """Release one running tick directly into its terminal status.
+
+        Final state and lock release are one SQLite update. Callers must never
+        expose an intermediate ``idle`` row and then set ``error`` or
+        ``budget_exceeded``: another worker could acquire that gap.
+        """
+
+        if status not in {"idle", "error", "needs_attention", "budget_exceeded"}:
+            raise ValueError(f"invalid terminal tick status: {status}")
+        if not isinstance(tick_token, str) or not tick_token:
+            raise ValueError("tick owner token is required")
+        cursor = self._conn.execute(
+            "UPDATE managed_agents SET status = ?, tick_token = NULL, "
+            "current_activity = '', updated_at = ?"
+            " WHERE id = ? AND status = 'running' AND tick_token = ?",
+            (status, time.time(), agent_id, tick_token),
         )
         self._conn.commit()
+        return cursor.rowcount == 1
 
     # ── Checkpoints ───────────────────────────────────────────────
 
     _CHECKPOINT_RETENTION = 5
 
+    @_serialized_database
     def save_checkpoint(
         self,
         agent_id: str,
@@ -357,6 +527,7 @@ class AgentManager:
             "created_at": now,
         }
 
+    @_serialized_database
     def list_checkpoints(self, agent_id: str) -> list:
         rows = self._conn.execute(
             "SELECT * FROM agent_checkpoints"
@@ -365,6 +536,7 @@ class AgentManager:
         ).fetchall()
         return [self._row_to_checkpoint(r) for r in rows]
 
+    @_serialized_database
     def get_latest_checkpoint(self, agent_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
             "SELECT * FROM agent_checkpoints"
@@ -373,10 +545,31 @@ class AgentManager:
         ).fetchone()
         return self._row_to_checkpoint(row) if row else None
 
+    @_serialized_database
     def recover_agent(self, agent_id: str) -> Optional[Dict[str, Any]]:
+        current = self._conn.execute(
+            "SELECT status FROM managed_agents WHERE id = ?",
+            (agent_id,),
+        ).fetchone()
+        if current is None:
+            raise ValueError(f"Agent {agent_id} does not exist")
+        if current["status"] not in {
+            "error",
+            "needs_attention",
+            "budget_exceeded",
+        }:
+            raise ValueError(
+                f"agent in status {current['status']!r} cannot be recovered"
+            )
         checkpoint = self.get_latest_checkpoint(agent_id)
-        # Always reset to idle — clearing the error state is the primary purpose
-        self.update_agent(agent_id, status="idle")
+        # Reset only a terminal state. A live/stalled worker must retain its
+        # lock until an authoritative process boundary reconciles it.
+        self._transition_agent_status(
+            agent_id,
+            target="idle",
+            allowed={"error", "needs_attention", "budget_exceeded"},
+            action="recovered",
+        )
         return checkpoint
 
     @staticmethod
@@ -392,6 +585,7 @@ class AgentManager:
 
     # ── Summary memory ────────────────────────────────────────────
 
+    @_serialized_database
     def update_summary_memory(self, agent_id: str, summary: str) -> None:
         truncated = summary[:_SUMMARY_MAX]
         self._conn.execute(
@@ -402,6 +596,7 @@ class AgentManager:
 
     # ── Task CRUD ─────────────────────────────────────────────────
 
+    @_serialized_database
     def create_task(
         self, agent_id: str, description: str, status: str = "pending"
     ) -> Dict[str, Any]:
@@ -415,6 +610,7 @@ class AgentManager:
         self._conn.commit()
         return self._get_task(task_id)  # type: ignore[return-value]
 
+    @_serialized_database
     def list_tasks(
         self, agent_id: str, status: Optional[str] = None
     ) -> List[Dict[str, Any]]:
@@ -427,6 +623,7 @@ class AgentManager:
         rows = self._conn.execute(query, params).fetchall()
         return [self._row_to_task(r) for r in rows]
 
+    @_serialized_database
     def update_task(self, task_id: str, **kwargs: Any) -> Dict[str, Any]:
         sets: List[str] = []
         vals: List[Any] = []
@@ -449,10 +646,12 @@ class AgentManager:
         self._conn.commit()
         return self._get_task(task_id)  # type: ignore[return-value]
 
+    @_serialized_database
     def delete_task(self, task_id: str) -> None:
         self._conn.execute("DELETE FROM agent_tasks WHERE id = ?", (task_id,))
         self._conn.commit()
 
+    @_serialized_database
     def _get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
             "SELECT * FROM agent_tasks WHERE id = ?", (task_id,)
@@ -461,6 +660,7 @@ class AgentManager:
 
     # ── Channel bindings ──────────────────────────────────────────
 
+    @_serialized_database
     def bind_channel(
         self,
         agent_id: str,
@@ -480,22 +680,26 @@ class AgentManager:
         self._conn.commit()
         return self._get_binding(binding_id)  # type: ignore[return-value]
 
+    @_serialized_database
     def list_channel_bindings(self, agent_id: str) -> List[Dict[str, Any]]:
         rows = self._conn.execute(
             "SELECT * FROM channel_bindings WHERE agent_id = ?", (agent_id,)
         ).fetchall()
         return [self._row_to_binding(r) for r in rows]
 
+    @_serialized_database
     def unbind_channel(self, binding_id: str) -> None:
         self._conn.execute("DELETE FROM channel_bindings WHERE id = ?", (binding_id,))
         self._conn.commit()
 
+    @_serialized_database
     def _get_binding(self, binding_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
             "SELECT * FROM channel_bindings WHERE id = ?", (binding_id,)
         ).fetchone()
         return self._row_to_binding(row) if row else None
 
+    @_serialized_database
     def find_binding_for_channel(
         self, channel_type: str, channel_id: str
     ) -> Optional[Dict[str, Any]]:
@@ -551,6 +755,7 @@ class AgentManager:
 
         return templates
 
+    @_serialized_database
     def create_from_template(
         self, template_id: str, name: str, overrides: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
@@ -577,7 +782,17 @@ class AgentManager:
 
     # ── Message queue ─────────────────────────────────────────────
 
+    @_serialized_database
     def send_message(self, agent_id: str, content: str, mode: str = "queued") -> dict:
+        if (
+            not isinstance(content, str)
+            or not content.strip()
+            or len(content) > MAX_AGENT_MESSAGE_CHARS
+        ):
+            raise ValueError(
+                "managed-agent message must contain"
+                f" 1..{MAX_AGENT_MESSAGE_CHARS} characters"
+            )
         msg_id = uuid4().hex[:16]
         now = time.time()
         _sql = (
@@ -597,6 +812,41 @@ class AgentManager:
             "created_at": now,
         }
 
+    @_serialized_database
+    def send_claimed_message(
+        self, agent_id: str, content: str, mode: str = "immediate"
+    ) -> dict:
+        """Insert a message directly as processing in one indivisible operation."""
+
+        if (
+            not isinstance(content, str)
+            or not content.strip()
+            or len(content) > MAX_AGENT_MESSAGE_CHARS
+        ):
+            raise ValueError(
+                "managed-agent message must contain"
+                f" 1..{MAX_AGENT_MESSAGE_CHARS} characters"
+            )
+        msg_id = uuid4().hex[:16]
+        now = time.time()
+        self._conn.execute(
+            "INSERT INTO agent_messages"
+            " (id, agent_id, direction, content, mode, status, created_at)"
+            " VALUES (?, ?, 'user_to_agent', ?, ?, 'processing', ?)",
+            (msg_id, agent_id, content, mode, now),
+        )
+        self._conn.commit()
+        return {
+            "id": msg_id,
+            "agent_id": agent_id,
+            "direction": "user_to_agent",
+            "content": content,
+            "mode": mode,
+            "status": "processing",
+            "created_at": now,
+        }
+
+    @_serialized_database
     def store_agent_response(
         self,
         agent_id: str,
@@ -610,14 +860,30 @@ class AgentManager:
         as JSON alongside the message so the UI can replay them after a
         page reload.
         """
+        if (
+            not isinstance(content, str)
+            or not content.strip()
+            or len(content) > MAX_AGENT_MESSAGE_CHARS
+        ):
+            raise ValueError(
+                "managed-agent response must contain"
+                f" 1..{MAX_AGENT_MESSAGE_CHARS} characters"
+            )
         msg_id = uuid4().hex[:16]
         now = time.time()
-        tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+        tool_calls_json = (
+            json.dumps(tool_calls, ensure_ascii=False) if tool_calls else None
+        )
+        if (
+            tool_calls_json is not None
+            and len(tool_calls_json.encode("utf-8")) > MAX_AGENT_TOOL_CALLS_BYTES
+        ):
+            raise ValueError("managed-agent tool call envelope is too large")
         self._conn.execute(
             "INSERT INTO agent_messages"
             " (id, agent_id, direction, content, mode, status, created_at,"
-            " tool_calls)"
-            " VALUES (?, ?, 'agent_to_user', ?, 'immediate', 'delivered', ?, ?)",
+            " tool_calls, reply_to_id)"
+            " VALUES (?, ?, 'agent_to_user', ?, 'immediate', 'delivered', ?, ?, NULL)",
             (msg_id, agent_id, content, now, tool_calls_json),
         )
         self._conn.commit()
@@ -630,8 +896,10 @@ class AgentManager:
             "status": "delivered",
             "created_at": now,
             "tool_calls": tool_calls or None,
+            "reply_to_id": None,
         }
 
+    @_serialized_database
     def list_messages(self, agent_id: str, limit: int = 50) -> list[dict]:
         rows = self._conn.execute(
             "SELECT * FROM agent_messages"
@@ -640,6 +908,7 @@ class AgentManager:
         ).fetchall()
         return [self._row_to_message(r) for r in rows]
 
+    @_serialized_database
     def get_pending_messages(self, agent_id: str) -> list[dict]:
         rows = self._conn.execute(
             "SELECT * FROM agent_messages"
@@ -649,6 +918,151 @@ class AgentManager:
         ).fetchall()
         return [self._row_to_message(r) for r in rows]
 
+    @_serialized_database
+    def claim_message(self, agent_id: str, message_id: str) -> dict:
+        """Atomically claim one pending user message before any model/tool effect."""
+
+        cursor = self._conn.execute(
+            "UPDATE agent_messages SET status = 'processing'"
+            " WHERE id = ? AND agent_id = ? AND direction = 'user_to_agent'"
+            " AND status = 'pending'",
+            (message_id, agent_id),
+        )
+        if cursor.rowcount != 1:
+            self._conn.rollback()
+            raise ValueError("message is not pending or does not belong to this agent")
+        row = self._conn.execute(
+            "SELECT * FROM agent_messages WHERE id = ? AND agent_id = ?",
+            (message_id, agent_id),
+        ).fetchone()
+        self._conn.commit()
+        if row is None:  # Defensive: the row was updated in the same transaction.
+            raise RuntimeError("claimed message disappeared")
+        return self._row_to_message(row)
+
+    @_serialized_database
+    def claim_next_message(self, agent_id: str) -> Optional[dict]:
+        """Claim the oldest pending message, processing at most one per tick."""
+
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT id FROM agent_messages"
+                " WHERE agent_id = ? AND direction = 'user_to_agent'"
+                " AND status = 'pending' ORDER BY created_at ASC, id ASC LIMIT 1",
+                (agent_id,),
+            ).fetchone()
+            if row is None:
+                self._conn.commit()
+                return None
+            cursor = self._conn.execute(
+                "UPDATE agent_messages SET status = 'processing'"
+                " WHERE id = ? AND status = 'pending'",
+                (row["id"],),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("pending message claim lost")
+            claimed = self._conn.execute(
+                "SELECT * FROM agent_messages WHERE id = ?", (row["id"],)
+            ).fetchone()
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        if claimed is None:
+            raise RuntimeError("claimed message disappeared")
+        return self._row_to_message(claimed)
+
+    @_serialized_database
+    def complete_message_turn(
+        self,
+        agent_id: str,
+        message_id: str,
+        content: str,
+        tool_calls: Optional[list] = None,
+    ) -> dict:
+        """Atomically persist one response and deliver its claimed user message."""
+
+        if (
+            not isinstance(content, str)
+            or not content.strip()
+            or len(content) > MAX_AGENT_MESSAGE_CHARS
+        ):
+            raise ValueError(
+                "completed managed-agent response must contain"
+                f" 1..{MAX_AGENT_MESSAGE_CHARS} characters"
+            )
+        tool_calls_json = (
+            json.dumps(tool_calls, ensure_ascii=False) if tool_calls else None
+        )
+        if (
+            tool_calls_json is not None
+            and len(tool_calls_json.encode("utf-8")) > MAX_AGENT_TOOL_CALLS_BYTES
+        ):
+            raise ValueError("managed-agent tool call envelope is too large")
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            source = self._conn.execute(
+                "SELECT status FROM agent_messages"
+                " WHERE id = ? AND agent_id = ? AND direction = 'user_to_agent'",
+                (message_id, agent_id),
+            ).fetchone()
+            if source is None:
+                raise ValueError("source message does not exist")
+            existing = self._conn.execute(
+                "SELECT * FROM agent_messages"
+                " WHERE agent_id = ? AND direction = 'agent_to_user'"
+                " AND reply_to_id = ?",
+                (agent_id, message_id),
+            ).fetchone()
+            if existing is not None:
+                existing_tools = existing["tool_calls"]
+                if existing["content"] != content or existing_tools != tool_calls_json:
+                    raise ValueError(
+                        "message turn already completed with another response"
+                    )
+                if source["status"] != "delivered":
+                    raise RuntimeError("completed response has an undelivered source")
+                self._conn.commit()
+                return self._row_to_message(existing)
+            if source["status"] != "processing":
+                raise ValueError("source message is not claimed")
+
+            response_id = uuid4().hex[:16]
+            now = time.time()
+            self._conn.execute(
+                "INSERT INTO agent_messages"
+                " (id, agent_id, direction, content, mode, status, created_at,"
+                " tool_calls, reply_to_id)"
+                " VALUES (?, ?, 'agent_to_user', ?, 'immediate', 'delivered', ?, ?, ?)",
+                (
+                    response_id,
+                    agent_id,
+                    content,
+                    now,
+                    tool_calls_json,
+                    message_id,
+                ),
+            )
+            delivered = self._conn.execute(
+                "UPDATE agent_messages SET status = 'delivered'"
+                " WHERE id = ? AND agent_id = ? AND status = 'processing'",
+                (message_id, agent_id),
+            )
+            if delivered.rowcount != 1:
+                raise RuntimeError("claimed source message changed before completion")
+            response = self._conn.execute(
+                "SELECT * FROM agent_messages WHERE id = ?", (response_id,)
+            ).fetchone()
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        if response is None:
+            raise RuntimeError("completed response disappeared")
+        return self._row_to_message(response)
+
+    @_serialized_database
     def mark_message_delivered(self, message_id: str) -> None:
         self._conn.execute(
             "UPDATE agent_messages SET status = 'delivered' WHERE id = ?",
@@ -656,6 +1070,17 @@ class AgentManager:
         )
         self._conn.commit()
 
+    @_serialized_database
+    def mark_message_failed(self, message_id: str) -> None:
+        self._conn.execute(
+            "UPDATE agent_messages SET status = 'failed'"
+            " WHERE id = ? AND direction = 'user_to_agent'"
+            " AND status IN ('pending', 'processing')",
+            (message_id,),
+        )
+        self._conn.commit()
+
+    @_serialized_database
     def add_agent_response(self, agent_id: str, content: str) -> dict:
         msg_id = uuid4().hex[:16]
         now = time.time()
@@ -679,6 +1104,7 @@ class AgentManager:
     @staticmethod
     def _row_to_message(row: sqlite3.Row) -> dict:
         tool_calls = None
+        reply_to_id = None
         try:
             raw = row["tool_calls"]
         except (IndexError, KeyError):
@@ -688,6 +1114,10 @@ class AgentManager:
                 tool_calls = json.loads(raw)
             except (json.JSONDecodeError, TypeError):
                 tool_calls = None
+        try:
+            reply_to_id = row["reply_to_id"]
+        except (IndexError, KeyError):
+            pass
         return {
             "id": row["id"],
             "agent_id": row["agent_id"],
@@ -697,10 +1127,12 @@ class AgentManager:
             "status": row["status"],
             "created_at": row["created_at"],
             "tool_calls": tool_calls,
+            "reply_to_id": reply_to_id,
         }
 
     # ── Learning log ──────────────────────────────────────────
 
+    @_serialized_database
     def add_learning_log(
         self,
         agent_id: str,
@@ -726,6 +1158,7 @@ class AgentManager:
             "created_at": now,
         }
 
+    @_serialized_database
     def list_learning_log(self, agent_id: str, limit: int = 50) -> list[dict]:
         rows = self._conn.execute(
             "SELECT * FROM agent_learning_log"

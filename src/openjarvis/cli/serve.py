@@ -389,10 +389,6 @@ def serve(
         channel_agent = config.channel.default_agent or agent_key or "simple"
 
         _channel_tools: list = []
-        # MCP transports persisted at function scope (= server-process
-        # lifetime); see the comment near the channel-MCP-load block
-        # below. Initialise here so it's always bound. #461.
-        _channel_mcp_clients: list = []
         if channel_agent:
             try:
                 import openjarvis.agents
@@ -401,8 +397,9 @@ def serve(
                 if AgentRegistry.contains(channel_agent):
                     _ch_cls = AgentRegistry.get(channel_agent)
                     if getattr(_ch_cls, "accepts_tools", False):
-                        import openjarvis.tools
+                        import openjarvis.tools  # noqa: F401
                         from openjarvis.core.registry import ToolRegistry
+                        from openjarvis.server.routes import _HTTP_DISABLED_TOOLS
                         from openjarvis.tools._stubs import BaseTool
 
                         _DEFAULT_TOOLS = {"think", "calculator", "web_search"}
@@ -424,7 +421,7 @@ def serve(
                             _allowed = _DEFAULT_TOOLS
 
                         for _tname in ToolRegistry.keys():
-                            if _tname not in _allowed:
+                            if _tname not in _allowed or _tname in _HTTP_DISABLED_TOOLS:
                                 continue
                             _tcls = ToolRegistry.get(_tname)
                             if isinstance(_tcls, type) and issubclass(_tcls, BaseTool):
@@ -432,29 +429,11 @@ def serve(
                             elif isinstance(_tcls, BaseTool):
                                 _channel_tools.append(_tcls)
 
-                        # MCP tools for the channel agent too (#461).
-                        from openjarvis.mcp.loader import (
-                            load_mcp_tools_from_config,
-                        )
-
-                        _ch_mcp_tools, _ch_mcp_clients = load_mcp_tools_from_config(
-                            config.tools.mcp,
-                            allowed_names=_allowed if configured else None,
-                        )
-                        if _ch_mcp_tools:
-                            _existing = {t.spec.name for t in _channel_tools}
-                            for t in _ch_mcp_tools:
-                                if t.spec.name not in _existing:
-                                    _channel_tools.append(t)
-                                    _existing.add(t.spec.name)
-                        # Hold a reference at module / function scope —
-                        # the channel agent is constructed inside
-                        # JarvisSystem below; we extend its lifetime by
-                        # keeping the list bound here.
-                        _channel_mcp_clients = _ch_mcp_clients
+                        # Inbound channels do not expose remote MCP adapters:
+                        # their side effects and filesystem reach cannot be
+                        # proven by the local capability policy.
             except Exception as exc:
                 logger.warning("Channel tools failed to load: %s", exc)
-                _channel_mcp_clients = []
 
         _wire_system = JarvisSystem(
             config=config,
@@ -486,10 +465,12 @@ def serve(
     memory_backend = None
     if config.agent.context_from_memory:
         try:
-            import openjarvis.tools.storage  # noqa: F401
+            mem_key = config.memory.default_backend
+            from openjarvis.tools.storage import register_optional_backends
+
+            register_optional_backends(mem_key)
             from openjarvis.core.registry import MemoryRegistry
 
-            mem_key = config.memory.default_backend
             if MemoryRegistry.contains(mem_key):
                 memory_backend = MemoryRegistry.create(
                     mem_key,

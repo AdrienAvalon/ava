@@ -1,13 +1,14 @@
 import type { AuthProviderProps } from 'react-oidc-context';
 import { WebStorageStateStore } from 'oidc-client-ts';
+import { OIDC_AUTHORITY, OIDC_CLIENT_ID } from './oidcIdentity';
 
 /**
  * OIDC config for Ava — public client on Keycloak realm "master".
  * Uses Authorization Code + PKCE. Tokens stored in sessionStorage (cleared on tab close).
  */
 export const oidcConfig: AuthProviderProps = {
-  authority: 'https://auth.avalon-network.com/realms/master',
-  client_id: 'ava',
+  authority: OIDC_AUTHORITY,
+  client_id: OIDC_CLIENT_ID,
   redirect_uri: window.location.origin + '/',
   post_logout_redirect_uri: window.location.origin + '/',
   scope: 'openid profile email',

@@ -29,9 +29,9 @@ RACINE = Path(__file__).resolve().parents[1]
 def _charger(nom: str) -> Any:
     """Charge un outil SANS passer par le registre.
 
-    ⚠ Un import direct echouerait : `@ToolRegistry.register` leve « already has an entry »
-      si le daemon a deja charge le module. On neutralise donc le decorateur le temps du
-      chargement — la classe reste intacte, seul l'enregistrement est saute.
+    ⚠ Un import direct echouerait : `@ToolRegistry.register` leve « already has an entry
+      » si le daemon a deja charge le module. On neutralise donc le decorateur le temps
+      du chargement — la classe reste intacte, seul l'enregistrement est saute.
     """
     import openjarvis.core.registry as reg
 
@@ -343,9 +343,7 @@ def test_charger_attrape_AUSSI_les_erreurs_d_execution() -> None:
 # ══ Enregistrement dans le registre — transpose du STT le 2026-08-04 ══════════════
 
 
-@pytest.mark.parametrize(
-    "cle", ["avalon_status", "home_assistant", "memoire", "journal", "logs"]
-)
+@pytest.mark.parametrize("cle", ["avalon_status", "home_assistant", "journal", "logs"])
 def test_l_outil_est_REELLEMENT_enregistre(cle: str) -> None:
     """⚠ AUCUN TEST NE VERIFIAIT CECI, et c'est le seul qui attraperait la panne.
 
@@ -368,6 +366,13 @@ def test_l_outil_est_REELLEMENT_enregistre(cle: str) -> None:
     assert ToolRegistry.contains(cle), (
         f"outil {cle!r} absent du ToolRegistry — le decorateur s'est-il execute ?"
     )
+
+
+def test_la_memoire_legacy_n_est_pas_enregistree() -> None:
+    """Le JSONL commun ne doit etre accessible par aucun moteur ou agent gere."""
+    from openjarvis.core.registry import ToolRegistry
+
+    assert not ToolRegistry.contains("memoire")
 
 
 def test_la_voix_kokoro_fr_est_REELLEMENT_enregistree() -> None:
@@ -594,9 +599,9 @@ def _outils_importes_par_boot() -> set[str]:
 
     ⚠ La premiere version de ce test decoupait le fichier a la chaine et cherchait la
       parenthese fermante apres « def _skills() » — elle tombait sur celle de la
-      SIGNATURE, donc lisait un bloc vide et declarait les sept outils manquants. Un test
-      faux qui echoue est moins couteux qu'un test faux qui passe, mais c'est le meme
-      defaut : on lit une source qui ne porte pas la donnee.
+      SIGNATURE, donc lisait un bloc vide et declarait les sept outils manquants. Un
+      test faux qui echoue est moins couteux qu'un test faux qui passe, mais c'est le
+      meme defaut : on lit une source qui ne porte pas la donnee.
     """
     arbre = ast.parse((RACINE / "boot.py").read_text(encoding="utf-8"))
     for noeud in ast.walk(arbre):
@@ -613,15 +618,16 @@ def _outils_importes_par_boot() -> set[str]:
 def test_TOUT_outil_pose_sur_le_disque_est_IMPORTE_par_boot() -> None:
     """⚠ LE GARDE-FOU QUE `boot.py` ANNONCAIT SANS QU'IL EXISTE.
 
-    Son commentaire dit « TOUT NOUVEL OUTIL DOIT ETRE AJOUTE ICI (et la CI le verifie) ».
-    La CI ne verifiait rien. Paye le 2026-08-05 avec l'outil `proposer` : le fichier etait
-    depose, la liste blanche Ansible le nommait, le service redemarrait sans la moindre
-    erreur — et Ava repondait « je n'ai pas d'outil `proposer` dans ma liste ». Rien
-    n'etait casse ; personne n'importait le module, donc le decorateur
+    Son commentaire dit « TOUT NOUVEL OUTIL DOIT ETRE AJOUTE ICI (et la CI le verifie)
+    ». La CI ne verifiait rien. Paye le 2026-08-05 avec l'outil `proposer` : le fichier
+    etait depose, la liste blanche Ansible le nommait, le service redemarrait sans la
+    moindre erreur — et Ava repondait « je n'ai pas d'outil `proposer` dans ma liste ».
+    Rien n'etait casse ; personne n'importait le module, donc le decorateur
     `@ToolRegistry.register` ne s'executait jamais.
 
     C'est le defaut recurrent de ce projet sous une forme de plus : *une source qui ne
-    porte pas la donnee repond « rien » sans erreur.* Ici la source est la liste d'imports.
+    porte pas la donnee repond « rien » sans erreur.* Ici la source est la liste
+    d'imports.
     """
     poses = {
         f.stem for f in (RACINE / "skills").glob("*.py") if not f.stem.startswith("_")
@@ -635,7 +641,8 @@ def test_TOUT_outil_pose_sur_le_disque_est_IMPORTE_par_boot() -> None:
 
 def test_le_garde_fou_precedent_examine_VRAIMENT_quelque_chose() -> None:
     """Contre-test indispensable : un test dont la lecture echoue silencieusement reste
-    vert pour toujours. On verifie donc que les DEUX cotes de la comparaison sont peuples.
+    vert pour toujours. On verifie donc que les DEUX cotes de la comparaison sont
+    peuples.
     """
     poses = {
         f.stem for f in (RACINE / "skills").glob("*.py") if not f.stem.startswith("_")
@@ -677,10 +684,10 @@ def test_un_fichier_ORDINAIRE_reste_lisible() -> None:
 
 def test_la_garde_consulte_les_DEUX_implementations() -> None:
     """⚠ LE PIEGE QUI A COUTE UNE PASSE. `is_sensitive_file` rendait la reponse RUST des
-    qu'elle etait disponible et ne consultait Python qu'en `ImportError` : un motif ajoute
-    a `DEFAULT_SENSITIVE_PATTERNS` etait DU CODE MORT en production. On croit durcir, rien
-    ne change, aucune erreur ne le signale.
-    L'union doit aller dans le sens du REFUS — un desaccord entre deux gardes doit fermer,
+    qu'elle etait disponible et ne consultait Python qu'en `ImportError` : un motif
+    ajoute a `DEFAULT_SENSITIVE_PATTERNS` etait DU CODE MORT en production. On croit
+    durcir, rien ne change, aucune erreur ne le signale. L'union doit aller dans le sens
+    du REFUS — un desaccord entre deux gardes doit fermer,
     jamais ouvrir."""
     import inspect
 
@@ -698,7 +705,8 @@ def test_la_garde_consulte_les_DEUX_implementations() -> None:
 def test_un_echec_DOCUMENTAIRE_oriente_vers_lire_doc() -> None:
     """⚠ MESURE : 12 appels a `file_read`, 11 echecs, dont NEUF sur le meme fichier
     essaye en sept orthographes. Aucune ne pouvait aboutir — le depot d'infrastructure
-    n'est pas sur cette machine. « File not found » est exact et sans issue : il invite a
+    n'est pas sur cette machine. « File not found » est exact et sans issue : il invite
+    a
     reessayer un chemin de plus, ce qu'elle a fait sept fois."""
     import ava_extensions.patches.file_read_oriente  # noqa: F401
     from openjarvis.tools.file_read import FileReadTool
@@ -721,17 +729,16 @@ def test_un_echec_ORDINAIRE_n_est_PAS_pollue() -> None:
 
 def test_une_lecture_REUSSIE_reste_intacte() -> None:
     """Un patch d'orientation ne doit rien changer au chemin nominal."""
-    import ava_extensions.patches.file_read_oriente  # noqa: F401
-    from openjarvis.tools.file_read import FileReadTool
-
-    # ⚠ CE TEST LISAIT `/etc/hostname`, ce qui n'est plus permis depuis le durcissement du
-    #   2026-08-06 : `file_read` a desormais un perimetre par defaut (liste BLANCHE = la
-    #   racine du depot) au lieu d'un `if not allowed_dirs: return True` qui laissait tout
-    #   passer, `/proc/self/environ` compris. On lit donc un fichier du depot — ce qui est
-    #   aussi plus representatif de l'usage reel d'Ava.
+    # ⚠ CE TEST LISAIT `/etc/hostname`, ce qui n'est plus permis depuis le durcissement
+    #   du 2026-08-06 : `file_read` a desormais un perimetre par defaut (liste BLANCHE =
+    #   la racine du depot) au lieu d'un `if not allowed_dirs: return True` qui laissait
+    #   tout passer, `/proc/self/environ` compris. On lit donc un fichier du depot — ce
+    #   qui est aussi plus representatif de l'usage reel d'Ava.
     from pathlib import Path
 
+    import ava_extensions.patches.file_read_oriente  # noqa: F401
     import openjarvis.tools.file_read as fr
+    from openjarvis.tools.file_read import FileReadTool
 
     racine = Path(fr.__file__).resolve().parents[3]
     r = FileReadTool().execute(path=str(racine / "pyproject.toml"))
@@ -741,7 +748,8 @@ def test_une_lecture_REUSSIE_reste_intacte() -> None:
 
 def test_TOUT_patch_pose_sur_le_disque_est_IMPORTE_par_boot() -> None:
     """Meme garde-fou que pour les outils, etendu aux patches : un module pose et jamais
-    importe ne s'execute pas, et rien ne le signale. C'est ainsi que `proposer` est reste
+    importe ne s'execute pas, et rien ne le signale. C'est ainsi que `proposer` est
+    reste
     invisible au modele le 2026-08-05 alors que tout semblait en place."""
     poses = {
         f.stem for f in (RACINE / "patches").glob("*.py") if not f.stem.startswith("_")
@@ -749,13 +757,16 @@ def test_TOUT_patch_pose_sur_le_disque_est_IMPORTE_par_boot() -> None:
     arbre = ast.parse((RACINE / "boot.py").read_text(encoding="utf-8"))
     importes: set[str] = set()
     for noeud in ast.walk(arbre):
-        if isinstance(noeud, ast.FunctionDef) and noeud.name == "_patches":
-            importes = {
+        if isinstance(noeud, ast.FunctionDef) and noeud.name in {
+            "_patches",
+            "_safety_guards",
+        }:
+            importes.update(
                 alias.name
                 for sous in ast.walk(noeud)
                 if isinstance(sous, ast.ImportFrom)
                 for alias in sous.names
-            }
+            )
     assert poses, "aucun patch decouvert — lecture cassee"
     manquants = sorted(poses - importes)
     assert not manquants, f"patches jamais importes par boot.py : {manquants}"
@@ -791,8 +802,11 @@ def _trace_avec(succes_outils: list[bool]):
 
 
 def test_un_echec_d_outil_NOTE_la_trace() -> None:
-    """⚠ Mesure du 2026-08-05 : 1 trace notee sur 108. `outcome` a de vrais consommateurs
-    mais personne ne l'ecrivait — la boucle d'apprentissage etait branchee sur du vide."""
+    """⚠ Mesure du 2026-08-05 : 1 trace notee sur 108.
+
+    `outcome` a de vrais consommateurs mais personne ne l'ecrivait — la boucle
+    d'apprentissage etait branchee sur du vide.
+    """
     from openjarvis.core.types import StepType
 
     t = _trace_avec([True, False, True])
@@ -814,7 +828,8 @@ def test_l_ABSENCE_d_echec_ne_vaut_PAS_succes() -> None:
     ).read_text(encoding="utf-8")
     assert 'trace.outcome = "tool_failure"' in source
     assert 'trace.outcome = "success"' not in source, (
-        "aucun succes ne doit etre ecrit automatiquement — l'absence d'echec n'est pas une preuve"
+        "aucun succes ne doit etre ecrit automatiquement — l'absence d'echec "
+        "n'est pas une preuve"
     )
 
 
@@ -823,14 +838,15 @@ def test_l_ABSENCE_d_echec_ne_vaut_PAS_succes() -> None:
 
 def test_une_sonde_FIGEE_est_signalee_SUR_LA_LIGNE_de_sa_valeur() -> None:
     """⚠ DIXIÈME OCCURRENCE DE « COLLECTÉ MAIS NON RELAYÉ », et celle-ci a un coût
-    mesurable sur la qualité des réponses. Le 2026-08-06, interrogée sur « 23,3 °C dans la
-    salle de bain des parents », Ava a correctement douté — mais faute de pouvoir
-    CONSTATER que la sonde était figée, elle a INVENTÉ un mécanisme (« doublon ou mapping
-    d'entité foireux », parce que la cuisine affichait aussi 23,3). La coïncidence était
-    réelle, l'explication fausse : deux appareils Tuya distincts, et la salle de bain
-    n'émettait plus rien depuis cinq jours.
-    ⚠ L'avertissement doit être SUR LA LIGNE de la valeur : une note en fin de réponse se
-    lit après avoir déjà cru le chiffre."""
+    mesurable sur la qualité des réponses. Le 2026-08-06, interrogée sur « 23,3 °C dans
+    la salle de bain des parents », Ava a correctement douté — mais faute de pouvoir
+    CONSTATER que la sonde était figée, elle a INVENTÉ un mécanisme (« doublon ou
+    mapping d'entité foireux », parce que la cuisine affichait aussi 23,3). La
+    coïncidence était réelle, l'explication fausse : deux appareils Tuya distincts, et
+    la salle de bain n'émettait plus rien depuis cinq jours.
+    ⚠ L'avertissement doit être SUR LA LIGNE de la valeur : une note en fin de
+      réponse se lit après avoir déjà cru le chiffre.
+    """
     from ava_extensions.skills import home_assistant as ha
 
     d = {
@@ -854,9 +870,11 @@ def test_une_sonde_FIGEE_est_signalee_SUR_LA_LIGNE_de_sa_valeur() -> None:
 
 
 def test_une_sonde_muette_est_dite_MEME_hors_du_domaine_climat() -> None:
-    """⚠ Une pile faible dégrade une mesure ; une sonde figée en FABRIQUE une. Sans cette
-    remontée globale, une question posée en domaine `maison` citerait la valeur morte sans
-    le moindre signe."""
+    """⚠ Une pile faible dégrade une mesure ; une sonde figée en FABRIQUE une.
+
+    Sans cette remontée globale, une question en domaine `maison` citerait la valeur
+    morte sans le moindre signe.
+    """
     from ava_extensions.skills import home_assistant as ha
 
     d = {
@@ -869,8 +887,10 @@ def test_une_sonde_muette_est_dite_MEME_hors_du_domaine_climat() -> None:
 
 
 def test_l_INTEGRATION_en_echec_est_nommee_comme_CAUSE() -> None:
-    """⚠ Quand une intégration tombe, toutes ses sondes paraissent figées. La nommer évite
-    de faire chercher cinq pannes de capteur là où il n'y en a qu'une, en amont."""
+    """⚠ Quand une intégration tombe, toutes ses sondes paraissent figées.
+
+    La nommer évite de chercher cinq pannes de capteur quand une seule existe en amont.
+    """
     from ava_extensions.skills import home_assistant as ha
 
     d = {"lumieres": {"Salon": "allumée"}, "integrations_ko": [{"nom": "Tuya"}]}

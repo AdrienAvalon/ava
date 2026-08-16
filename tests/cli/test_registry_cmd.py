@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from click.testing import CliRunner
 
 from openjarvis.cli import cli
@@ -36,6 +38,17 @@ class TestRegistryCmd:
         # Should show registry-related content
         output = result.output.lower()
         assert "registry" in output
+
+    def test_registry_inspection_declenche_les_chargeurs_lazies(self) -> None:
+        with (
+            patch("openjarvis.speech.register_builtin_backends") as speech,
+            patch("openjarvis.tools.storage.register_optional_backends") as memory,
+        ):
+            result = CliRunner().invoke(cli, ["registry", "show", "speech"])
+
+        assert result.exit_code == 0
+        speech.assert_called_once_with()
+        memory.assert_called_once_with()
 
     def test_registry_show_unknown_registry(self) -> None:
         """Test that showing an unknown registry shows an error."""

@@ -250,6 +250,19 @@ INSTALL_START_EPOCH="$(date +%s)"
 CURRENT_STAGE=""
 
 analytics_enabled() {
+    # The Ava fork never creates an identifier or opens a network connection
+    # without an explicit positive opt-in.  Kill switches still win.
+    case "$(printf '%s' "${OPENJARVIS_ENABLE_ANALYTICS:-}" | tr '[:upper:]' '[:lower:]' | xargs)" in
+        1|true|yes|on) ;;
+        *) return 1 ;;
+    esac
+    for var in DO_NOT_TRACK OPENJARVIS_NO_ANALYTICS; do
+        val="${!var:-}"
+        case "$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]' | xargs)" in
+            ""|0|false|no|off) ;;
+            *) return 1 ;;
+        esac
+    done
     return 0
 }
 

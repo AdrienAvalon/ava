@@ -44,6 +44,7 @@ RUN pip install --no-cache-dir uv && \
 # Copy the source and the non-src force-include paths (see pyproject
 # [tool.hatch.build.targets.wheel.force-include]) before building the project.
 COPY src/ src/
+COPY ava_extensions/ ava_extensions/
 COPY rust/ rust/
 COPY scripts/install scripts/install
 COPY deploy/windows deploy/windows

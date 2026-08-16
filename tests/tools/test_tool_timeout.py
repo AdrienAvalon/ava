@@ -78,6 +78,35 @@ class TestToolTimeout:
         assert len(timeout_events) == 1
         assert timeout_events[0].data["tool"] == "slow_tool"
 
+    def test_tool_exception_details_do_not_enter_result_or_trace_event(self):
+        class ExplodingTool(BaseTool):
+            tool_id = "exploding_tool"
+
+            @property
+            def spec(self):
+                return ToolSpec(name=self.tool_id, description="test")
+
+            def execute(self, **params):
+                raise RuntimeError("PRIVATE_TOOL_EXCEPTION_CANARY")
+
+        bus = EventBus(record_history=True)
+        executor = ToolExecutor([ExplodingTool()], bus=bus)
+
+        result = executor.execute(
+            ToolCall(id="1", name="exploding_tool", arguments="{}")
+        )
+
+        assert result.success is False
+        assert result.content == "Tool 'exploding_tool' failed."
+        terminal = [
+            event
+            for event in bus.history
+            if event.event_type == EventType.TOOL_CALL_END
+        ]
+        assert len(terminal) == 1
+        assert terminal[0].data["result"] == "Tool 'exploding_tool' failed."
+        assert "PRIVATE_TOOL_EXCEPTION_CANARY" not in terminal[0].data["result"]
+
     def test_default_timeout_used(self):
         """When ToolSpec has no timeout, the executor default is used."""
 

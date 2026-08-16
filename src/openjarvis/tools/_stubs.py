@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import logging
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -16,6 +17,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.types import ToolCall, ToolResult
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # ToolSpec — metadata describing a tool's interface
@@ -258,9 +261,15 @@ class ToolExecutor:
                 success=False,
             )
         except Exception as exc:
+            logger.error(
+                "Tool %s raised during execution: %s",
+                tool_call.name,
+                exc,
+                exc_info=True,
+            )
             result = ToolResult(
                 tool_name=tool_call.name,
-                content=f"Tool execution error: {exc}",
+                content=f"Tool '{tool_call.name}' failed.",
                 success=False,
             )
         latency = time.time() - t0
@@ -280,7 +289,11 @@ class ToolExecutor:
 
         # Emit end event
         if self._bus:
-            result_text = str(result.content)[:10240] if result.content else ""
+            result_text = (
+                str(result.content)[:10240]
+                if result.success and result.content
+                else f"Tool '{tool_call.name}' failed."
+            )
             # Pass through ToolResult.metadata so downstream consumers
             # (TraceCollector → TraceStep.metadata → SkillOptimizer) can
             # see skill-tagged invocations.  Filter to JSON-serializable

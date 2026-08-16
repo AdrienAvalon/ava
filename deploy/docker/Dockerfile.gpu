@@ -46,6 +46,7 @@ RUN pip install --no-cache-dir uv && \
     uv pip install --system --no-deps "maturin>=1.12.6,<2"
 
 COPY src/ src/
+COPY ava_extensions/ ava_extensions/
 COPY rust/ rust/
 COPY scripts/install scripts/install
 COPY deploy/windows deploy/windows

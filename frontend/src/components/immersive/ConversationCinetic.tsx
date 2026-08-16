@@ -44,7 +44,7 @@ export function ConversationCinetic() {
             fontFamily: "'JetBrains Mono', 'Space Mono', 'Courier New', monospace",
           }}
         >
-          <span style={{ color: '#2a5a7a', fontWeight: 600 }}>⌈ ADRIEN ⌉&nbsp;&nbsp;</span>
+          <span style={{ color: '#2a5a7a', fontWeight: 600 }}>⌈ VOUS ⌉&nbsp;&nbsp;</span>
           {userMsg}
         </div>
       )}

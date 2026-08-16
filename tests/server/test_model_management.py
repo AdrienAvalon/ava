@@ -150,8 +150,8 @@ class TestModelDelete:
 class TestStreamingResilience:
     """Verify streaming handles errors gracefully."""
 
-    def test_stream_error_returns_error_chunk(self):
-        """When the engine raises during streaming, error is sent as content."""
+    def test_stream_error_returns_generic_terminal_error(self):
+        """Backend errors must never be relabelled stop or leak details."""
         engine = _make_engine()
 
         async def failing_stream(messages, *, model, **kw):
@@ -172,11 +172,34 @@ class TestStreamingResilience:
         )
         assert resp.status_code == 200
 
-        # Should contain partial content + error message + [DONE]
         text = resp.text
         assert "partial" in text
-        assert "model not found" in text
+        assert "Chat generation failed" in text
+        assert "model not found" not in text
+        assert '"finish_reason":"stop"' not in text
         assert "[DONE]" in text
+
+    def test_empty_stream_is_an_explicit_terminal_error(self):
+        engine = _make_engine()
+
+        async def empty_stream(messages, *, model, **kw):
+            if False:
+                yield "unreachable"
+
+        engine.stream = empty_stream
+        response = TestClient(create_app(engine, "test-model")).post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+            },
+        )
+
+        assert response.status_code == 200
+        assert "empty_or_incomplete_response" in response.text
+        assert '"finish_reason":"stop"' not in response.text
+        assert "data: [DONE]" in response.text
 
     def test_stream_tokens_arrive(self):
         """Verify tokens stream through correctly (not batched)."""

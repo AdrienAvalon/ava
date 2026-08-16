@@ -1,26 +1,28 @@
 """Outil `evolutions` — ce qui a changé CHEZ ELLE, et quand.
 
 ⚠ POURQUOI CET OUTIL EXISTE. Constat de l'admin, le 2026-08-06 : « j'ai l'impression
-  qu'elle ne sait pas trop à chaque fois ce qui a changé ». Il a raison, et le défaut est
-  structurel : son code est modifié plusieurs fois par jour — mémoire, outils, garde-fous,
-  identité Matrix — et **rien ne le lui dit**. Elle décrit donc ses propres capacités
-  d'après sa persona, c'est-à-dire d'après un texte figé au jour de sa rédaction.
+  qu'elle ne sait pas trop à chaque fois ce qui a changé ». Il a raison, et le défaut
+  est structurel : son code est modifié plusieurs fois par jour — mémoire, outils,
+  garde-fous, identité Matrix — et **rien ne le lui dit**. Elle décrit donc ses propres
+  capacités d'après sa persona, c'est-à-dire d'après un texte figé au jour de sa
+  rédaction.
 
   Le symptôme se voit à l'œil : elle récitait encore « je n'ai aucune initiative » alors
   que sa veille documentaire tournait depuis des heures. Une IA qui se décrit à partir
   d'un souvenir périmé se trompe sur elle-même **avec assurance** — et refuse des tâches
   qu'elle sait faire.
 
-⚠ LA SOURCE EST LE JOURNAL GIT, PAS UN FICHIER RECOPIÉ. C'est le point de conception.
-  Un CHANGELOG écrit à la main dériverait dès la première session pressée, et il dérive
-  toujours dans le sens qui trompe : on oublie d'y retirer ce qui a été défait. Le journal
-  git ne peut pas mentir sur ce qui a été fait, parce qu'il EST ce qui a été fait.
+⚠ LA SOURCE EST LE JOURNAL GIT, PAS UN FICHIER RECOPIÉ. C'est le point de conception. Un
+  CHANGELOG écrit à la main dériverait dès la première session pressée, et il dérive
+  toujours dans le sens qui trompe : on oublie d'y retirer ce qui a été défait. Le
+  journal git ne peut pas mentir sur ce qui a été fait, parce qu'il EST ce qui a été
+  fait.
 
 ⚠ AUCUNE CHAÎNE DU MODÈLE N'ATTEINT LA LIGNE DE COMMANDE. Le nombre est un entier borné,
-  la fenêtre est un `enum`, le répertoire est fixe. Le modèle ne compose pas de commande :
-  il choisit parmi des questions nommées. Même doctrine que `journal` et `logs`, et pour
-  la même raison — une requête plausible et ruineuse est acceptée sans broncher par les
-  outils qui acceptent un langage.
+  la fenêtre est un `enum`, le répertoire est fixe. Le modèle ne compose pas de commande
+  : il choisit parmi des questions nommées. Même doctrine que `journal` et `logs`, et
+  pour la même raison — une requête plausible et ruineuse est acceptée sans broncher par
+  les outils qui acceptent un langage.
 
 ⚠ LECTURE SEULE, ET SUR SON PROPRE DÉPÔT UNIQUEMENT. `git log` ne modifie rien, ne sort
   pas sur le réseau, et le chemin est dérivé de l'emplacement de ce module — il ne peut
@@ -32,10 +34,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import stat
 import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -45,19 +49,27 @@ from openjarvis.tools._stubs import BaseTool, ToolSpec
 
 logger = logging.getLogger(__name__)
 
-#: Racine de son propre dépôt, dérivée de l'emplacement de ce fichier. Jamais un paramètre.
+#: Racine de son propre dépôt, dérivée de l'emplacement de ce fichier. Jamais un
+#: paramètre.
 RACINE = Path(__file__).resolve().parents[2]
+HISTORIQUE_RELEASE = Path(
+    os.environ.get(
+        "AVA_RELEASE_HISTORY_FILE",
+        str(RACINE / ".ava-artifacts" / "evolutions-v1.json"),
+    )
+)
+_MAX_HISTORIQUE_RELEASE_BYTES = 2 * 1024 * 1024
 
-#: ⚠ LA MOITIÉ DE CE QUI CHANGE CHEZ ELLE N'EST PAS DANS SON DÉPÔT. Ses outils côté control
-#: plane, le relais de conversation, sa veille et sa liste blanche d'outils vivent dans
-#: `infra_avalon`. Angle mort trouvé EN LUI PARLANT le 2026-08-06 : interrogée sur ses
-#: propres échecs, elle a classé « inexpliqué » un refus dont la cause était un correctif
-#: livré une heure plus tôt dans l'AUTRE dépôt. Huit commits du jour lui étaient invisibles,
-#: et rien ne le lui disait — sa vue de sa propre évolution était juste sur ce qu'elle
-#: voyait, et amputée de moitié.
-#: ⚠ Elle n'a PAS ce dépôt sur sa machine, et il n'a rien à y faire. C'est le control plane,
-#: dual-homé et déjà porteur d'un jeton GitLab, qui le lit pour elle. Même doctrine que
-#: pour Home Assistant, la parole et les journaux.
+#: ⚠ LA MOITIÉ DE CE QUI CHANGE CHEZ ELLE N'EST PAS DANS SON DÉPÔT. Ses outils côté
+#: control plane, le relais de conversation, sa veille et sa liste blanche d'outils
+#: vivent dans `infra_avalon`. Angle mort trouvé EN LUI PARLANT le 2026-08-06 :
+#: interrogée sur ses propres échecs, elle a classé « inexpliqué » un refus dont la
+#: cause était un correctif livré une heure plus tôt dans l'AUTRE dépôt. Huit commits du
+#: jour lui étaient invisibles, et rien ne le lui disait — sa vue de sa propre évolution
+#: était juste sur ce qu'elle voyait, et amputée de moitié.
+#: ⚠ Elle n'a PAS ce dépôt sur sa machine, et il n'a rien à y faire. C'est le control
+#: plane, dual-homé et déjà porteur d'un jeton GitLab, qui le lit pour elle. Même
+#: doctrine que pour Home Assistant, la parole et les journaux.
 CP_BASE = os.environ.get("AVA_CP_BASE", "http://192.168.100.31:8100")
 CHEMIN_JETON = Path(
     os.environ.get(
@@ -77,8 +89,79 @@ _MAX = 20
 _DEFAUT = 8
 
 
+def _lignes_release(depuis: str, nombre: int) -> list[str] | None:
+    """Lit le journal immuable exporté avec une release sans métadonnées Git."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(HISTORIQUE_RELEASE, flags)
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or not 1 <= metadata.st_size <= _MAX_HISTORIQUE_RELEASE_BYTES
+            ):
+                return None
+            morceaux: list[bytes] = []
+            restant = metadata.st_size + 1
+            while restant:
+                morceau = os.read(descriptor, restant)
+                if not morceau:
+                    break
+                morceaux.append(morceau)
+                restant -= len(morceau)
+        finally:
+            os.close(descriptor)
+        brut = b"".join(morceaux)
+        if len(brut) != metadata.st_size:
+            return None
+        document = json.loads(brut)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"entries", "git_sha", "schema", "truncated"}
+        or document.get("schema") != 1
+        or not isinstance(document.get("git_sha"), str)
+        or len(document["git_sha"]) != 40
+        or not all(character in "0123456789abcdef" for character in document["git_sha"])
+        or not isinstance(document.get("truncated"), bool)
+        or not isinstance(document.get("entries"), list)
+    ):
+        return None
+
+    jours = {"7 days ago": 7, "30 days ago": 30, "": None}.get(depuis)
+    if depuis not in {"7 days ago", "30 days ago", ""}:
+        return None
+    seuil = date.today() - timedelta(days=jours) if jours is not None else None
+    lignes: list[str] = []
+    for entree in document["entries"]:
+        if not isinstance(entree, dict) or set(entree) != {"body", "date", "subject"}:
+            return None
+        jour, sujet, corps = entree["date"], entree["subject"], entree["body"]
+        if (
+            not isinstance(jour, str)
+            or not isinstance(sujet, str)
+            or not isinstance(corps, str)
+            or len(sujet) > 500
+            or len(corps) > 20_000
+        ):
+            return None
+        try:
+            date_entree = date.fromisoformat(jour)
+        except ValueError:
+            return None
+        if seuil is not None and date_entree < seuil:
+            continue
+        lignes.append(f"{jour}\x1f{sujet}\x1f{corps}\x1e")
+        if len(lignes) >= nombre * 4:
+            break
+    return lignes
+
+
 def _lignes_git(depuis: str, nombre: int) -> list[str] | None:
-    """Le journal brut, ou None si git est injoignable. Ne lève jamais."""
+    """Le journal brut Git, ou son export de release strict. Ne lève jamais."""
     commande = [
         "git",
         "-C",
@@ -96,10 +179,10 @@ def _lignes_git(depuis: str, nombre: int) -> list[str] | None:
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("evolutions: git injoignable (%s)", type(exc).__name__)
-        return None
+        return _lignes_release(depuis, nombre)
     if r.returncode != 0:
-        logger.warning("evolutions: git a refusé (%s)", r.stderr[:120])
-        return None
+        logger.info("evolutions: metadata Git absente, lecture de l'export de release")
+        return _lignes_release(depuis, nombre)
     return [bloc for bloc in r.stdout.split("\x1e") if bloc.strip()]
 
 
@@ -113,8 +196,8 @@ def _resumer(bloc: str) -> tuple[str, str, str] | None:
         return None
     corps = morceaux[2].strip() if len(morceaux) > 2 else ""
     # ⚠ On ne garde que la PREMIÈRE ligne utile du corps : les messages de ce dépôt font
-    #   souvent trente lignes. Tout rendre ferait un appel de plusieurs milliers de jetons
-    #   pour une question à laquelle une phrase répond.
+    #   souvent trente lignes. Tout rendre ferait un appel de plusieurs milliers de
+    #   jetons pour une question à laquelle une phrase répond.
     premiere = next(
         (
             ligne.strip()
@@ -135,10 +218,10 @@ def _cote_infra(fenetre: str, nombre: int) -> list[tuple[str, str, str]] | None:
 
     ⚠ Rend `None` si le control plane est muet — « je n'ai pas pu regarder » n'est pas
       « rien n'a changé », et c'est le rendu qui doit porter la différence.
-    ⚠ NE FAIT PAS ÉCHOUER L'OUTIL : si cette moitié manque, on rend quand même le journal
-      local en DISANT qu'il est partiel. Une vue amputée annoncée vaut mieux qu'aucune vue,
-      et infiniment mieux qu'une vue amputée SILENCIEUSE — c'est précisément le défaut que
-      cet ajout corrige.
+    ⚠ NE FAIT PAS ÉCHOUER L'OUTIL : si cette moitié manque, on rend quand même le
+      journal local en DISANT qu'il est partiel. Une vue amputée annoncée vaut mieux
+      qu'aucune vue, et infiniment mieux qu'une vue amputée SILENCIEUSE — c'est
+      précisément le défaut que cet ajout corrige.
     """
     try:
         jeton = CHEMIN_JETON.read_text(encoding="utf-8").strip()
@@ -172,10 +255,11 @@ class EvolutionsTool(BaseTool):
             name="evolutions",
             description=(
                 "Ce qui a récemment changé dans le code d'Ava elle-même : nouvelles "
-                "capacités, corrections, garde-fous. À utiliser quand on lui demande ce "
-                "qui a changé chez elle, ce qu'elle sait faire de nouveau, ou pourquoi "
-                "quelque chose se comporte différemment d'avant. À consulter aussi avant "
-                "d'affirmer une de ses propres limites : sa description d'elle-même est "
+                "capacités, corrections, garde-fous. À utiliser quand on lui demande "
+                "ce qui a changé chez elle, ce qu'elle sait faire de nouveau, ou "
+                "pourquoi quelque chose se comporte différemment d'avant. À consulter "
+                "aussi avant d'affirmer une de ses propres limites : sa description "
+                "d'elle-même est "
                 "figée au jour où elle a été écrite, ce journal ne l'est pas."
             ),
             parameters={
@@ -221,14 +305,16 @@ class EvolutionsTool(BaseTool):
 
         # ⚠ LA TROISIÈME AMPUTATION SILENCIEUSE, ET C'EST CE FICHIER QUI LA PORTAIT.
         #   Mesuré le 2026-08-07 par un agent d'évaluation : interrogée sur ce qui avait
-        #   changé le 5 août, Ava a répondu « un seul changement » là où il y en avait des
-        #   dizaines. Elle n'a pas mal lu — elle a rendu les `nombre` plus récents, sans
-        #   qu'un mot ne dise qu'il y en avait d'autres. Le paragraphe vingt lignes plus bas
-        #   déclare qu'« il serait absurde de reproduire ce défaut ici » à propos de l'axe
-        #   infrastructure : il était reproduit sur l'axe du NOMBRE, dans le même fichier.
-        #   ⚠ Le coût n'est pas cosmétique : « un seul changement le 5 août » est FAUX, alors
-        #   que « voici 8 changements sur au moins 69 » est vrai et utile. Une vue partielle
-        #   annoncée reste une réponse ; une vue partielle muette est une erreur.
+        #   changé le 5 août, Ava a répondu « un seul changement » là où il y en avait
+        #   des dizaines. Elle n'a pas mal lu — elle a rendu les `nombre` plus récents,
+        #   sans qu'un mot ne dise qu'il y en avait d'autres. Le paragraphe vingt lignes
+        #   plus bas déclare qu'« il serait absurde de reproduire ce défaut ici » à
+        #   propos de l'axe infrastructure : il était reproduit sur l'axe du NOMBRE,
+        #   dans le même fichier.
+        #   ⚠ Le coût n'est pas cosmétique : « un seul changement le 5 août » est FAUX,
+        #   alors que « voici 8 changements sur au moins 69 » est vrai et utile. Une vue
+        #   partielle annoncée reste une réponse ; une vue partielle muette est une
+        #   erreur.
         tous = [r for r in (_resumer(b) for b in blocs) if r]
         resumes = tous[:nombre]
         # ⚠ On ne peut PAS annoncer un total exact : `git log` a lui-même été borné à
@@ -271,23 +357,25 @@ class EvolutionsTool(BaseTool):
         ]
         lignes.sort(reverse=True)
 
-        # ⚠ ON DIT QUAND LA VUE EST PARTIELLE. Une vue amputée annoncée vaut mieux qu'aucune
-        #   vue, et infiniment mieux qu'une vue amputée SILENCIEUSE — c'est exactement le
-        #   défaut que cet ajout corrige, il serait absurde de le reproduire ici.
+        # ⚠ ON DIT QUAND LA VUE EST PARTIELLE. Une vue amputée annoncée vaut mieux
+        #   qu'aucune vue, et infiniment mieux qu'une vue amputée SILENCIEUSE — c'est
+        #   exactement le défaut que cet ajout corrige, il serait absurde de le
+        #   reproduire ici.
         avertissement = (
             ""
             if infra is not None
-            else "\n⚠ Je n'ai PAS pu lire les changements côté infrastructure : cette liste "
-            "est donc incomplète, et une absence n'y prouve rien.\n"
+            else "\n⚠ Je n'ai PAS pu lire les changements côté infrastructure : "
+            "cette liste est donc incomplète, et une absence n'y prouve rien.\n"
         )
         # ⚠ La troncature se DIT, avec le mot « au moins » : on ne connaît pas le total.
         reste = _coupes + _coupes_infra
         if reste or _borne_git:
-            combien = f"au moins {len(resumes) + len(infra or []) + reste}"
+            affiches = len(resumes) + len(infra or [])
+            combien = f"au moins {affiches + reste}"
             avertissement += (
-                f"\n⚠ Je n'affiche que les {len(resumes) + len(infra or [])} plus récents "
-                f"sur {combien} sur la période. Ce n'est PAS la liste complète : pour en "
-                f"voir davantage, redemande avec un `nombre` plus grand ou une fenêtre plus "
+                f"\n⚠ Je n'affiche que les {affiches} plus récents sur {combien} sur "
+                "la période. Ce n'est PAS la liste complète : pour en voir davantage, "
+                "redemande avec un `nombre` plus grand ou une fenêtre plus "
                 f"courte. Ne conclus pas d'ici qu'il n'y a eu que ça.\n"
             )
         return ToolResult(
@@ -295,8 +383,9 @@ class EvolutionsTool(BaseTool):
             content=(
                 "<mes_evolutions>\n"
                 "Changements me concernant, du plus récent au plus ancien. [moi] = mon "
-                "propre code ; [infrastructure] = mes outils côté control plane, ma liste "
-                "d'outils, le relais de conversation. Si l'un d'eux contredit ce que je "
+                "propre code ; [infrastructure] = mes outils côté control plane, ma "
+                "liste d'outils, le relais de conversation. Si l'un d'eux contredit "
+                "ce que je "
                 "crois savoir de moi, c'est lui qui a raison.\n"
                 + avertissement
                 + "\n".join(lignes)

@@ -117,7 +117,10 @@ def test_filter_by_source(store: KnowledgeStore) -> None:
 
 
 def test_registered() -> None:
-    from openjarvis.tools.knowledge_sql import KnowledgeSQLTool
+    import importlib
 
-    ToolRegistry.register_value("knowledge_sql", KnowledgeSQLTool)
-    assert ToolRegistry.contains("knowledge_sql")
+    module = importlib.import_module("openjarvis.tools.knowledge_sql")
+    if not ToolRegistry.contains("knowledge_sql"):
+        module = importlib.reload(module)
+
+    assert ToolRegistry.get("knowledge_sql") is module.KnowledgeSQLTool

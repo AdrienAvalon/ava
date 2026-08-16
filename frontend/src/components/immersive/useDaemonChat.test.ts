@@ -18,8 +18,17 @@
  *   usage réel.
  */
 
-import { describe, expect, it } from 'vitest';
-import { extractNewSentences } from './useDaemonChat';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  completerTourDurable,
+  createHydrationGate,
+  demanderChatDurable,
+  extractNewSentences,
+  TURN_ID_HEADER,
+  type Message,
+} from './useDaemonChat';
+
+afterEach(() => vi.restoreAllMocks());
 
 /** Le reliquat tel que le calculait le code AVANT correction. */
 function resteAvant(assembled: string): string {
@@ -54,8 +63,8 @@ describe('extractNewSentences — le décalage de fin', () => {
       'Et toi',
     ],
     [
-      "réponse réelle d'Ava sur l'état de la maison",
-      'Il fait 26,7 degrés dehors.\n\nAdrien est présent, Aurélie absente.\n\nLa baie serveur tire 738 watts',
+      "exemple synthétique d'Ava sur l'état de la maison",
+      'Il fait 26,7 degrés dehors.\n\nUne personne est présente, une autre absente.\n\nLa baie serveur tire 738 watts',
       'La baie serveur tire 738 watts',
     ],
   ])('ne fait PAS répéter un fragment — %s', (_nom, texte, attendu) => {
@@ -99,4 +108,171 @@ describe('extractNewSentences — le décalage de fin', () => {
     expect(b.sentences).toEqual(['Deuxième phrase.']);
     expect(complet.slice(b.newEnd).trim()).toBe('Reste');
   });
+});
+
+describe('createHydrationGate — ordre historique puis envoi', () => {
+  it('bloque le premier envoi jusqu’à une résolution explicite', async () => {
+    const gate = createHydrationGate();
+    let released = false;
+    const waiting = gate.wait().then(() => { released = true; });
+
+    await Promise.resolve();
+    expect(released).toBe(false);
+    gate.complete();
+    await waiting;
+    expect(released).toBe(true);
+  });
+
+  it('tolère plusieurs chemins de fin sans relancer la barrière', async () => {
+    const gate = createHydrationGate();
+    gate.complete();
+    gate.complete();
+    await expect(gate.wait()).resolves.toBeUndefined();
+  });
+});
+
+function chatResponse(status: number, content = '', retryAfter?: string): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: new Headers(retryAfter ? { 'Retry-After': retryAfter } : {}),
+    json: async () => ({
+      choices: [{ message: { role: 'assistant', content } }],
+    }),
+  } as Response;
+}
+
+describe('demanderChatDurable — retry HTTP idempotent', () => {
+  const turnId = '4d593ddf-cf92-4d85-9d5d-68a961f5827b';
+  const messages: Message[] = [{ role: 'user', content: 'question synthétique' }];
+  const waitImpl = async () => undefined;
+
+  it('réutilise le même UUID et le même corps si la première réponse réseau est perdue', async () => {
+    const fetchImpl = vi.fn()
+      .mockRejectedValueOnce(new TypeError('connexion perdue'))
+      .mockResolvedValueOnce(chatResponse(200, 'réponse rejouée'));
+
+    await expect(demanderChatDurable({
+      messages,
+      turnId,
+      signal: new AbortController().signal,
+      fetchImpl,
+      retryDelaysMs: [0],
+      waitImpl,
+    })).resolves.toBe('réponse rejouée');
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    const first = fetchImpl.mock.calls[0][1] as RequestInit;
+    const second = fetchImpl.mock.calls[1][1] as RequestInit;
+    expect(first.headers).toMatchObject({ [TURN_ID_HEADER]: turnId });
+    expect(second.headers).toMatchObject({ [TURN_ID_HEADER]: turnId });
+    expect(second.body).toBe(first.body);
+  });
+
+  it('réessaie un 503 transitoire', async () => {
+    const transient = vi.fn()
+      .mockResolvedValueOnce(chatResponse(503))
+      .mockResolvedValueOnce(chatResponse(200, 'ok'));
+    await expect(demanderChatDurable({
+      messages,
+      turnId,
+      signal: new AbortController().signal,
+      fetchImpl: transient,
+      retryDelaysMs: [0],
+      waitImpl,
+    })).resolves.toBe('ok');
+    expect(transient).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([401, 409, 422])('ne réessaie pas le refus HTTP %i', async (status) => {
+    const denied = vi.fn().mockResolvedValue(chatResponse(status));
+    await expect(demanderChatDurable({
+      messages,
+      turnId,
+      signal: new AbortController().signal,
+      fetchImpl: denied,
+      retryDelaysMs: [0, 0],
+      waitImpl,
+    })).rejects.toThrow(`HTTP ${status}`);
+    expect(denied).toHaveBeenCalledTimes(1);
+  });
+
+  it('réessaie un 425 avec le même tour jusqu’au replay durable', async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(chatResponse(425, '', '5'))
+      .mockResolvedValueOnce(chatResponse(200, 'réponse persistée'));
+    const wait = vi.fn().mockResolvedValue(undefined);
+
+    await expect(demanderChatDurable({
+      messages,
+      turnId,
+      signal: new AbortController().signal,
+      fetchImpl,
+      retryDelaysMs: [0],
+      waitImpl: wait,
+    })).resolves.toBe('réponse persistée');
+
+    expect(wait).toHaveBeenCalledWith(5_000, expect.any(AbortSignal));
+    const first = fetchImpl.mock.calls[0][1] as RequestInit;
+    const second = fetchImpl.mock.calls[1][1] as RequestInit;
+    expect(first.headers).toMatchObject({ [TURN_ID_HEADER]: turnId });
+    expect(second.headers).toMatchObject({ [TURN_ID_HEADER]: turnId });
+    expect(second.body).toBe(first.body);
+  });
+
+  it('ne transforme pas une réponse 200 vide en tour validé', async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(chatResponse(200, ''))
+      .mockResolvedValueOnce(chatResponse(200, 'réponse complète'));
+
+    await expect(demanderChatDurable({
+      messages,
+      turnId,
+      signal: new AbortController().signal,
+      fetchImpl,
+      retryDelaysMs: [0],
+      waitImpl,
+    })).resolves.toBe('réponse complète');
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('completerTourDurable — contexte modèle transactionnel', () => {
+  it('ajoute question et réponse ensemble après accusé durable', async () => {
+    const history: Message[] = [{ role: 'assistant', content: 'avant' }];
+
+    await expect(completerTourDurable(
+      history,
+      'question',
+      async (candidate) => {
+        expect(candidate).toEqual([
+          { role: 'assistant', content: 'avant' },
+          { role: 'user', content: 'question' },
+        ]);
+        return 'réponse';
+      },
+    )).resolves.toBe('réponse');
+    expect(history).toEqual([
+      { role: 'assistant', content: 'avant' },
+      { role: 'user', content: 'question' },
+      { role: 'assistant', content: 'réponse' },
+    ]);
+  });
+
+  it.each(['échec HTTP', 'abandon utilisateur'])(
+    'ne laisse aucune question orpheline après %s',
+    async (raison) => {
+      const history: Message[] = [{ role: 'assistant', content: 'avant' }];
+      const erreur = raison === 'abandon utilisateur'
+        ? new DOMException('Aborted', 'AbortError')
+        : new Error('HTTP 503');
+
+      await expect(completerTourDurable(
+        history,
+        'question non validée',
+        async () => { throw erreur; },
+      )).rejects.toThrow();
+      expect(history).toEqual([{ role: 'assistant', content: 'avant' }]);
+    },
+  );
 });

@@ -91,12 +91,14 @@ server = [
     "fastapi>=0.110",
     "uvicorn>=0.30",
     "pydantic>=2.0",
+    "PyJWT[crypto]>=2.13,<3",
     "python-multipart>=0.0.9",
 ]
 desktop = [
     "fastapi>=0.110",
     "uvicorn>=0.30",
     "pydantic>=2.0",
+    "PyJWT[crypto]>=2.13,<3",
     "python-multipart>=0.0.9",
     "faster-whisper>=1.0",
 ]
@@ -198,7 +200,8 @@ fallback_version = "0.0.0+unknown"
 openjarvis-rust = { path = "rust/crates/openjarvis-python" }
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/openjarvis"]
+packages = ["src/openjarvis", "ava_extensions"]
+exclude = ["ava_extensions/tests"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "src/openjarvis/agents/claude_code_runner" = "_node_modules/claude_code_runner"

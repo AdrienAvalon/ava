@@ -9,10 +9,13 @@ No email, no name, no hardware fingerprint — just an opaque UUID.
 
 from __future__ import annotations
 
+import os
 import uuid
 from pathlib import Path
 
 from openjarvis.core.config import AnalyticsConfig
+
+_OPT_OUT_ENV_VARS = ("DO_NOT_TRACK", "OPENJARVIS_NO_ANALYTICS")
 
 
 def get_or_create_anon_id(path: Path | str) -> str:
@@ -44,6 +47,19 @@ def reset_anon_id(path: Path | str) -> str:
     return get_or_create_anon_id(p)
 
 
+def _env_opt_out() -> bool:
+    """Return whether an explicit process-level analytics opt-out is active."""
+
+    for name in _OPT_OUT_ENV_VARS:
+        raw = os.environ.get(name)
+        if raw and raw.strip().lower() not in ("", "0", "false", "no", "off"):
+            return True
+    return False
+
+
 def is_analytics_enabled(cfg: AnalyticsConfig) -> bool:
-    """Return True if analytics is enabled in config."""
+    """Return True only when the operator explicitly allows analytics."""
+
+    if _env_opt_out():
+        return False
     return cfg.enabled

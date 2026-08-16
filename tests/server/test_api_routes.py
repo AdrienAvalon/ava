@@ -1,12 +1,22 @@
 """Tests for extended API routes."""
 
+from types import SimpleNamespace
+
 import pytest
 
 fastapi = pytest.importorskip("fastapi")
+from ava_extensions.server.principal import Principal  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from openjarvis.core.types import Trace  # noqa: E402
 from openjarvis.server.api_routes import include_all_routes  # noqa: E402
+from openjarvis.traces.store import TraceStore  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _legacy_memory_http_explicitly_enabled(monkeypatch):
+    monkeypatch.setenv("OPENJARVIS_ENABLE_LEGACY_MEMORY_HTTP", "1")
 
 
 def _make_app():
@@ -54,6 +64,60 @@ class TestMemoryRoutes:
         resp = client.get("/v1/memory/stats")
         assert resp.status_code in self._BACKEND_OPTIONAL
 
+    def test_default_without_opt_in_is_quarantined(self, monkeypatch):
+        monkeypatch.delenv("OPENJARVIS_ENABLE_LEGACY_MEMORY_HTTP", raising=False)
+        client = TestClient(_make_app())
+        assert client.post("/v1/memory/search", json={"query": "x"}).status_code == 410
+        assert client.post("/v1/memory/store", json={"content": "x"}).status_code == 410
+
+    def test_memory_facts_remains_quarantined_even_with_opt_in(
+        self, monkeypatch, tmp_path
+    ):
+        facts = tmp_path / "memory_facts.jsonl"
+        facts.write_text('{"fact":"canary"}\n')
+        monkeypatch.setenv("OPENJARVIS_WORKSPACE", str(tmp_path))
+        response = TestClient(_make_app()).post(
+            "/v1/memory/index",
+            json={"path": str(facts)},
+        )
+        assert response.status_code == 403
+
+    def test_memory_facts_hard_link_remains_quarantined(self, monkeypatch, tmp_path):
+        facts = tmp_path / "memory_facts.jsonl"
+        facts.write_text('{"fact":"canary"}\n')
+        alias = tmp_path / "innocent-note.txt"
+        alias.hardlink_to(facts)
+        monkeypatch.setenv("OPENJARVIS_WORKSPACE", str(tmp_path))
+        app = _make_app()
+        app.state.config = SimpleNamespace(
+            memory=SimpleNamespace(facts_path=str(facts))
+        )
+
+        response = TestClient(app).post(
+            "/v1/memory/index",
+            json={"path": str(alias)},
+        )
+
+        assert response.status_code == 403
+
+    def test_configured_fact_store_path_remains_quarantined(
+        self, monkeypatch, tmp_path
+    ):
+        facts = tmp_path / "facts-live.jsonl"
+        facts.write_text('{"fact":"canary"}\n')
+        monkeypatch.setenv("OPENJARVIS_WORKSPACE", str(tmp_path))
+        app = _make_app()
+        app.state.config = SimpleNamespace(
+            memory=SimpleNamespace(facts_path=str(facts))
+        )
+
+        response = TestClient(app).post(
+            "/v1/memory/index",
+            json={"path": str(tmp_path)},
+        )
+
+        assert response.status_code == 403
+
 
 class TestMemoryRustMissing:
     """Regression for #502: when the native ``openjarvis_rust`` extension is
@@ -83,6 +147,7 @@ class TestMemoryRustMissing:
 
     def test_index_surfaces_actionable_detail(self, monkeypatch, tmp_path):
         (tmp_path / "note.txt").write_text("hello world some content here")
+        monkeypatch.setenv("OPENJARVIS_WORKSPACE", str(tmp_path))
         client = self._client(monkeypatch)
         resp = client.post("/v1/memory/index", json={"path": str(tmp_path)})
         assert resp.status_code == 503
@@ -136,14 +201,118 @@ class TestSkillRoutes:
 
 
 class TestSessionRoutes:
-    def test_list_sessions(self):
+    def test_legacy_session_routes_are_quarantined(self):
         client = TestClient(_make_app())
-        resp = client.get("/v1/sessions")
-        assert resp.status_code == 200
+        assert client.get("/v1/sessions").status_code == 410
+        assert client.get("/v1/sessions/example").status_code == 410
 
 
 class TestTraceRoutes:
-    def test_list_traces(self):
-        client = TestClient(_make_app())
-        resp = client.get("/v1/traces")
-        assert resp.status_code == 200
+    OWNER = Principal(provider="oidc", issuer="https://issuer.invalid", subject="owner")
+    GUEST = Principal(provider="oidc", issuer="https://issuer.invalid", subject="guest")
+
+    @staticmethod
+    def _client(monkeypatch, tmp_path):
+        from ava_extensions.server import principal as principal_module
+
+        owner = TestTraceRoutes.OWNER
+        guest = TestTraceRoutes.GUEST
+
+        def _resolve(headers):
+            return {"owner": owner, "guest": guest}.get(headers.get("X-Test-Principal"))
+
+        monkeypatch.setattr(principal_module, "resolve_request_principal", _resolve)
+        app = _make_app()
+        app.state.trace_store = TraceStore(tmp_path / "traces.db")
+        app.state.trace_store.save(
+            Trace(
+                trace_id="trace-owner",
+                query="OWNER_PRIVATE_QUERY",
+                result="OWNER_PRIVATE_REPLY",
+                feedback=1.0,
+                metadata={"provenance": owner.provenance},
+            )
+        )
+        app.state.trace_store.save(
+            Trace(
+                trace_id="trace-guest",
+                query="GUEST_PRIVATE_QUERY",
+                result="GUEST_PRIVATE_REPLY",
+                feedback=0.0,
+                metadata={"provenance": guest.provenance},
+            )
+        )
+        app.state.trace_store.save(
+            Trace(
+                trace_id="trace-legacy",
+                query="UNATTRIBUTED_PRIVATE_QUERY",
+                result="UNATTRIBUTED_PRIVATE_REPLY",
+            )
+        )
+        return TestClient(app), app.state.trace_store
+
+    def test_trace_routes_require_a_verified_principal(self, monkeypatch, tmp_path):
+        client, store = self._client(monkeypatch, tmp_path)
+
+        assert client.get("/v1/traces").status_code == 401
+        assert client.get("/v1/traces/trace-owner").status_code == 401
+        assert (
+            client.post(
+                "/v1/feedback",
+                json={"trace_id": "trace-owner", "score": 0.5},
+            ).status_code
+            == 401
+        )
+        store.close()
+
+    def test_list_and_stats_are_scoped_to_principal(self, monkeypatch, tmp_path):
+        client, store = self._client(monkeypatch, tmp_path)
+        headers = {"X-Test-Principal": "owner"}
+
+        response = client.get("/v1/traces", headers=headers)
+        stats = client.get("/v1/feedback/stats", headers=headers)
+
+        assert response.status_code == 200
+        assert [trace["id"] for trace in response.json()["traces"]] == ["trace-owner"]
+        assert stats.status_code == 200
+        assert stats.json()["total"] == 1
+        assert stats.json()["mean_score"] == 1.0
+        assert stats.json()["traces_totales"] == 1
+        store.close()
+
+    def test_detail_and_feedback_hide_other_principals(self, monkeypatch, tmp_path):
+        client, store = self._client(monkeypatch, tmp_path)
+        owner_headers = {"X-Test-Principal": "owner"}
+        guest_headers = {"X-Test-Principal": "guest"}
+
+        assert (
+            client.get("/v1/traces/trace-owner", headers=owner_headers).status_code
+            == 200
+        )
+        assert (
+            client.get("/v1/traces/trace-owner", headers=guest_headers).status_code
+            == 404
+        )
+        assert (
+            client.get("/v1/traces/trace-legacy", headers=owner_headers).status_code
+            == 404
+        )
+        assert (
+            client.post(
+                "/v1/feedback",
+                headers=guest_headers,
+                json={"trace_id": "trace-owner", "score": 0.25},
+            ).status_code
+            == 404
+        )
+        assert store.get("trace-owner").feedback == 1.0
+        assert (
+            client.post(
+                "/v1/feedback",
+                headers=owner_headers,
+                json={"trace_id": "trace-owner", "score": 0.25},
+            ).status_code
+            == 200
+        )
+        assert store.get("trace-owner").feedback == 0.25
+        store.close()

@@ -13,12 +13,11 @@ from typing import Any, Dict, List, Optional
 from openjarvis.core.types import StepType, Trace, TraceStep
 from openjarvis.traces.store import TraceStore
 
-
-#: Issues qui comptent comme ABOUTIES. `completed` est un FAIT (la tache est allee au bout
-#: sans echec d'outil ni troncature) ; `success` reste un jugement de QUALITE, qu'un humain
-#: seul peut porter via le retour explicite. Les compter ensemble corrige le taux de 5,9 %
-#: que publiait l'API quand SEULS les echecs etaient notes -- un chiffre catastrophique
-#: fabrique par l'absence de mesure, pas par la realite.
+#: Issues qui comptent comme ABOUTIES. `completed` est un FAIT (la tache est allee au
+#: bout sans echec d'outil ni troncature) ; `success` reste un jugement de QUALITE,
+#: qu'un humain seul peut porter via le retour explicite. Les compter ensemble corrige
+#: le taux de 5,9 % que publiait l'API quand SEULS les echecs etaient notes -- un
+#: chiffre catastrophique fabrique par l'absence de mesure, pas par la realite.
 #: ⚠ `recovered` EN FAIT PARTIE (2026-08-06) : un outil qui echoue pendant un tour
 #: qui aboutit n'est pas un tour rate. Sur 210 traces, 19 des 21 `tool_failure`
 #: avaient livre une reponse — le taux tombait a 89 % contre 98,1 % de reel.
@@ -102,9 +101,15 @@ class TraceAnalyzer:
         *,
         since: Optional[float] = None,
         until: Optional[float] = None,
+        provenance: Optional[str] = None,
     ) -> TraceSummary:
         """Compute an overall summary of all traces in the time range."""
-        traces = self._store.list_traces(since=since, until=until, limit=10_000)
+        traces = self._store.list_traces(
+            since=since,
+            until=until,
+            provenance=provenance,
+            limit=10_000,
+        )
         if not traces:
             return TraceSummary()
 
@@ -215,9 +220,15 @@ class TraceAnalyzer:
         *,
         since: Optional[float] = None,
         until: Optional[float] = None,
+        provenance: Optional[str] = None,
     ) -> List[ToolStats]:
         """Compute stats grouped by tool name."""
-        traces = self._store.list_traces(since=since, until=until, limit=10_000)
+        traces = self._store.list_traces(
+            since=since,
+            until=until,
+            provenance=provenance,
+            limit=10_000,
+        )
         tools: Dict[str, Dict[str, Any]] = {}
         for t in traces:
             for s in t.steps:

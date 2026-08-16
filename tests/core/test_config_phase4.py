@@ -59,7 +59,9 @@ class TestLearningConfig:
             "[learning.metrics]\nlatency_weight = 0.5\n"
         )
         cfg = load_config(toml_file)
-        assert cfg.learning.enabled is True
+        # Le fork Ava applique sa politique fail-closed apres le parsing : une
+        # activation TOML ne doit jamais atteindre le runtime.
+        assert cfg.learning.enabled is False
         assert cfg.learning.routing.policy == "learned"
         assert cfg.learning.metrics.latency_weight == 0.5
 

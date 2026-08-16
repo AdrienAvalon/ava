@@ -177,6 +177,11 @@ def create_app(
     config:
         Optional JarvisConfig for other settings.
     """
+    if config is not None:
+        from ava_extensions.boot import normalize_config
+
+        config = normalize_config(config)
+
     # Optional Ava extension hook (prewarm Kokoro TTS at startup). Imported
     # before FastAPI() so it can be wired into the lifespan context manager.
     try:

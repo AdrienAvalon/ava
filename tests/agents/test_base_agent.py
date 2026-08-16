@@ -149,7 +149,8 @@ class TestBuildMessages:
         messages = agent._build_messages("hello")
         assert len(messages) == 2
         assert messages[0].role == Role.SYSTEM
-        assert "local" in messages[0].content.lower()
+        assert "ava" in messages[0].content.lower()
+        assert "assistante ia" in messages[0].content.lower()
         assert messages[1].role == Role.USER
         assert messages[1].content == "hello"
 

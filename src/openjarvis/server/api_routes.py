@@ -153,6 +153,24 @@ async def message_agent(agent_id: str, req: AgentMessageRequest, request: Reques
 memory_router = APIRouter(prefix="/v1/memory", tags=["memory"])
 
 
+def _require_legacy_memory_http_opt_in() -> None:
+    """Keep the shared, principal-less memory API closed in Ava by default."""
+
+    import os
+
+    enabled = os.environ.get("OPENJARVIS_ENABLE_LEGACY_MEMORY_HTTP", "").strip().lower()
+    if enabled not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        raise HTTPException(
+            status_code=410,
+            detail="Legacy shared memory HTTP API is disabled",
+        )
+
+
 def _get_memory_backend(request: Request):
     """Return the app-level memory backend, falling back to a fresh SQLiteMemory.
 
@@ -185,6 +203,7 @@ def _get_memory_backend(request: Request):
 @memory_router.post("/store")
 async def memory_store(req: MemoryStoreRequest, request: Request):
     """Store content in memory."""
+    _require_legacy_memory_http_opt_in()
     backend = _get_memory_backend(request)
     if backend is None:
         # Memory is intentionally disabled; report it honestly instead of a
@@ -200,6 +219,7 @@ async def memory_store(req: MemoryStoreRequest, request: Request):
 @memory_router.post("/search")
 async def memory_search(req: MemorySearchRequest, request: Request):
     """Search memory for relevant content."""
+    _require_legacy_memory_http_opt_in()
     backend = _get_memory_backend(request)
     if backend is None:
         return {"results": []}
@@ -221,6 +241,7 @@ async def memory_search(req: MemorySearchRequest, request: Request):
 @memory_router.get("/stats")
 async def memory_stats(request: Request):
     """Get memory backend statistics."""
+    _require_legacy_memory_http_opt_in()
     backend = _get_memory_backend(request)
     if backend is None:
         return {"entries": 0, "backend": "none", "status": "not_configured"}
@@ -242,6 +263,7 @@ async def memory_config(request: Request):
     missing, so the UI can show the real cause instead of a healthy-looking
     config that backs a silent no-op (#502).
     """
+    _require_legacy_memory_http_opt_in()
     try:
         config = getattr(request.app.state, "config", None)
         if config is None:
@@ -285,6 +307,7 @@ async def memory_config(request: Request):
 @memory_router.post("/index")
 async def memory_index(req: MemoryIndexRequest, request: Request):
     """Index files from a path into memory."""
+    _require_legacy_memory_http_opt_in()
     try:
         import os
         from pathlib import Path
@@ -292,30 +315,103 @@ async def memory_index(req: MemoryIndexRequest, request: Request):
         from openjarvis.security.file_policy import is_sensitive_file
         from openjarvis.tools.storage.ingest import ingest_path
 
-        target = Path(req.path).expanduser().resolve()
+        requested = Path(req.path).expanduser()
+        target = requested.resolve()
         if not target.exists():
             raise HTTPException(status_code=404, detail=f"Path not found: {req.path}")
 
-        # Sandbox: when workspace roots are configured via OPENJARVIS_WORKSPACE
-        # (os.pathsep-separated), only allow indexing inside them. This endpoint
-        # must not become an arbitrary-filesystem read primitive over the API.
+        # The indexing API is fail-closed without explicit workspace roots.
+        # It must never become an arbitrary-filesystem read primitive.
         workspace = os.environ.get("OPENJARVIS_WORKSPACE", "").strip()
-        if workspace:
-            roots = [
-                Path(d).expanduser().resolve()
-                for d in workspace.split(os.pathsep)
-                if d.strip()
-            ]
-            if not any(target == root or root in target.parents for root in roots):
+        if not workspace:
+            raise HTTPException(
+                status_code=403,
+                detail="No memory indexing workspace is configured",
+            )
+        roots = [
+            Path(d).expanduser().resolve()
+            for d in workspace.split(os.pathsep)
+            if d.strip()
+        ]
+        if not any(target == root or root in target.parents for root in roots):
+            raise HTTPException(
+                status_code=403,
+                detail="Path is outside the allowed workspace directories.",
+            )
+
+        fact_paths = {
+            (Path.home() / ".openjarvis" / "memory_facts.jsonl").resolve(),
+        }
+        app_config = getattr(request.app.state, "config", None)
+        configured_facts = getattr(
+            getattr(app_config, "memory", None),
+            "facts_path",
+            None,
+        )
+        if isinstance(configured_facts, str) and configured_facts.strip():
+            fact_paths.add(Path(configured_facts).expanduser().resolve())
+        env_facts = os.environ.get("AVA_FACTS_PATH", "").strip()
+        if env_facts:
+            fact_paths.add(Path(env_facts).expanduser().resolve())
+
+        def _is_quarantined_fact(candidate: Path) -> bool:
+            if candidate.name == "memory_facts.jsonl":
+                return True
+            resolved = candidate.resolve(strict=False)
+            if resolved in fact_paths:
+                return True
+            if not candidate.exists():
+                return False
+            for facts_path in fact_paths:
+                try:
+                    if facts_path.exists() and os.path.samefile(candidate, facts_path):
+                        return True
+                except OSError:
+                    continue
+            return False
+
+        if (
+            requested.is_symlink()
+            or _is_quarantined_fact(requested)
+            or _is_quarantined_fact(target)
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Legacy shared Ava facts are quarantined",
+            )
+
+        # Validate every descendant before handing the directory to the generic
+        # ingester.  Name-only checks are insufficient: a harmless-looking
+        # symlink can otherwise escape the workspace and expose the quarantined
+        # JSONL (or any sensitive file) when ``ingest_path`` follows it.
+        candidates = [target]
+        if target.is_dir():
+            for directory, directories, filenames in os.walk(target, followlinks=False):
+                base = Path(directory)
+                candidates.extend(base / name for name in directories)
+                candidates.extend(base / name for name in filenames)
+        for candidate in candidates:
+            if candidate.is_symlink():
                 raise HTTPException(
                     status_code=403,
-                    detail="Path is outside the allowed workspace directories.",
+                    detail="Symbolic links are not allowed in memory indexing",
                 )
-        # Never ingest sensitive files (.env, private keys, credentials, ...).
-        if target.is_file() and is_sensitive_file(target):
-            raise HTTPException(
-                status_code=403, detail="Refusing to index a sensitive file."
-            )
+            resolved = candidate.resolve(strict=True)
+            if not any(resolved == root or root in resolved.parents for root in roots):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Indexed content escapes the allowed workspace",
+                )
+            if _is_quarantined_fact(candidate) or _is_quarantined_fact(resolved):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Legacy shared Ava facts are quarantined",
+                )
+            if resolved.is_file() and is_sensitive_file(resolved):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Refusing to index a sensitive file.",
+                )
 
         backend = _get_memory_backend(request)
         if backend is None:
@@ -351,6 +447,27 @@ async def memory_index(req: MemoryIndexRequest, request: Request):
 traces_router = APIRouter(prefix="/v1/traces", tags=["traces"])
 
 
+def _require_trace_principal(request: Request):
+    """Return the verified principal that owns a trace-facing request.
+
+    The daemon API key authenticates an application, not the person whose
+    conversation a trace contains.  Trace content and feedback therefore need
+    the same cryptographic principal boundary as durable conversations.
+    """
+
+    from ava_extensions.server.principal import resolve_request_principal
+
+    principal = resolve_request_principal(request.headers)
+    if principal is None:
+        raise HTTPException(status_code=401, detail="Ava identity required")
+    return principal
+
+
+def _trace_owned_by(trace: Any, provenance: str) -> bool:
+    metadata = getattr(trace, "metadata", None)
+    return isinstance(metadata, dict) and metadata.get("provenance") == provenance
+
+
 def _serialise_trace(trace) -> dict:
     """Convert a Trace dataclass to a frontend-friendly dict."""
     import datetime
@@ -375,12 +492,16 @@ def _serialise_trace(trace) -> dict:
 
 @traces_router.get("")
 async def list_traces(request: Request, limit: int = 20):
-    """List recent traces."""
+    """List recent traces belonging to the verified request principal."""
+    principal = _require_trace_principal(request)
     try:
         store = getattr(request.app.state, "trace_store", None)
         if store is None:
             return {"traces": []}
-        traces = store.list_traces(limit=limit)
+        traces = store.list_traces(
+            provenance=principal.provenance,
+            limit=max(1, min(limit, 100)),
+        )
         items = [_serialise_trace(t) for t in traces]
         return {"traces": items}
     except Exception as exc:
@@ -389,13 +510,14 @@ async def list_traces(request: Request, limit: int = 20):
 
 @traces_router.get("/{trace_id}")
 async def get_trace(trace_id: str, request: Request):
-    """Get a specific trace by ID."""
+    """Get a specific trace only when it belongs to the request principal."""
+    principal = _require_trace_principal(request)
     try:
         store = getattr(request.app.state, "trace_store", None)
         if store is None:
             raise HTTPException(status_code=404, detail="Trace not found")
         trace = store.get(trace_id)
-        if trace is None:
+        if trace is None or not _trace_owned_by(trace, principal.provenance):
             raise HTTPException(status_code=404, detail="Trace not found")
         return _serialise_trace(trace)
     except HTTPException:
@@ -523,33 +645,30 @@ sessions_router = APIRouter(prefix="/v1/sessions", tags=["sessions"])
 
 @sessions_router.get("")
 async def list_sessions(request: Request, limit: int = 20):
-    """List active sessions."""
-    try:
-        from openjarvis.sessions.store import SessionStore
+    """The unscoped legacy session API is quarantined.
 
-        store = SessionStore()
-        sessions = store.recent(limit=limit)
-        items = [s.to_dict() if hasattr(s, "to_dict") else str(s) for s in sessions]
-        return {"sessions": items}
-    except Exception as exc:
-        return {"sessions": [], "error": str(exc)}
+    It referenced a non-existent store module and returned a misleading empty
+    success.  Wiring it to either real store would expose cross-channel history
+    without a verified-principal ownership model.  Ava's durable conversation
+    route is the supported, principal-scoped replacement.
+    """
+
+    del request, limit
+    raise HTTPException(
+        status_code=410,
+        detail="Legacy session API is quarantined; use Ava conversation history",
+    )
 
 
 @sessions_router.get("/{session_id}")
 async def get_session(session_id: str, request: Request):
-    """Get a specific session."""
-    try:
-        from openjarvis.sessions.store import SessionStore
+    """Reject direct reads from the unscoped legacy session store."""
 
-        store = SessionStore()
-        session = store.get(session_id)
-        if session is None:
-            raise HTTPException(status_code=404, detail="Session not found")
-        return session.to_dict() if hasattr(session, "to_dict") else {"id": session_id}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    del session_id, request
+    raise HTTPException(
+        status_code=410,
+        detail="Legacy session API is quarantined; use Ava conversation history",
+    )
 
 
 # ---- Budget routes ----
@@ -637,6 +756,7 @@ def _record_ws_trace(
     model: str,
     started_at: float,
     ended_at: float,
+    provenance: str | None,
 ) -> None:
     """Record a trace for a completed WebSocket chat (best-effort)."""
     if trace_store is None or not result:
@@ -650,7 +770,56 @@ def _record_ws_trace(
         model=model,
         started_at=started_at,
         ended_at=ended_at,
+        provenance=provenance,
     )
+
+
+class _WebSocketIdentityRejectedError(RuntimeError):
+    """A supplied Ava credential did not establish exactly one principal."""
+
+
+async def _websocket_trust_context(websocket: WebSocket):
+    """Resolve the same identity, relationship and persona boundary as HTTP chat."""
+
+    from openjarvis.server.routes import (
+        _base_identity_prompt,
+        _identity_header_present,
+        _relationship_context,
+    )
+
+    relationship_context = await asyncio.to_thread(
+        _relationship_context,
+        websocket.headers,
+    )
+    if len(relationship_context) == 2:
+        principal, relationship_overlay = relationship_context
+    else:
+        principal, relationship_overlay, _protect_legacy_memory = relationship_context
+    if principal is None and _identity_header_present(websocket.headers):
+        raise _WebSocketIdentityRejectedError
+    base_identity_prompt = await asyncio.to_thread(
+        _base_identity_prompt,
+        getattr(websocket.app.state, "config", None),
+    )
+    return principal, relationship_overlay, base_identity_prompt
+
+
+async def _close_untrusted_websocket(websocket: WebSocket, exc: Exception) -> None:
+    """Reject a handshake without exposing verifier or policy diagnostics."""
+
+    from ava_extensions.identity.relationship import RelationshipPolicyError
+
+    if isinstance(exc, _WebSocketIdentityRejectedError):
+        code = 1008
+        reason = "Ava identity rejected"
+    elif isinstance(exc, RelationshipPolicyError):
+        code = 1011
+        reason = "Ava relationship policy unavailable"
+    else:
+        code = 1011
+        reason = "Ava identity unavailable"
+    logger.warning("WebSocket chat rejected before model (%s)", type(exc).__name__)
+    await websocket.close(code=code, reason=reason)
 
 
 @websocket_router.websocket("/v1/chat/stream")
@@ -674,6 +843,12 @@ async def websocket_chat_stream(websocket: WebSocket):
         # 1008 = policy violation; reject before accepting the connection.
         await websocket.close(code=1008)
         return
+    try:
+        # Reject static credential/policy failures before accepting the channel.
+        await _websocket_trust_context(websocket)
+    except Exception as exc:  # noqa: BLE001 - all trust failures are fail-closed
+        await _close_untrusted_websocket(websocket, exc)
+        return
     await websocket.accept()
     try:
         while True:
@@ -687,11 +862,30 @@ async def websocket_chat_stream(websocket: WebSocket):
                 continue
 
             message = data.get("message")
-            if not message:
+            if not isinstance(message, str) or not message.strip():
                 await websocket.send_json(
                     {"type": "error", "detail": "Missing 'message' field"},
                 )
                 continue
+
+            try:
+                # Re-read the policy for every turn so revocation also closes an
+                # already established WebSocket before another model call.
+                (
+                    principal,
+                    relationship_overlay,
+                    base_identity_prompt,
+                ) = await _websocket_trust_context(websocket)
+            except Exception as exc:  # noqa: BLE001 - generic client response
+                logger.warning(
+                    "WebSocket chat trust context became unavailable (%s)",
+                    type(exc).__name__,
+                )
+                await websocket.send_json(
+                    {"type": "error", "detail": "Ava identity unavailable"},
+                )
+                await websocket.close(code=1011)
+                return
 
             model = data.get("model") or getattr(
                 websocket.app.state,
@@ -701,11 +895,18 @@ async def websocket_chat_stream(websocket: WebSocket):
             engine = getattr(websocket.app.state, "engine", None)
             if engine is None:
                 await websocket.send_json(
-                    {"type": "error", "detail": "No engine configured"},
+                    {"type": "error", "detail": "Chat unavailable"},
                 )
                 continue
 
-            messages = [{"role": "user", "content": message}]
+            from openjarvis.core.types import Message, Role
+            from openjarvis.server.routes import _ensure_identity_prompt
+
+            messages = _ensure_identity_prompt(
+                [Message(role=Role.USER, content=message)],
+                base_identity_prompt,
+                relationship_overlay,
+            )
 
             # This WS path streams straight from the engine (no agent /
             # TraceCollector), so record the interaction directly once it
@@ -768,6 +969,9 @@ async def websocket_chat_stream(websocket: WebSocket):
                         model=model,
                         started_at=_ws_started_at,
                         ended_at=_time.time(),
+                        provenance=(
+                            principal.provenance if principal is not None else None
+                        ),
                     )
                 else:
                     # No stream method — single-shot generate. Blocking upstream
@@ -796,12 +1000,19 @@ async def websocket_chat_stream(websocket: WebSocket):
                         model=model,
                         started_at=_ws_started_at,
                         ended_at=_time.time(),
+                        provenance=(
+                            principal.provenance if principal is not None else None
+                        ),
                     )
             except WebSocketDisconnect:
                 raise
             except Exception as exc:
+                logger.warning(
+                    "WebSocket chat generation failed (%s)",
+                    type(exc).__name__,
+                )
                 await websocket.send_json(
-                    {"type": "error", "detail": str(exc)},
+                    {"type": "error", "detail": "Chat generation failed"},
                 )
     except WebSocketDisconnect:
         pass  # Client disconnected — nothing to clean up
@@ -955,18 +1166,17 @@ feedback_router = APIRouter(prefix="/v1/feedback", tags=["feedback"])
 
 @feedback_router.post("")
 async def submit_feedback(req: FeedbackScoreRequest, request: Request):
-    """Submit feedback for a trace."""
+    """Submit feedback only for a trace owned by the verified principal."""
+    principal = _require_trace_principal(request)
     try:
-        from openjarvis.core.config import DEFAULT_CONFIG_DIR
-        from openjarvis.traces.store import TraceStore
-
-        db_path = DEFAULT_CONFIG_DIR / "traces.db"
-        if not db_path.exists():
+        store = getattr(request.app.state, "trace_store", None)
+        if store is None:
             raise HTTPException(status_code=404, detail="No trace database")
-
-        store = TraceStore(db_path)
+        trace = store.get(req.trace_id)
+        if trace is None or not _trace_owned_by(trace, principal.provenance):
+            # Do not reveal whether another principal owns the identifier.
+            raise HTTPException(status_code=404, detail="Trace not found")
         updated = store.update_feedback(req.trace_id, req.score)
-        store.close()
 
         if not updated:
             raise HTTPException(
@@ -983,38 +1193,39 @@ async def submit_feedback(req: FeedbackScoreRequest, request: Request):
 async def feedback_stats(request: Request):
     """Statistiques REELLES des retours, et taux de reussite par outil.
 
-    ⚠ CETTE ROUTE RENVOYAIT `{"total": 0, "mean_score": 0.0}` EN DUR, quoi qu'il y ait en
-      base. Une API qui repond « aucun retour » alors qu'il y en a est pire qu'une API
-      absente : on en conclut que le mecanisme ne sert a rien, et on cesse de l'alimenter.
+    ⚠ CETTE ROUTE RENVOYAIT `{"total": 0, "mean_score": 0.0}` EN DUR, quoi
+      qu'il y ait en base. Une API qui repond « aucun retour » alors qu'il y
+      en a est pire qu'une API absente : on en conclut que le mecanisme ne
+      sert a rien, et on cesse de l'alimenter.
       Defaut trouve le 2026-08-05 en cherchant pourquoi la boucle d'apprentissage
       n'apprenait rien — reponse : elle n'avait jamais tourne (0 note, 0 outcome sur 65
       traces), et ce point de mesure ne pouvait pas le montrer.
-    ⚠ Elle expose aussi `per_tool`, que `TraceAnalyzer` calculait DEJA sans qu'aucune route
-      ne le rende lisible. C'est ce chiffre-la qui dit ou porter l'effort d'entrainement.
+    ⚠ Elle expose aussi `per_tool`, que `TraceAnalyzer` calculait DEJA sans
+      qu'aucune route ne le rende lisible. C'est ce chiffre-la qui dit ou
+      porter l'effort d'entrainement.
     """
+    principal = _require_trace_principal(request)
     try:
-        from openjarvis.core.config import DEFAULT_CONFIG_DIR
         from openjarvis.traces.analyzer import TraceAnalyzer
-        from openjarvis.traces.store import TraceStore
 
-        db_path = DEFAULT_CONFIG_DIR / "traces.db"
-        if not db_path.exists():
-            # ⚠ On DIT qu'on ne sait pas plutot que de rendre des zeros : « pas de base »
+        store = getattr(request.app.state, "trace_store", None)
+        if store is None:
+            # ⚠ On DIT qu'on ne sait pas plutot que de rendre des zeros :
+            #   « pas de base »
             #   et « aucun retour » ne sont pas la meme chose.
             raise HTTPException(status_code=404, detail="No trace database")
 
-        store = TraceStore(db_path)
-        try:
-            notes = [
-                t.feedback
-                for t in store.list_traces(limit=10000)
-                if getattr(t, "feedback", None) is not None
-            ]
-            analyseur = TraceAnalyzer(store)
-            resume = analyseur.summary()
-            par_outil = analyseur.per_tool_stats()
-        finally:
-            store.close()
+        notes = [
+            t.feedback
+            for t in store.list_traces(
+                provenance=principal.provenance,
+                limit=10000,
+            )
+            if getattr(t, "feedback", None) is not None
+        ]
+        analyseur = TraceAnalyzer(store)
+        resume = analyseur.summary(provenance=principal.provenance)
+        par_outil = analyseur.per_tool_stats(provenance=principal.provenance)
 
         return {
             "total": len(notes),

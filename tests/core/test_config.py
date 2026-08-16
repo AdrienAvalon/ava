@@ -346,7 +346,10 @@ class TestNestedLearningConfig:
             "[learning.metrics]\nlatency_weight = 0.5\n"
         )
         cfg = load_config(toml_file)
-        assert cfg.learning.enabled is True
+        # Ava neutralise les optimiseurs upstream au chargement, meme lorsqu'un
+        # fichier TOML tente de les activer. Les autres champs imbriques doivent
+        # toutefois continuer d'etre parses normalement.
+        assert cfg.learning.enabled is False
         assert cfg.learning.update_interval == 50
         assert cfg.learning.routing.policy == "learned"
         assert cfg.learning.metrics.latency_weight == 0.5

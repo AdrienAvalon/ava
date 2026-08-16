@@ -7,6 +7,33 @@ from unittest.mock import patch
 from openjarvis.core.registry import TTSRegistry
 from openjarvis.speech.tts import TTSResult
 
+
+def test_lazy_registration_isolates_a_broken_optional_backend() -> None:
+    from openjarvis import speech
+
+    calls: list[str] = []
+
+    def import_module(name: str, package: str):
+        calls.append(name)
+        if name == ".faster_whisper":
+            raise OSError("native library unavailable")
+        return object()
+
+    with patch.object(speech.importlib, "import_module", side_effect=import_module):
+        speech.register_builtin_backends()
+
+    assert calls == [f".{name}" for name in speech._BACKEND_MODULES.values()]
+
+
+def test_lazy_registration_imports_only_the_requested_backend() -> None:
+    from openjarvis import speech
+
+    with patch.object(speech.importlib, "import_module") as importer:
+        speech.register_builtin_backends("openai_tts")
+
+    importer.assert_called_once_with(".openai_tts", speech.__name__)
+
+
 # ---------------------------------------------------------------------------
 # TTSResult tests
 # ---------------------------------------------------------------------------
@@ -39,7 +66,8 @@ def test_tts_result_save(tmp_path):
 def test_cartesia_registered():
     from openjarvis.speech.cartesia_tts import CartesiaTTSBackend
 
-    TTSRegistry.register_value("cartesia", CartesiaTTSBackend)
+    if not TTSRegistry.contains("cartesia"):
+        TTSRegistry.register_value("cartesia", CartesiaTTSBackend)
     assert TTSRegistry.contains("cartesia")
 
 
@@ -67,7 +95,8 @@ def test_cartesia_synthesize():
 def test_kokoro_registered():
     from openjarvis.speech.kokoro_tts import KokoroTTSBackend
 
-    TTSRegistry.register_value("kokoro", KokoroTTSBackend)
+    if not TTSRegistry.contains("kokoro"):
+        TTSRegistry.register_value("kokoro", KokoroTTSBackend)
     assert TTSRegistry.contains("kokoro")
 
 
@@ -75,8 +104,10 @@ def test_kokoro_health_false_without_package():
     from openjarvis.speech.kokoro_tts import KokoroTTSBackend
 
     backend = KokoroTTSBackend()
-    # Without kokoro installed, health returns False
-    assert backend.health() is False
+    # Simulate the missing optional dependency: Ava installs Kokoro, so relying on
+    # the developer environment made this test both non-deterministic and expensive.
+    with patch.dict("sys.modules", {"kokoro": None}):
+        assert backend.health() is False
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +118,8 @@ def test_kokoro_health_false_without_package():
 def test_openai_tts_registered():
     from openjarvis.speech.openai_tts import OpenAITTSBackend
 
-    TTSRegistry.register_value("openai_tts", OpenAITTSBackend)
+    if not TTSRegistry.contains("openai_tts"):
+        TTSRegistry.register_value("openai_tts", OpenAITTSBackend)
     assert TTSRegistry.contains("openai_tts")
 
 

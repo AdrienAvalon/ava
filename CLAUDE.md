@@ -13,9 +13,11 @@
 **Identité Ava** :
 - **Personnalité féminine** — ton complice, direct, attachant, pas servile
 - **Voix de femme française** naturelle (priorité absolue sur la qualité vocale)
-- **Usage unique** : pas de multi-profil, c'est **ton** assistante
+- **Persona commune + identité vérifiée** : chaque historique est cloisonné par principal ;
+  un overlay relationnel privé, opt-in et révocable peut être lié par politique GitOps
 - **Autonomie croissante** : skills vocales → skills agentiques → capacités proactives (suggestions, rappels, routines)
-- **Mémoire longue durée** via OpenJarvis memory system + enrichissements Ava
+- **Mémoire** : le magasin OpenJarvis partagé reste legacy et en retrait ; le ledger
+  gouverné demeure en shadow jusqu'à preuve de restauration et d'ancrage externe
 
 **Langue** : français principal, anglais passif (comprend, peut lire de la doc technique EN mais répond FR sauf demande explicite).
 
@@ -25,12 +27,14 @@
 
 > **Claude Code : mets cette section à jour à la fin de chaque session.**
 
-- **Dernier commit** : _(à remplir après M0)_
+- **Dernier état relu** : 2026-08-16 (avant commits d'intégration)
 - **Branche active** : `ava-main`
-- **Jalon en cours** : M0 — Setup initial (plan à rédiger)
-- **Prochaine étape** : création VM `avalon-ai-ava-01`, fork OpenJarvis (GitHub privé + mirror GitLab), structure `ava_extensions/`
-- **Questions en suspens pour le propriétaire** : — (décisions d'architecture actées 2026-04-16)
-- **Dernière session-note** : `docs/session-notes/2026-04-16-brainstorm-initial.md`
+- **Jalon en cours** : identité HTTP, conversations durables, overlay relationnel et
+  évaluations adversariales avant activation
+- **Prochaine étape** : suites globales, release immuable attestée, shadow avec le moteur
+  effectivement déployé, puis activation GitOps séparée si tous les gates passent
+- **Questions en suspens** : aucune décision produit bloquante ; l'activation reste
+  volontairement `enabled: false` jusqu'aux preuves E2E
 
 ### Décisions actées 2026-04-16
 
@@ -38,7 +42,9 @@
 - **VM Proxmox dédiée** : `avalon-ai-ava-01`, VMID 107, PVE-01, Debian 13, 8 vCPU / 16 Go RAM / 80 Go disque, IP DMZ `192.168.100.15`.
 - **Repos** : `origin = github.com/AdrienAvalon/ava` (privé), `mirror = gitlab.avalon-network.com/avalon/ava` (self-hosted, push auto).
 - **TTS validé POC 2026-04-16** : **Kokoro-82M** avec voix `ff_siwis` (Apache-2.0, CPU-only, souverain, 0 €/mois). Piper reste dispo comme fallback ultra-rapide (0.3s) si besoin. ElevenLabs rejeté (free tier bloque API voix). Cartesia rejeté au profit d'une solution open source qualité équivalente.
-- **Pas de cloisonnement profils** : single user, single persona. Simplicité > flexibilité.
+- **Décision historique remplacée** : la persona commune reste unique, mais les
+  conversations sont maintenant cloisonnées par principal vérifié et l'overlay privé ne
+  peut être sélectionné que par un binding serveur explicite.
 - **Python 3.12** (OpenJarvis supporte 3.10–3.13 via `pyproject.toml`).
 - **Extended thinking Claude** : patch dans `ava_extensions/patches/anthropic_thinking.py` (non présent upstream).
 - **Prompt caching** systématique (cache SystemPromptBuilder + tools) — économie ~80-90 % sur tours répétés.
@@ -64,7 +70,8 @@
 ### Stack
 
 - **Python ~90 %** du codebase (core, agents, skills, engines, speech)
-- **Rust** (optionnel) — crate `openjarvis-python` pour paths perf-critiques
+- **Rust** — crate `openjarvis-python` obligatoire en production ; la release exige une
+  wheel attestée au SHA et refuse de basculer si son import échoue
 - **TypeScript + React 19** — frontend Tauri 2, Shadcn UI, Zustand state, Vite
 
 ### Flow typique
@@ -197,42 +204,30 @@ Daemon HTTP sur `localhost:8000` par défaut. Tauri UI communique via IPC + WebS
 >
 > ### Recompiler après une modification du code Rust
 >
-> **En local** (chaîne Rust présente) :
-> ```bash
-> uv run maturin develop -m rust/crates/openjarvis-python/Cargo.toml --release
-> ```
+> Pour un test de développement local uniquement, `uv run maturin develop -m
+> rust/crates/openjarvis-python/Cargo.toml --release` reste possible. Cette extension
+> locale ne constitue jamais un artefact livrable à la VM.
 >
-> **Pour la VM — PAS depuis le laptop, et pas sur la VM non plus.** Deux obstacles,
-> chacun suffisant :
-> 1. **glibc** — le laptop est en 2.44 (Arch), la VM en 2.41 (Debian 13). Une wheel bâtie
->    ici exigerait des symboles absents là-bas. Aucune version de Python ne change ça.
-> 2. **Le durcissement interdit le compilateur sur la VM** : le rôle Ansible `hardening`
->    met `/usr/bin/{gcc,g++,cc,as}` en **0700 root** (Lynis HRDN-7222), et Rust a besoin
->    du linker. Y installer une chaîne reviendrait à défaire une mesure en place.
->
-> **La méthode retenue : compiler dans un conteneur Debian 13 sur AVA**, machine de build
-> légitime (elle sert déjà de runner CI), puis déployer la seule wheel. Aucun compilateur
-> n'atterrit sur la VM.
+> La release VM passe exclusivement par le builder versionné et épinglé :
 > ```bash
-> # sur AVA — cloner via l'endpoint GitLab INTERNE (le public est derrière CF Access)
-> docker run --rm -v /tmp/ava-rust-build:/work -w /work python:3.12-slim bash -c '
->   apt-get update -qq && apt-get install -y -qq build-essential curl
->   curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
->   export PATH=/work/.cargo/bin:$PATH CARGO_HOME=/work/.cargo RUSTUP_HOME=/work/.rustup
->   pip install -q maturin && cd /work/src
->   maturin build --release -m rust/crates/openjarvis-python/Cargo.toml -o /work/wheels'
-> # puis, SUR LA VM et dans cet ordre :
-> ~/.local/bin/uv sync --extra …          # d'abord
-> ~/.local/bin/uv pip install --no-deps <wheel>   # ensuite
+> # checkout Ava propre et commit exact à livrer
+> scripts/build-rust-attested.sh
+> # le script affiche les deux chemins content-addressed à transmettre au deployeur
+> AVA_RUST_WHEEL=/chemin/affiche/openjarvis_rust-...manylinux_2_36_x86_64.whl \
+> AVA_RUST_ATTESTATION=/chemin/affiche/openjarvis_rust-...whl.attestation \
+>   scripts/deploy-vm.sh
 > ```
-> ⚠️ **`python:3.12-slim` et non 3.13** : le venv de la VM est épinglé par le fichier
-> `.python-version` du dépôt (valeur `3.12`), alors que la VM a Python 3.13.5 en système.
-> Une wheel `cp313` n'y serait pas chargée. Vérifier `.python-version` avant de compiler.
-> ⚠️ **L'ORDRE `uv sync` PUIS `uv pip install` EST NON NÉGOCIABLE** : la wheel n'est pas
-> dans le lock, donc un `uv sync` postérieur la **retire** — vécu, l'environnement
-> paraissait bon une minute plus tôt.
-> ⚠️ La wheel produite est `manylinux_2_39` : compatible avec toute glibc ≥ 2.39, donc
-> avec la VM (2.41). C'est ce tag qu'il faut vérifier, pas la version de Debian.
+> `deploy/docker/Dockerfile.rust-builder` épingle Python 3.12.13, Rust 1.88.0 et
+> Maturin 1.14.1 par image/digest. Il exécute les tests Cargo verrouillés, produit une
+> wheel `cp312-cp312-manylinux_2_36_x86_64`, l'installe dans un venv isolé et en vérifie
+> l'import. Le workflow `ava-ci` publie le même couple wheel/manifeste pendant 14 jours.
+>
+> L'attestation `ava-rust-wheel-attestation-v1` est un **manifeste de checksums non
+> signé**, pas une preuve cryptographique d'auteur. Le deployeur recoupe néanmoins le
+> commit, le sous-arbre Rust, le Dockerfile, les images épinglées, la wheel et sa
+> compatibilité avant le premier SSH, puis recontrôle les octets sur la VM. Il installe
+> toujours les extras par `uv sync --frozen` avant la wheel, car un sync ultérieur la
+> retirerait. Aucun compilateur ni chaîne Rust n'est installé sur la VM durcie.
 
 ### Cerveau — Phase 1 (M0→M6)
 
@@ -340,7 +335,8 @@ ava/
 │   ├── README.md                      ← conventions techniques
 │   ├── identity/
 │   │   ├── system_prompts/
-│   │   │   └── ava.md                 ← persona Ava unique (plus de profils)
+│   │   │   └── ava.md                 ← persona commune, sans identité privée
+│   │   └── relationship_profiles/     ← overlays privés versionnés, sélection serveur
 │   │   └── voice_samples/             ← hors Git (.gitignore)
 │   ├── branding/
 │   │   ├── icons/
@@ -539,14 +535,18 @@ Zéro modification fichier upstream → récupération updates triviale.
 
 #### 6.3 Mémoire longue durée
 
-- [ ] Activer OpenJarvis memory backend (SQLite par défaut)
-- [ ] `ava_extensions/memory/soul.md` — valeurs, ton, préférences immuables Ava
-- [ ] `ava_extensions/memory/user_profile.md` — profil propriétaire (rôle, projets en cours, préférences apprises)
-- [ ] `ava_extensions/memory/facts/` — faits appris au fil des conversations (JSON lignes, auto-pruning 90 j)
+- [x] Mettre `memory_facts.jsonl` en quarantaine : aucune lecture, injection ou
+  écriture depuis les frontières HTTP, Matrix ou CLI conversationnelle
+- [x] Garder le ledger et la mémoire gouvernée en shadow, sans promotion
+  automatique ni apprentissage depuis les conversations ou les traces
+- [ ] Migrer les faits legacy avec attribution, scope et validation humaine ;
+  ne jamais réactiver le magasin partagé comme outil ou contexte modèle
+- [ ] Prouver sauvegarde logique, restauration, ancrage append-only externe et
+  cloisonnement des scopes avant toute lecture de mémoire gouvernée en runtime
 
 #### 6.4 Tests bout-en-bout
 
-- [ ] "Ava, rappelle-moi d'appeler Jean demain à 14h" → skill rappel → mémoire → notification
+- [ ] "Ava, rappelle-moi une tâche demain à 14h" → état `task:*` isolé avec TTL → notification, sans mémoire legacy
 - [ ] "Ava, comment va l'infra ?" → skill infra → CP v2 dashboard → synthèse vocale 2 phrases
 - [ ] "Ava, est-ce que j'ai des emails urgents ?" → skill Gmail → filtrage IA → liste courte vocale
 
@@ -708,22 +708,23 @@ ava_extensions/backends/piper_models/
 
 ---
 
-_Fichier vivant. Mis à jour à chaque session. Dernière révision : 2026-04-16 (suppression cloisonnement profils, synthèse OpenJarvis)._
+_Fichier vivant. Dernière révision : 2026-08-16 (identité vérifiée, conversations
+durables, overlay relationnel privé, évaluations et releases immuables)._
 
 ## ⚠ Telemetrie externe (PostHog) — COUPEE le 2026-08-04, et a re-verifier apres chaque synchro amont
 
-OpenJarvis **pousse par defaut** des evenements d'usage vers une instance PostHog tierce :
+OpenJarvis amont peut pousser des evenements d'usage vers une instance PostHog tierce :
 `https://34.231.106.201.sslip.io` — une IP AWS derriere un domaine *wildcard DNS* qui encode
 l'IP dans son propre nom. Ajoute en amont par la **PR #351 du 17 mai 2026**
-(`src/openjarvis/core/config.py`, `AnalyticsConfig.enabled = True`), entre dans ce fork par la
+(`src/openjarvis/core/config.py`, historiquement `AnalyticsConfig.enabled = True`), entre dans ce fork par la
 **synchronisation amont du 3 aout** (353 commits).
 
-**Coupe par `[analytics] enabled = false` dans `~/.openjarvis/config.toml`** (VM Ava).
-⚠ **C'est le SEUL opt-out** : il n'existe ni variable d'environnement, ni `DO_NOT_TRACK` —
-`is_analytics_enabled()` ne lit que cette cle. Et `config.toml` **vit hors git** : une
-reinstallation, une remise a zero de la config ou une prochaine synchro amont la rallumerait
-**en silence**. D'ou le controle dans `scripts/deploy-vm.sh` (etape 6), qui fait echouer le
-deploiement si la telemetrie est active.
+**Coupee par defaut dans le fork**, par `[analytics] enabled = false` dans
+`~/.openjarvis/config.toml` et par `OPENJARVIS_NO_ANALYTICS=1` dans l'unite et le `.env`
+GitOps. `DO_NOT_TRACK` et `OPENJARVIS_NO_ANALYTICS` sont aussi des kill switches runtime.
+Le controle dans `scripts/deploy-vm.sh` (validation avant bascule et sante finale) fait
+toujours echouer le deploiement si
+ces gardes ont derive.
 
 > ⚠ **CE N'EST PAS UNE REVUE DE CODE QUI L'A TROUVEE, C'EST UNE ALERTE DE SECURITE.**
 > L'egress DMZ **bloque** ces envois → chaque echec est retente en boucle → Zeek a compte

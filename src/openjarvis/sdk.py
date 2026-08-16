@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import openjarvis
-from openjarvis.core.config import JarvisConfig, load_config
+from openjarvis.core import config as _config_module
+from openjarvis.core.config import JarvisConfig
 from openjarvis.core.events import EventBus
 from openjarvis.core.types import Message, Role
 from openjarvis.engine._discovery import get_engine
@@ -30,10 +31,12 @@ class MemoryHandle:
         if self._backend is not None:
             return self._backend
 
-        import openjarvis.tools.storage  # noqa: F401
+        key = self._config.memory.default_backend
+        from openjarvis.tools.storage import register_optional_backends
+
+        register_optional_backends(key)
         from openjarvis.core.registry import MemoryRegistry
 
-        key = self._config.memory.default_backend
         if not MemoryRegistry.contains(key):
             # Register built-in backends
             try:
@@ -160,9 +163,13 @@ class Jarvis:
         if config is not None:
             self._config = config
         elif config_path is not None:
-            self._config = load_config(Path(config_path))
+            self._config = _config_module.load_config(Path(config_path))
         else:
-            self._config = load_config()
+            self._config = _config_module.load_config()
+
+        from ava_extensions.boot import normalize_config
+
+        self._config = normalize_config(self._config)
 
         self._engine_key = engine_key
         self._model_override = model

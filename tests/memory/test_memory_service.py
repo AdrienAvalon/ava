@@ -7,7 +7,7 @@ import time
 from types import SimpleNamespace
 
 from openjarvis.core.config import StorageConfig
-from openjarvis.core.events import EventBus
+from openjarvis.core.events import EventBus, EventType
 from openjarvis.memory.service import (
     MemoryService,
     build_memory_service,
@@ -102,6 +102,33 @@ def test_completed_exchange_event_unsubscribes_on_stop(tmp_path):
     publish_completed_exchange(bus, "I like jazz", "Noted.", source="test")
 
     assert extractor.calls == []
+
+
+def test_completed_relationship_exchange_is_not_extracted_into_legacy_store(tmp_path):
+    bus = EventBus(record_history=True)
+    extractor = FakeExtractor(["must not be stored"])
+    store = LocalFactStore(tmp_path / "facts.jsonl")
+    svc = MemoryService(store, extractor, event_bus=bus)
+    svc.start()
+    try:
+        assert publish_completed_exchange(
+            bus,
+            "private relationship turn",
+            "private reply",
+            source="test",
+            allow_legacy_memory=False,
+        )
+        time.sleep(0.05)
+        assert extractor.calls == []
+        assert svc.fact_count() == 0
+        events = [
+            event
+            for event in bus.history
+            if event.event_type == EventType.CHAT_EXCHANGE_COMPLETED
+        ]
+        assert events[-1].data["allow_legacy_memory"] is False
+    finally:
+        svc.stop()
 
 
 def test_submit_when_not_running_is_dropped(tmp_path):

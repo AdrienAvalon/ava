@@ -87,6 +87,7 @@ class Event:
     event_type: EventType
     timestamp: float
     data: Dict[str, Any] = field(default_factory=dict)
+    correlation_id: str = ""
 
 
 # Type alias for subscriber callbacks
@@ -134,12 +135,19 @@ class EventBus:
         self,
         event_type: EventType,
         data: Optional[Dict[str, Any]] = None,
+        *,
+        correlation_id: str = "",
     ) -> Event:
         """Create and dispatch an event to all subscribers.
 
         Returns the published ``Event`` instance.
         """
-        event = Event(event_type=event_type, timestamp=time.time(), data=data or {})
+        event = Event(
+            event_type=event_type,
+            timestamp=time.time(),
+            data=data or {},
+            correlation_id=correlation_id,
+        )
 
         with self._lock:
             if self._record_history:
@@ -150,6 +158,13 @@ class EventBus:
             callback(event)
 
         return event
+
+    def scoped(self, correlation_id: str) -> "ScopedEventBus":
+        """Return a request-local view that still forwards global telemetry."""
+
+        if not correlation_id:
+            raise ValueError("an event scope requires a correlation id")
+        return ScopedEventBus(self, correlation_id)
 
     # -- history ------------------------------------------------------------
 
@@ -163,6 +178,63 @@ class EventBus:
         """Discard all recorded events."""
         with self._lock:
             self._history.clear()
+
+
+class ScopedEventBus:
+    """Isolate request subscribers while forwarding events to a parent bus.
+
+    A server request owns its trace subscribers.  Publishing still reaches the
+    parent bus for aggregate telemetry, but callbacks registered through this
+    view see only events produced by this exact request.  This prevents two
+    concurrent principals from absorbing each other's model or tool events.
+    """
+
+    def __init__(self, parent: EventBus, correlation_id: str) -> None:
+        self._parent = parent
+        self._correlation_id = correlation_id
+        self._subscribers: Dict[EventType, List[Subscriber]] = {}
+        self._lock = threading.Lock()
+
+    def subscribe(self, event_type: EventType, callback: Subscriber) -> None:
+        with self._lock:
+            self._subscribers.setdefault(event_type, []).append(callback)
+
+    def unsubscribe(self, event_type: EventType, callback: Subscriber) -> None:
+        with self._lock:
+            listeners = self._subscribers.get(event_type, [])
+            try:
+                listeners.remove(callback)
+            except ValueError:
+                pass
+
+    def publish(
+        self,
+        event_type: EventType,
+        data: Optional[Dict[str, Any]] = None,
+    ) -> Event:
+        event = self._parent.publish(
+            event_type,
+            data,
+            correlation_id=self._correlation_id,
+        )
+        with self._lock:
+            listeners = list(self._subscribers.get(event_type, []))
+        for callback in listeners:
+            callback(event)
+        return event
+
+    @property
+    def history(self) -> List[Event]:
+        return [
+            event
+            for event in self._parent.history
+            if event.correlation_id == self._correlation_id
+        ]
+
+    def clear_history(self) -> None:
+        """A scoped view cannot erase unrelated global telemetry."""
+
+        raise RuntimeError("scoped event history cannot be cleared")
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +264,7 @@ def reset_event_bus() -> None:
 __all__ = [
     "Event",
     "EventBus",
+    "ScopedEventBus",
     "EventType",
     "Subscriber",
     "get_event_bus",

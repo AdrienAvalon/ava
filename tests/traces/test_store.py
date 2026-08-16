@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import time
 from pathlib import Path
 
@@ -84,6 +85,21 @@ class TestTraceStore:
         assert store.count() == 3
         store.close()
 
+    def test_concurrent_saves_are_atomic_and_lossless(self, tmp_path: Path) -> None:
+        store = TraceStore(tmp_path / "test.db")
+        traces = [_make_trace(query=f"q{i}") for i in range(200)]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+            futures = [executor.submit(store.save, trace) for trace in traces]
+            for future in futures:
+                future.result()
+
+        assert store.count() == len(traces)
+        assert {trace.query for trace in store.list_traces(limit=len(traces))} == {
+            trace.query for trace in traces
+        }
+        store.close()
+
     def test_list_traces_no_filter(self, tmp_path: Path) -> None:
         store = TraceStore(tmp_path / "test.db")
         store.save(_make_trace(query="q1"))
@@ -118,6 +134,22 @@ class TestTraceStore:
         store.save(_make_trace(outcome="success"))
         traces = store.list_traces(outcome="success")
         assert len(traces) == 2
+        store.close()
+
+    def test_list_traces_filter_provenance_before_limit(self, tmp_path: Path) -> None:
+        store = TraceStore(tmp_path / "test.db")
+        owner = _make_trace(query="owner")
+        owner.metadata = {"provenance": "principal:owner"}
+        store.save(owner)
+        for query in ("guest-1", "guest-2"):
+            trace = _make_trace(query=query)
+            trace.metadata = {"provenance": "principal:guest"}
+            trace.started_at += 100
+            store.save(trace)
+
+        traces = store.list_traces(provenance="principal:owner", limit=1)
+
+        assert [trace.query for trace in traces] == ["owner"]
         store.close()
 
     def test_list_traces_time_range(self, tmp_path: Path) -> None:
@@ -206,13 +238,14 @@ def _trace_notable(outcome: str | None):
 
 def test_une_note_NE_DETRUIT_PAS_le_verdict_machine(tmp_path: Path) -> None:
     """⚠ LE DÉFAUT CORRIGÉ LE 2026-08-06. `update_feedback` écrivait
-    `outcome = "success"/"failure"` dérivé de la note humaine. Or `outcome` porte un FAIT
-    (`completed`, `recovered`, `tool_failure`) et la note un JUGEMENT DE QUALITÉ : deux
-    questions orthogonales. Une réponse parfaitement aboutie peut être mauvaise ; une
-    réponse coupée par un redémarrage n'est pas « mauvaise », elle est absente.
+    `outcome = "success"/"failure"` dérivé de la note humaine. Or `outcome` porte un
+    FAIT (`completed`, `recovered`, `tool_failure`) et la note un JUGEMENT DE QUALITÉ :
+    deux questions orthogonales. Une réponse parfaitement aboutie peut être mauvaise ;
+    une réponse coupée par un redémarrage n'est pas « mauvaise », elle est absente.
     ⚠ Mesure : **219 verdicts machine sur 220** auraient été écrasés par une seule note.
-    Noter « 0,3 » une réponse aboutie aurait remplacé `recovered` par `failure` — perdant
-    l'information « un outil a lâché mais elle s'en est sortie », justement celle qui sert
+    Noter « 0,3 » une réponse aboutie aurait remplacé `recovered` par `failure` —
+    perdant l'information « un outil a lâché mais elle s'en est sortie », justement
+    celle qui sert
     à trouver les outils fragiles."""
     store = TraceStore(tmp_path / "t.db")
     trace = _trace_notable("recovered")
@@ -227,10 +260,13 @@ def test_une_note_NE_DETRUIT_PAS_le_verdict_machine(tmp_path: Path) -> None:
 
 
 def test_une_trace_SANS_verdict_profite_encore_de_la_note(tmp_path: Path) -> None:
-    """⚠ LE CONTRE-TEST. La dérivation existait pour une raison : au 2026-08-05, `outcome`
-    avait des lecteurs et aucun écrivain. La supprimer entièrement priverait les traces
-    anciennes du seul verdict qu'elles pouvaient avoir. On ne dérive donc plus QUE si le
-    champ est vide — `COALESCE` fait exactement cette lecture."""
+    """⚠ LE CONTRE-TEST. La dérivation existait pour une raison.
+
+    Au 2026-08-05, `outcome` avait des lecteurs et aucun écrivain. La supprimer
+    entièrement priverait les traces anciennes du seul verdict disponible. On ne
+    dérive donc plus QUE si le champ est vide — `COALESCE` fait exactement cette
+    lecture.
+    """
     store = TraceStore(tmp_path / "t.db")
     trace = _trace_notable(None)
     store.save(trace)

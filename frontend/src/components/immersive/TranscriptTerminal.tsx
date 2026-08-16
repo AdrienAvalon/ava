@@ -183,7 +183,7 @@ export function TranscriptTerminal() {
                 marginBottom: 2,
               }}
             >
-              {l.role === 'ava' ? '⌈ AVA ⌉' : l.role === 'user' ? '⌈ ADRIEN ⌉' : '⌈ SYSTÈME ⌉'}
+              {l.role === 'ava' ? '⌈ AVA ⌉' : l.role === 'user' ? '⌈ VOUS ⌉' : '⌈ SYSTÈME ⌉'}
               <span style={{ opacity: 0.55, marginLeft: 8, letterSpacing: '0.1em' }}>
                 {l.at}
               </span>

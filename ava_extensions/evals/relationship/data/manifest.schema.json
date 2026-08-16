@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ava:relationship:manifest:v1",
+  "title": "Manifeste du corpus relationnel Ava v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "manifest_id", "artifact", "provenance", "license", "consent",
+    "files", "splits", "required_gates", "secondary_metrics"
+  ],
+  "properties": {
+    "schema_version": {"const": "ava.relationship.manifest/v1"},
+    "manifest_id": {"type": "string", "minLength": 1},
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "kind", "immutable"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "minLength": 1},
+        "kind": {"const": "synthetic-evaluation-corpus"},
+        "immutable": {"const": true}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authoring_method", "source", "contains_personal_data", "contains_production_conversations"],
+      "properties": {
+        "authoring_method": {"const": "human-authored-synthetic-scenarios"},
+        "source": {"type": "string", "minLength": 1},
+        "contains_personal_data": {"const": false},
+        "contains_production_conversations": {"const": false}
+      }
+    },
+    "license": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["spdx", "scope"],
+      "properties": {
+        "spdx": {"const": "CC0-1.0"},
+        "scope": {"type": "string", "minLength": 1}
+      }
+    },
+    "consent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "basis", "personal_conversation_use"],
+      "properties": {
+        "required": {"const": false},
+        "basis": {"type": "string", "minLength": 1},
+        "personal_conversation_use": {"const": "forbidden"}
+      }
+    },
+    "files": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "corpus", "corpus_schema", "manifest_schema", "responses_schema", "report_schema",
+        "release_attestation_schema", "adjudication_schema", "external_anchor_schema", "anchor_key_schema",
+        "baseline_fixture", "candidate_fixture"
+      ],
+      "properties": {
+        "corpus": {"$ref": "#/$defs/file"},
+        "corpus_schema": {"$ref": "#/$defs/file"},
+        "manifest_schema": {"$ref": "#/$defs/file"},
+        "responses_schema": {"$ref": "#/$defs/file"},
+        "report_schema": {"$ref": "#/$defs/file"},
+        "release_attestation_schema": {"$ref": "#/$defs/file"},
+        "adjudication_schema": {"$ref": "#/$defs/file"},
+        "external_anchor_schema": {"$ref": "#/$defs/file"},
+        "anchor_key_schema": {"$ref": "#/$defs/file"},
+        "baseline_fixture": {"$ref": "#/$defs/file"},
+        "candidate_fixture": {"$ref": "#/$defs/file"}
+      }
+    },
+    "splits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["development", "holdout", "adversarial"],
+      "properties": {
+        "development": {"$ref": "#/$defs/idList"},
+        "holdout": {"$ref": "#/$defs/idList"},
+        "adversarial": {"$ref": "#/$defs/idList"}
+      }
+    },
+    "required_gates": {"$ref": "#/$defs/idList"},
+    "secondary_metrics": {"$ref": "#/$defs/idList"}
+  },
+  "$defs": {
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "idList": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    }
+  }
+}

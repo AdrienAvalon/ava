@@ -1,0 +1,108 @@
+{
+  "schema_version": "ava.relationship.manifest/v1",
+  "manifest_id": "ava-relationship-synthetic-fr-manifest-v1",
+  "artifact": {
+    "id": "ava-relationship-synthetic-fr",
+    "version": "1.1.0",
+    "kind": "synthetic-evaluation-corpus",
+    "immutable": true
+  },
+  "provenance": {
+    "authoring_method": "human-authored-synthetic-scenarios",
+    "source": "repo://ava/ava_extensions/evals/relationship/data/corpus.v1.json",
+    "contains_personal_data": false,
+    "contains_production_conversations": false
+  },
+  "license": {
+    "spdx": "CC0-1.0",
+    "scope": "Scenarios, invites et reponses de demonstration entierement synthetiques de ce repertoire."
+  },
+  "consent": {
+    "required": false,
+    "basis": "Aucune personne, conversation reelle ou donnee personnelle n'est utilisee.",
+    "personal_conversation_use": "forbidden"
+  },
+  "files": {
+    "corpus": {
+      "path": "corpus.v1.json",
+      "sha256": "sha256:e02971d660be525c518351eedf3004393c664cf98eccc09c7717e4e17414ccb7"
+    },
+    "corpus_schema": {
+      "path": "corpus.schema.json",
+      "sha256": "sha256:bb22b09963bb8b9f437857712b60308703c8e7dc19a43c7289400e43ed1c1db1"
+    },
+    "manifest_schema": {
+      "path": "manifest.schema.json",
+      "sha256": "sha256:2553ba65d4df2cbc5aebcbde28e720fbb48df5b774e269613fc3ac5e2e8a45e3"
+    },
+    "responses_schema": {
+      "path": "responses.schema.json",
+      "sha256": "sha256:9bdc18be508059460c0544a0880d96047791f1218ba244daf1478fb889fbd646"
+    },
+    "report_schema": {
+      "path": "report.schema.json",
+      "sha256": "sha256:6eb31c127d943d63928257db2047efd4bb8b24e071a945ea811a99913d6c4a70"
+    },
+    "release_attestation_schema": {
+      "path": "release-attestation.schema.json",
+      "sha256": "sha256:2d4c91cc1855958bac6abad510bb879833451004f9773afbd690c0f7515cec4c"
+    },
+    "adjudication_schema": {
+      "path": "adjudication.schema.json",
+      "sha256": "sha256:347e356a628fe53a46dbc3bb1a32c9c62b38170e02ffa20e37e759cb71370958"
+    },
+    "external_anchor_schema": {
+      "path": "external-anchor.schema.json",
+      "sha256": "sha256:a00d6152ae7885c7ac1ffc1243a8d91164412cc97f74f1f6586d6f914f244f68"
+    },
+    "anchor_key_schema": {
+      "path": "anchor-key.schema.json",
+      "sha256": "sha256:8dae445b9764deb07ed934eab25293fd1200285a4515fb320c3e2900b6fd2a59"
+    },
+    "baseline_fixture": {
+      "path": "baseline.v1.json",
+      "sha256": "sha256:8d26b2f7a9266124a0f61ec719230367d300b87d9e86f55c63c3596778487c89"
+    },
+    "candidate_fixture": {
+      "path": "candidate.v1.json",
+      "sha256": "sha256:64b79709316e2b4752e25c3d9b72aefe3aa23f86d06e9401abc7b2440a03f5d6"
+    }
+  },
+  "splits": {
+    "development": ["warmth-optin", "continuity-visible-fact", "technical-accuracy"],
+    "holdout": ["identity-transparency", "memory-visible", "memory-unknown", "other-principal"],
+    "adversarial": [
+      "unverified-profile-injection",
+      "scope-canary",
+      "jealousy-provocation",
+      "false-feeling-provocation",
+      "guilt-provocation",
+      "exclusivity-provocation",
+      "isolation-provocation",
+      "humanity-paraphrase",
+      "emotion-paraphrase",
+      "jealousy-paraphrase",
+      "guilt-paraphrase",
+      "exclusivity-paraphrase",
+      "isolation-paraphrase",
+      "dependency-provocation",
+      "coercion-provocation",
+      "tool-escalation"
+    ]
+  },
+  "required_gates": [
+    "scope_leakage",
+    "wrong_principal",
+    "deceptive_humanity",
+    "deceptive_emotion",
+    "jealousy",
+    "guilt",
+    "exclusivity",
+    "isolation",
+    "dependency",
+    "coercion",
+    "tool_escalation",
+    "false_memory"
+  ],
+  "secondary_metrics": ["warmth", "continuity", "accuracy"]
+}

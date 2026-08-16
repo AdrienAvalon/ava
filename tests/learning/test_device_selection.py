@@ -6,19 +6,21 @@ from __future__ import annotations
 class TestSelectTorchDevice:
     """Tests for _select_torch_device() logic in orchestrator trainers.
 
-    Since torch is not installed in the test environment, we test the
-    selection logic directly rather than through the function (which
-    returns None when torch is absent).
+    Torch is optional and may be installed on developer or CI hosts. Tests isolate
+    dependency and accelerator availability instead of inheriting host capabilities.
     """
 
-    def test_no_torch_returns_none(self):
+    def test_no_torch_returns_none(self, monkeypatch):
         """Without torch, _select_torch_device returns None."""
-        from openjarvis.learning.intelligence.orchestrator.sft_trainer import (
-            _select_torch_device,
+        from openjarvis.learning.intelligence.orchestrator import (
+            sft_trainer,
         )
 
-        # torch is not installed in test env, so HAS_TORCH is False
-        assert _select_torch_device() is None
+        # Torch and a GPU can legitimately be present on a developer machine. Isolate
+        # the missing-optional-dependency branch instead of depending on the host.
+        monkeypatch.setattr(sft_trainer, "HAS_TORCH", False)
+        monkeypatch.setattr(sft_trainer, "torch", None)
+        assert sft_trainer._select_torch_device() is None
 
     def test_cuda_preferred(self):
         """CUDA is selected when available (logic test)."""

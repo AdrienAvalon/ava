@@ -439,7 +439,9 @@ export function InputArea() {
                 lastFlush = now;
               }
             }
-            if (data.choices?.[0]?.finish_reason === 'stop') break;
+            // Do not break on the finish chunk: streamChat must still consume
+            // and validate the mandatory [DONE] sentinel. Otherwise a proxy
+            // cut immediately after `stop` is falsely persisted as success.
           } catch {}
         }
       }

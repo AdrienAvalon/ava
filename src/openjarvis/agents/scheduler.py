@@ -216,15 +216,14 @@ class AgentScheduler:
             current_retries = agent.get("stall_retries", 0)
 
             if current_retries >= max_retries:
-                self._manager.update_agent(agent["id"], status="error")
                 logger.warning(
-                    "Agent %s stall retries exhausted (%d/%d), setting error",
+                    "Agent %s remains locked after %d/%d stall alerts; "
+                    "manual reconciliation is required",
                     agent["id"],
                     current_retries,
                     max_retries,
                 )
             else:
-                self._manager.end_tick(agent["id"])  # Release concurrency guard
                 self._manager.update_agent(
                     agent["id"],
                     stall_retries=current_retries + 1,

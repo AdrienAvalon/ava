@@ -11,10 +11,12 @@ def test_budget_exceeded_sets_status(tmp_path):
     executor = AgentExecutor(mgr, bus)
 
     agent = mgr.create_agent("expensive", config={"max_cost": 1.0})
-    mgr.start_tick(agent["id"])
+    tick_token = mgr.start_tick(agent["id"])
 
     result = AgentResult(content="done", metadata={"cost": 1.50, "tokens_used": 100})
-    executor._finalize_tick(agent["id"], result, error=None, duration=1.0)
+    executor._finalize_tick(
+        agent["id"], result, error=None, duration=1.0, tick_token=tick_token
+    )
 
     updated = mgr.get_agent(agent["id"])
     assert updated["status"] == "budget_exceeded"
@@ -33,10 +35,12 @@ def test_budget_not_exceeded_stays_idle(tmp_path):
     executor = AgentExecutor(mgr, bus)
 
     agent = mgr.create_agent("cheap", config={"max_cost": 10.0})
-    mgr.start_tick(agent["id"])
+    tick_token = mgr.start_tick(agent["id"])
 
     result = AgentResult(content="done", metadata={"cost": 0.50, "tokens_used": 50})
-    executor._finalize_tick(agent["id"], result, error=None, duration=1.0)
+    executor._finalize_tick(
+        agent["id"], result, error=None, duration=1.0, tick_token=tick_token
+    )
 
     updated = mgr.get_agent(agent["id"])
     assert updated["status"] == "idle"
@@ -50,13 +54,15 @@ def test_budget_unlimited_skips_check(tmp_path):
     executor = AgentExecutor(mgr, bus)
 
     agent = mgr.create_agent("unlimited", config={"max_cost": 0})
-    mgr.start_tick(agent["id"])
+    tick_token = mgr.start_tick(agent["id"])
 
     result = AgentResult(
         content="done",
         metadata={"cost": 999.99, "tokens_used": 1000000},
     )
-    executor._finalize_tick(agent["id"], result, error=None, duration=1.0)
+    executor._finalize_tick(
+        agent["id"], result, error=None, duration=1.0, tick_token=tick_token
+    )
 
     updated = mgr.get_agent(agent["id"])
     assert updated["status"] == "idle"
@@ -64,17 +70,37 @@ def test_budget_unlimited_skips_check(tmp_path):
 
 
 def test_token_budget_exceeded(tmp_path):
-    """Agent exceeding max_tokens gets budget_exceeded."""
+    """Agent exceeding the separate cumulative token budget is stopped."""
     mgr = AgentManager(str(tmp_path / "test.db"))
     bus = EventBus()
     executor = AgentExecutor(mgr, bus)
 
-    agent = mgr.create_agent("token-heavy", config={"max_tokens": 1000})
-    mgr.start_tick(agent["id"])
+    agent = mgr.create_agent("token-heavy", config={"max_total_tokens": 1000})
+    tick_token = mgr.start_tick(agent["id"])
 
     result = AgentResult(content="done", metadata={"cost": 0.01, "tokens_used": 1500})
-    executor._finalize_tick(agent["id"], result, error=None, duration=1.0)
+    executor._finalize_tick(
+        agent["id"], result, error=None, duration=1.0, tick_token=tick_token
+    )
 
     updated = mgr.get_agent(agent["id"])
     assert updated["status"] == "budget_exceeded"
+    mgr.close()
+
+
+def test_per_call_token_limit_is_not_a_cumulative_budget(tmp_path):
+    """max_tokens bounds one generation; it must not stop later ticks."""
+    mgr = AgentManager(str(tmp_path / "test.db"))
+    bus = EventBus()
+    executor = AgentExecutor(mgr, bus)
+
+    agent = mgr.create_agent("per-call", config={"max_tokens": 1000})
+    tick_token = mgr.start_tick(agent["id"])
+    result = AgentResult(content="done", metadata={"tokens_used": 1500})
+
+    executor._finalize_tick(
+        agent["id"], result, error=None, duration=1.0, tick_token=tick_token
+    )
+
+    assert mgr.get_agent(agent["id"])["status"] == "idle"
     mgr.close()

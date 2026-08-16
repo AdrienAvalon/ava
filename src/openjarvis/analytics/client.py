@@ -37,10 +37,12 @@ class AnalyticsClient:
 
     def __init__(self, config: AnalyticsConfig, anon_id: str | None = None) -> None:
         self.config = config
-        self.anon_id = anon_id or get_or_create_anon_id(config.anon_id_path)
         self._lock = threading.Lock()
         self._posthog: Any = None
         self._enabled = is_analytics_enabled(config)
+        self.anon_id = anon_id or (
+            get_or_create_anon_id(config.anon_id_path) if self._enabled else ""
+        )
         if self._enabled:
             self._init_sdk()
 

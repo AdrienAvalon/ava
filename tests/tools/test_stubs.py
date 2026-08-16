@@ -146,7 +146,8 @@ class TestToolExecutor:
         call = ToolCall(id="1", name="error", arguments="{}")
         result = executor.execute(call)
         assert result.success is False
-        assert "boom" in result.content
+        assert result.content == "Tool 'error' failed."
+        assert "boom" not in result.content
 
     def test_available_tools(self):
         executor = ToolExecutor([_EchoTool(), _ErrorTool()])

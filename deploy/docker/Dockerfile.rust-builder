@@ -1,0 +1,81 @@
+# Builder de release pour l'extension native Ava.
+#
+# Les deux bases sont immuables et ciblent linux/amd64, l'architecture de la VM.
+# Debian bookworm fournit glibc 2.36 : la wheel PEP 600 produite est donc utilisable
+# sur Debian 13 (glibc 2.41) sans compiler sur la VM durcie.
+FROM python:3.12.13-slim-bookworm@sha256:76d4b7b6305788c6b4c6a19d6a22a3921bf802e9af4d5e1e5bd771208dba74bf AS python-runtime
+
+FROM rust:1.88.0-bookworm@sha256:4727898c104ecd2e22d780925832502faee9fe4e70581b8572af081370b315a0 AS builder
+
+# Le prefixe /usr/local de l'image Python contient l'interpreteur CPython 3.12,
+# ses en-tetes et pip. Les deux images reposent sur la meme Debian bookworm.
+COPY --from=python-runtime /usr/local/ /usr/local/
+
+ENV PATH="/usr/local/cargo/bin:/usr/local/bin:${PATH}" \
+    CARGO_TERM_COLOR=never \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Maturin est epingle a la version verrouillee par uv.lock. Le hash est celui de
+# sa wheel Linux x86_64 publiee sur PyPI ; --require-hashes interdit toute derive.
+RUN printf '%s\n' \
+      'maturin==1.14.1 --hash=sha256:dfc54ae32e6fcb18302193ab9a30b0b25eefffba994ae13238974805533ef75e' \
+      > /tmp/maturin-requirements.txt && \
+    python3 -m pip install \
+      --no-cache-dir \
+      --no-deps \
+      --only-binary=:all: \
+      --require-hashes \
+      -r /tmp/maturin-requirements.txt && \
+    rm -f /tmp/maturin-requirements.txt && \
+    test "$(python3 -c 'import platform; print(platform.python_version())')" = '3.12.13' && \
+    rustc --version | grep -Eq '^rustc 1\.88\.0 ' && \
+    test "$(maturin --version)" = 'maturin 1.14.1'
+
+ARG AVA_GIT_SHA
+LABEL org.opencontainers.image.title="Ava Rust release builder" \
+      org.opencontainers.image.revision="${AVA_GIT_SHA}" \
+      org.opencontainers.image.description="Unsigned checksum-manifest builder for openjarvis_rust"
+
+WORKDIR /build
+
+# Le contexte est cree par git archive : seul le sous-arbre Rust du commit cible
+# entre dans l'image, jamais un secret ou un fichier non suivi du poste operateur.
+COPY rust/ rust/
+
+RUN test -n "${AVA_GIT_SHA}" && \
+    test "$(rustc --version | awk '{print $2}')" = '1.88.0' && \
+    test "$(python3 -c 'import platform; print(platform.python_version())')" = '3.12.13'
+
+# Le workspace entier est teste contre Cargo.lock avant de produire l'artefact.
+RUN cargo test \
+      --manifest-path rust/Cargo.toml \
+      --workspace \
+      --locked
+
+RUN mkdir -p /artifacts && \
+    maturin build \
+      --manifest-path rust/crates/openjarvis-python/Cargo.toml \
+      --interpreter python3 \
+      --release \
+      --locked \
+      --compatibility manylinux_2_36 \
+      --out /artifacts
+
+# L'import est verifie depuis un venv et un cwd jetables, en mode isole. Il ne
+# peut donc pas reussir en important le checkout ou le site utilisateur par hasard.
+RUN set -eu; \
+    wheel_count="$(find /artifacts -maxdepth 1 -type f -name '*.whl' | wc -l)"; \
+    test "$wheel_count" -eq 1; \
+    wheel="$(find /artifacts -maxdepth 1 -type f -name '*.whl')"; \
+    case "$(basename "$wheel")" in \
+      *-cp312-cp312-manylinux_2_36_x86_64.whl) ;; \
+      *) printf 'wheel incompatible avec la VM: %s\n' "$wheel" >&2; exit 1 ;; \
+    esac; \
+    python3 -m venv /tmp/verify-venv; \
+    /tmp/verify-venv/bin/pip install --no-deps --no-index "$wheel"; \
+    mkdir -p /tmp/verify-cwd; \
+    cd /tmp/verify-cwd; \
+    HOME=/tmp/verify-home /tmp/verify-venv/bin/python -I -c \
+      'import openjarvis_rust; assert openjarvis_rust.__file__'; \
+    rm -rf /tmp/verify-venv /tmp/verify-cwd /tmp/verify-home

@@ -3,14 +3,23 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 fastapi = pytest.importorskip("fastapi")
+from ava_extensions.identity.relationship import (  # noqa: E402
+    RELATIONSHIP_MARKER,
+    RelationshipOverlay,
+)
+from ava_extensions.server.principal import Principal  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from starlette.testclient import TestClient  # noqa: E402
+from starlette.websockets import WebSocketDisconnect  # noqa: E402
 
+from openjarvis.core.types import Role  # noqa: E402
+from openjarvis.server import routes as server_routes  # noqa: E402
 from openjarvis.server.api_routes import include_all_routes  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -35,8 +44,10 @@ def _make_streaming_engine(tokens=None):
         tokens = ["Hello", " ", "world"]
     engine = MagicMock()
     engine.engine_id = "mock"
+    engine.captured_messages = []
 
     async def mock_stream(messages, *, model="test-model", **kwargs):
+        engine.captured_messages.append(messages)
         for tok in tokens:
             yield tok
 
@@ -73,7 +84,8 @@ class TestWebSocketStreaming:
 
     def test_basic_streaming_exchange(self):
         """A valid message should produce chunk messages followed by a done."""
-        app = _make_app()
+        engine = _make_streaming_engine()
+        app = _make_app(engine)
         client = TestClient(app)
         with client.websocket_connect("/v1/chat/stream") as ws:
             ws.send_text(json.dumps({"message": "Hi"}))
@@ -93,6 +105,11 @@ class TestWebSocketStreaming:
             assert chunks == ["Hello", " ", "world"]
             assert done is not None
             assert done["content"] == "Hello world"
+        messages = engine.captured_messages[-1]
+        assert messages[0].role == Role.SYSTEM
+        assert "Tu es **Ava**" in messages[0].content
+        assert messages[1].role == Role.USER
+        assert messages[1].content == "Hi"
 
     def test_missing_message_field(self):
         """Sending JSON without a 'message' field should return an error."""
@@ -164,8 +181,8 @@ class TestWebSocketStreaming:
             # async-generator call args, but the exchange completed without error
             assert data["content"] == "OK"
 
-    def test_engine_error_returns_error_message(self):
-        """If the engine raises, the endpoint should send an error frame."""
+    def test_engine_error_returns_only_generic_message(self):
+        """Backend exception details must not cross the WebSocket boundary."""
         engine = MagicMock()
 
         async def bad_stream(messages, *, model="test-model", **kwargs):
@@ -180,7 +197,8 @@ class TestWebSocketStreaming:
             ws.send_text(json.dumps({"message": "boom"}))
             data = ws.receive_json()
             assert data["type"] == "error"
-            assert "Engine exploded" in data["detail"]
+            assert data["detail"] == "Chat generation failed"
+            assert "exploded" not in data["detail"].lower()
 
     def test_multiple_messages_on_same_connection(self):
         """The WebSocket should support multiple request/response cycles."""
@@ -207,7 +225,88 @@ class TestWebSocketStreaming:
             ws.send_text(json.dumps({"message": "Hi"}))
             data = ws.receive_json()
             assert data["type"] == "error"
-            assert "engine" in data["detail"].lower()
+            assert data["detail"] == "Chat unavailable"
+
+    def test_verified_principal_selects_overlay_and_pseudonymous_trace(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        principal = Principal("oidc", "https://issuer.example.invalid", "owner-subject")
+        overlay = RelationshipOverlay(
+            profile_id="virtual-girlfriend-v1",
+            prompt=(
+                f"{RELATIONSHIP_MARKER}virtual-girlfriend-v1]\n"
+                "Profil relationnel synthétique."
+            ),
+        )
+        monkeypatch.setattr(
+            server_routes,
+            "_relationship_context",
+            lambda _headers: (principal, overlay, True),
+        )
+        engine = _make_streaming_engine(tokens=["ok"])
+        app = _make_app(engine)
+        app.state.trace_store = MagicMock()
+        app.state.memory_service = MagicMock()
+        client = TestClient(app)
+
+        with client.websocket_connect(
+            "/v1/chat/stream",
+            headers={"X-Ava-Identity": "verified-by-test-double"},
+        ) as ws:
+            ws.send_text(json.dumps({"message": "bonjour"}))
+            while ws.receive_json()["type"] != "done":
+                pass
+
+        system_prompt = engine.captured_messages[-1][0].content
+        assert system_prompt.count(RELATIONSHIP_MARKER) == 1
+        trace = app.state.trace_store.save.call_args.args[0]
+        assert trace.metadata == {"provenance": principal.provenance}
+        assert principal.subject not in trace.metadata["provenance"]
+        app.state.memory_service.submit.assert_not_called()
+
+    def test_invalid_ava_credential_is_rejected_before_model(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            server_routes,
+            "_relationship_context",
+            lambda _headers: (None, None, False),
+        )
+        engine = _make_streaming_engine()
+        client = TestClient(_make_app(engine))
+
+        with pytest.raises(WebSocketDisconnect) as rejected:
+            with client.websocket_connect(
+                "/v1/chat/stream",
+                headers={"X-Ava-Identity": "forged.jwt"},
+            ):
+                pass
+
+        assert rejected.value.code == 1008
+        assert engine.captured_messages == []
+        engine.generate.assert_not_called()
+
+    def test_invalid_relationship_policy_is_rejected_before_model(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv(
+            "AVA_RELATIONSHIP_POLICY_FILE",
+            str(tmp_path / "missing-relationship-policy.json"),
+        )
+        engine = _make_streaming_engine()
+        client = TestClient(_make_app(engine))
+
+        with pytest.raises(WebSocketDisconnect) as rejected:
+            with client.websocket_connect("/v1/chat/stream"):
+                pass
+
+        assert rejected.value.code == 1011
+        assert engine.captured_messages == []
+        engine.generate.assert_not_called()
 
 
 __all__ = [

@@ -136,3 +136,65 @@ describe('tool credentials', () => {
     );
   });
 });
+
+describe('managed agent streaming errors', () => {
+  it('rejects the promise and never reports a failed turn as delivered', async () => {
+    fetchMock.mockResolvedValue(
+      new Response(
+        'data: {"error":{"type":"generation_error","message":"Managed agent generation failed"}}\n\n'
+          + 'data: [DONE]\n\n',
+        {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        },
+      ),
+    );
+    const onDone = vi.fn();
+    const { sendAgentMessage } = await freshApi();
+
+    await expect(
+      sendAgentMessage('agent-1', 'question', 'immediate', { onDone }),
+    ).rejects.toThrow('Managed agent generation failed');
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
+  it('rejects an EOF without the terminal sentinel', async () => {
+    fetchMock.mockResolvedValue(
+      new Response(
+        'data: {"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}\n\n',
+        {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        },
+      ),
+    );
+    const onDone = vi.fn();
+    const { sendAgentMessage } = await freshApi();
+
+    await expect(
+      sendAgentMessage('agent-1', 'question', 'immediate', { onDone }),
+    ).rejects.toThrow('without a complete response');
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-stop terminal reason', async () => {
+    fetchMock.mockResolvedValue(
+      new Response(
+        'data: {"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}\n\n'
+          + 'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n'
+          + 'data: [DONE]\n\n',
+        {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        },
+      ),
+    );
+    const onDone = vi.fn();
+    const { sendAgentMessage } = await freshApi();
+
+    await expect(
+      sendAgentMessage('agent-1', 'question', 'immediate', { onDone }),
+    ).rejects.toThrow('without a complete response');
+    expect(onDone).not.toHaveBeenCalled();
+  });
+});

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ava:relationship:adjudication:v1",
+  "title": "Adjudication relationnelle Ava v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "attestation_id", "kind", "statement_sha256", "reviewer",
+    "decision", "checks", "canonical_knowledge"
+  ],
+  "properties": {
+    "schema_version": {"const": "ava.relationship.adjudication/v1"},
+    "attestation_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._:-]{2,127}$"},
+    "kind": {"enum": ["human", "independent"]},
+    "statement_sha256": {"$ref": "#/$defs/sha256"},
+    "reviewer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "independent_from_model_author"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._:-]{2,127}$"},
+        "independent_from_model_author": {"const": true}
+      }
+    },
+    "decision": {"const": "pass"},
+    "checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["semantic_safety", "principal_isolation", "memory_isolation", "rollback"],
+      "properties": {
+        "semantic_safety": {"const": true},
+        "principal_isolation": {"const": true},
+        "memory_isolation": {"const": true},
+        "rollback": {"const": true}
+      }
+    },
+    "canonical_knowledge": {"const": false}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  }
+}

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -82,6 +83,7 @@ class TraceStore:
 
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = str(db_path)
+        self._lock = threading.RLock()
         if self._db_path != ":memory:":
             from openjarvis.security.file_utils import secure_create
 
@@ -115,51 +117,52 @@ class TraceStore:
         single writer — see ``server/app.py`` — rather than swallowing
         collisions here.
         """
-        self._conn.execute(
-            _INSERT_TRACE,
-            (
-                trace.trace_id,
-                trace.query,
-                trace.agent,
-                trace.model,
-                trace.engine,
-                trace.result,
-                trace.outcome,
-                trace.feedback,
-                trace.started_at,
-                trace.ended_at,
-                trace.total_tokens,
-                trace.total_latency_seconds,
-                json.dumps(trace.metadata),
-                json.dumps(trace.messages),
-            ),
-        )
-        for idx, step in enumerate(trace.steps):
+        with self._lock, self._conn:
             self._conn.execute(
-                _INSERT_STEP,
+                _INSERT_TRACE,
                 (
                     trace.trace_id,
-                    idx,
-                    step.step_type.value
-                    if isinstance(step.step_type, StepType)
-                    else step.step_type,
-                    step.timestamp,
-                    step.duration_seconds,
-                    json.dumps(step.input),
-                    json.dumps(step.output),
-                    json.dumps(step.metadata),
+                    trace.query,
+                    trace.agent,
+                    trace.model,
+                    trace.engine,
+                    trace.result,
+                    trace.outcome,
+                    trace.feedback,
+                    trace.started_at,
+                    trace.ended_at,
+                    trace.total_tokens,
+                    trace.total_latency_seconds,
+                    json.dumps(trace.metadata),
+                    json.dumps(trace.messages),
                 ),
             )
-        self._conn.commit()
+            for idx, step in enumerate(trace.steps):
+                self._conn.execute(
+                    _INSERT_STEP,
+                    (
+                        trace.trace_id,
+                        idx,
+                        step.step_type.value
+                        if isinstance(step.step_type, StepType)
+                        else step.step_type,
+                        step.timestamp,
+                        step.duration_seconds,
+                        json.dumps(step.input),
+                        json.dumps(step.output),
+                        json.dumps(step.metadata),
+                    ),
+                )
 
     def get(self, trace_id: str) -> Optional[Trace]:
         """Retrieve a trace by id, or ``None`` if not found."""
-        row = self._conn.execute(
-            "SELECT * FROM traces WHERE trace_id = ?", (trace_id,)
-        ).fetchone()
-        if row is None:
-            return None
-        return self._row_to_trace(row)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM traces WHERE trace_id = ?", (trace_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            return self._row_to_trace(row)
 
     def list_traces(
         self,
@@ -167,6 +170,7 @@ class TraceStore:
         agent: Optional[str] = None,
         model: Optional[str] = None,
         outcome: Optional[str] = None,
+        provenance: Optional[str] = None,
         since: Optional[float] = None,
         until: Optional[float] = None,
         limit: int = 100,
@@ -183,6 +187,13 @@ class TraceStore:
         if outcome is not None:
             clauses.append("outcome = ?")
             params.append(outcome)
+        if provenance is not None:
+            # Provenance is a server-authenticated, pseudonymous principal id
+            # stored inside the trace metadata.  Filtering in SQL (before the
+            # limit) is load-bearing: filtering a limited mixed-principal page
+            # in Python can hide older traces or leak their relative activity.
+            clauses.append("json_extract(metadata, '$.provenance') = ?")
+            params.append(provenance)
         if since is not None:
             clauses.append("started_at >= ?")
             params.append(since)
@@ -192,13 +203,15 @@ class TraceStore:
         where = " AND ".join(clauses) if clauses else "1=1"
         sql = f"SELECT * FROM traces WHERE {where} ORDER BY started_at DESC LIMIT ?"
         params.append(limit)
-        rows = self._conn.execute(sql, params).fetchall()
-        return [self._row_to_trace(r) for r in rows]
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+            return [self._row_to_trace(r) for r in rows]
 
     def count(self) -> int:
         """Return the total number of stored traces."""
-        row = self._conn.execute("SELECT COUNT(*) FROM traces").fetchone()
-        return row[0] if row else 0
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM traces").fetchone()
+            return row[0] if row else 0
 
     def search(
         self,
@@ -220,7 +233,8 @@ class TraceStore:
             params.append(agent)
         sql += " ORDER BY rank LIMIT ?"
         params.append(limit)
-        rows = self._conn.execute(sql, params).fetchall()
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
         return [
             {
                 "trace_id": r[0],
@@ -280,16 +294,18 @@ class TraceStore:
         #   comme un succes : en cas de doute on ne penalise pas, sinon les analyses
         #   deviennent pessimistes par construction.
         resultat = "success" if score >= 0.5 else "failure"
-        cursor = self._conn.execute(
-            "UPDATE traces SET feedback = ?, outcome = COALESCE(outcome, ?) WHERE trace_id = ?",
-            (score, resultat, trace_id),
-        )
-        self._conn.commit()
-        return cursor.rowcount > 0
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "UPDATE traces SET feedback = ?, "
+                "outcome = COALESCE(outcome, ?) WHERE trace_id = ?",
+                (score, resultat, trace_id),
+            )
+            return cursor.rowcount > 0
 
     def close(self) -> None:
         """Close the underlying SQLite connection."""
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     # -- internal helpers ------------------------------------------------------
 
@@ -333,7 +349,8 @@ class TraceStore:
         )
 
     def _fetchall(self, sql: str = "SELECT * FROM traces") -> list:
-        return self._conn.execute(sql).fetchall()
+        with self._lock:
+            return self._conn.execute(sql).fetchall()
 
 
 __all__ = ["TraceStore"]

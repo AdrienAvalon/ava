@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Any, List, Optional
 
-from openjarvis.core.config import JarvisConfig, load_config
+from openjarvis.core import config as _config_module
+from openjarvis.core.config import JarvisConfig
 from openjarvis.core.events import EventBus, get_event_bus
 from openjarvis.core.paths import get_config_dir
 from openjarvis.engine._stubs import InferenceEngine
@@ -29,9 +30,13 @@ class SystemBuilder:
         elif config_path is not None:
             from pathlib import Path
 
-            self._config = load_config(Path(config_path))
+            self._config = _config_module.load_config(Path(config_path))
         else:
-            self._config = load_config()
+            self._config = _config_module.load_config()
+
+        from ava_extensions.boot import normalize_config
+
+        self._config = normalize_config(self._config)
 
         self._engine_key: Optional[str] = None
         self._engine_instance: Optional[InferenceEngine] = None
@@ -384,10 +389,12 @@ class SystemBuilder:
 
     def _resolve_memory(self, config):
         try:
-            import openjarvis.tools.storage  # noqa: F401 -- trigger registration
+            key = config.memory.default_backend
+            from openjarvis.tools.storage import register_optional_backends
+
+            register_optional_backends(key)
             from openjarvis.core.registry import MemoryRegistry
 
-            key = config.memory.default_backend
             if MemoryRegistry.contains(key):
                 return MemoryRegistry.create(key, db_path=config.memory.db_path)
         except Exception as exc:

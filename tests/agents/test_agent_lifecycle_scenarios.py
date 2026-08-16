@@ -126,7 +126,7 @@ def test_cron_scheduled_agent(scenario_harness: ScenarioHarness) -> None:
 
 
 def test_queued_message_delivery(scenario_harness: ScenarioHarness) -> None:
-    """Queue 3 messages, run tick, verify all delivered and in prompt."""
+    """Each tick durably claims exactly one queued message before inference."""
     h = scenario_harness
     h.engine._responses = [{"content": "Processed all messages."}]
     h.engine._call_count = 0
@@ -145,20 +145,19 @@ def test_queued_message_delivery(scenario_harness: ScenarioHarness) -> None:
     pending = h.manager.get_pending_messages(aid)
     assert len(pending) == 3
 
-    h.executor.execute_tick(aid)
-
-    # All should be delivered
-    pending = h.manager.get_pending_messages(aid)
-    assert len(pending) == 0
-
-    # Engine should have been called with messages in the prompt
-    assert h.engine.last_messages is not None
-    prompt_text = " ".join(
-        str(getattr(m, "content", m)) for m in h.engine.last_messages
-    )
-    assert "Message one" in prompt_text
-    assert "Message two" in prompt_text
-    assert "Message three" in prompt_text
+    for remaining, expected in zip(
+        (2, 1, 0),
+        ("Message one", "Message two", "Message three"),
+        strict=True,
+    ):
+        h.executor.execute_tick(aid)
+        assert len(h.manager.get_pending_messages(aid)) == remaining
+        assert h.engine.last_messages is not None
+        prompt_text = " ".join(
+            str(getattr(message, "content", message))
+            for message in h.engine.last_messages
+        )
+        assert expected in prompt_text
 
     # Response stored
     agent = h.manager.get_agent(aid)
@@ -295,7 +294,7 @@ def test_error_exhaustion(scenario_harness: ScenarioHarness) -> None:
 
 def test_stall_detection_and_recovery(scenario_harness: ScenarioHarness) -> None:
     """Set agent to running with stale last_activity, reconcile detects stall,
-    then recover resets to idle."""
+    but never replays it until an authoritative worker boundary is known."""
     h = scenario_harness
     import time as real_time
 
@@ -311,7 +310,7 @@ def test_stall_detection_and_recovery(scenario_harness: ScenarioHarness) -> None
     aid = agent["id"]
 
     # Simulate: agent is running with stale activity
-    h.manager.start_tick(aid)
+    tick_token = h.manager.start_tick(aid)
     ten_minutes_ago = real_time.time() - 600
     h.manager.update_agent(aid, last_activity_at=ten_minutes_ago)
 
@@ -320,9 +319,9 @@ def test_stall_detection_and_recovery(scenario_harness: ScenarioHarness) -> None
 
     agent = h.manager.get_agent(aid)
     assert agent is not None
-    # Stall detection should have released the concurrency guard (end_tick)
-    # and incremented stall_retries
-    assert agent["status"] == "idle"
+    # Observation alone must not release a worker that may still be executing
+    # model or tool effects.
+    assert agent["status"] == "running"
     assert agent["stall_retries"] == 1
 
     # Verify stall event was published
@@ -332,7 +331,12 @@ def test_stall_detection_and_recovery(scenario_harness: ScenarioHarness) -> None
     assert len(stall_events) >= 1
     assert stall_events[0].data["agent_id"] == aid
 
-    # Now recover the agent explicitly
+    with pytest.raises(ValueError, match="cannot be recovered"):
+        h.manager.recover_agent(aid)
+
+    # Simulate the authoritative process boundary declaring the old worker
+    # terminal, after which manual recovery is safe.
+    h.manager.end_tick(aid, tick_token, status="error")
     h.manager.recover_agent(aid)
     agent = h.manager.get_agent(aid)
     assert agent is not None

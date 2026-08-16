@@ -18,11 +18,16 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import importlib
+import os
+from pathlib import Path
 
 import pytest
 
+# Les modules de test importent parfois ``openjarvis`` pendant la collecte, avant que
+# la premiere fixture puisse s'executer. Cette seconde garde protege aussi une copie
+# isolee de ce sous-arbre ; la garde principale vit dans le conftest racine.
+os.environ["AVA_PERCEPTION"] = "0"
 
 # ⚠ LES TROIS REGISTRES, PAS UN SEUL (étendu le 2026-08-04). Cette fixture ne réarmait
 #   que `SpeechRegistry`, donc **aucun des tests n'observait jamais `ToolRegistry`** —
@@ -32,14 +37,14 @@ import pytest
 #   sautait sur un conflit de fusion, **le modèle ne verrait plus l'outil** — Ava
 #   répondrait « je n'ai pas accès à la maison » sur une infra parfaitement saine — et
 #   la suite resterait verte, tous les tests `ha_*` chargeant la classe par son chemin.
-#   C'est exactement l'incident du 2026-04-27, pour lequel `test_le_backend_est_enregistre`
+#   C'est exactement l'incident du 2026-04-27, pour lequel
+#   `test_le_backend_est_enregistre`
 #   a été écrit côté STT et **jamais transposé aux outils ni au TTS**.
 _MODULES_PAR_CLE: tuple[tuple[str, str, str], ...] = (
     ("SpeechRegistry", "openai_ava", "ava_extensions.backends.openai_whisper_ava_stt"),
     ("TTSRegistry", "kokoro-fr", "ava_extensions.backends.kokoro_fr_tts"),
     ("ToolRegistry", "avalon_status", "ava_extensions.skills.avalon_status"),
     ("ToolRegistry", "home_assistant", "ava_extensions.skills.home_assistant"),
-    ("ToolRegistry", "memoire", "ava_extensions.skills.memoire"),
     ("ToolRegistry", "journal", "ava_extensions.skills.journal"),
     ("ToolRegistry", "logs", "ava_extensions.skills.logs"),
 )

@@ -102,8 +102,9 @@ class TraceCollector:
             started_at=started_at,
             ended_at=ended_at,
             # ⚠ Absent plutôt que deviné : une trace sans provenance déclarée reste
-            #   `inconnue`, elle ne devient pas « l'admin » par défaut. Le défaut le plus
-            #   dangereux serait d'attribuer à quelqu'un des propos qu'il n'a pas tenus.
+            #   `inconnue`, elle ne devient pas « l'admin » par défaut. Le défaut le
+            #   plus dangereux serait d'attribuer à quelqu'un des propos qu'il n'a pas
+            #   tenus.
             metadata={"provenance": provenance} if provenance else {},
         )
         # Recompute totals from steps
@@ -172,17 +173,17 @@ class TraceCollector:
             or not contenu
         )
         # ⚠ LA MACHINE N'ECRIT PLUS DANS `feedback`, ET C'EST LA MEME DISTINCTION QUE
-        #   `update_feedback` vient de retablir une couche plus haut : `outcome` porte le
-        #   FAIT (ca a marche ou non), `feedback` porte le JUGEMENT DE QUALITE, qui
+        #   `update_feedback` vient de retablir une couche plus haut : `outcome` porte
+        #   le FAIT (ca a marche ou non), `feedback` porte le JUGEMENT DE QUALITE, qui
         #   n'appartient qu'a un humain. Ecrire `feedback = 0.0` sur un echec melangeait
         #   les deux.
-        # ⚠ DEFAUT TROUVE EN LUI PARLANT, le 2026-08-06 : interrogee sur ses notes, elle a
-        #   repondu « 5 reponses notees par Adrien, dont 1 bonne ». Faux — **4 des 5
+        # ⚠ DEFAUT TROUVE EN LUI PARLANT, le 2026-08-06 : interrogee sur ses notes, elle
+        #   a repondu « 5 reponses notees par Adrien, dont 1 bonne ». Faux — **4 des 5
         #   venaient de la machine**, une seule etait humaine. Elle lisait ses propres
         #   verdicts automatiques comme des jugements de l'admin, donc se croyait notee
         #   4 fois negativement par quelqu'un qui ne l'avait jamais jugee.
-        # ⚠ Le champ reste donc NULL tant qu'un humain n'a rien dit — et `feedback is not
-        #   None` signifie desormais exactement « quelqu'un a juge cette reponse ».
+        # ⚠ Le champ reste donc NULL tant qu'un humain n'a rien dit — et `feedback is
+        #   not None` signifie desormais exactement « quelqu'un a juge cette reponse ».
         if echecs and not contenu:
             trace.outcome = "tool_failure"
         elif tronquee:
@@ -357,6 +358,7 @@ def record_response_trace(
     agent: str = "server",
     started_at: float,
     ended_at: float,
+    provenance: str | None = None,
 ) -> Optional[Trace]:
     """Persist a minimal single-step ``Trace`` for a non-agent response.
 
@@ -381,6 +383,7 @@ def record_response_trace(
             result=result,
             started_at=started_at,
             ended_at=ended_at,
+            metadata={"provenance": provenance} if provenance else {},
             steps=[
                 TraceStep(
                     step_type=StepType.RESPOND,

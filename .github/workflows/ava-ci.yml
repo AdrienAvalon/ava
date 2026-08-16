@@ -25,9 +25,41 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  rust-release-artifact:
+    name: Wheel Rust attestee (Debian bookworm)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Construire et tester la wheel dans le builder epingle
+        env:
+          AVA_RUST_ARTIFACT_DIR: ${{ runner.temp }}/ava-rust-artifact
+        run: scripts/build-rust-attested.sh
+
+      - name: Verifier le lot content-addressed
+        env:
+          AVA_RUST_ARTIFACT_DIR: ${{ runner.temp }}/ava-rust-artifact
+        run: |
+          set -euo pipefail
+          test "$(find "$AVA_RUST_ARTIFACT_DIR" -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 1
+          test "$(find "$AVA_RUST_ARTIFACT_DIR" -maxdepth 1 -type f -name '*.attestation' | wc -l)" -eq 1
+
+      - name: Publier wheel et manifeste de checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: ava-rust-${{ github.sha }}
+          path: ${{ runner.temp }}/ava-rust-artifact/
+          if-no-files-found: error
+          retention-days: 14
+
   extensions:
     name: Extensions Ava (tests + invariants)
     runs-on: ubuntu-latest
+    env:
+      # Les tests doivent rester hermetiques : l'import racine ne lance jamais le
+      # thread de perception ni un observateur local pendant les shadows/evaluations.
+      AVA_PERCEPTION: "0"
     steps:
       - uses: actions/checkout@v4
 
@@ -48,6 +80,26 @@ jobs:
       #   rapides, et c'est la zone ou nos regressions apparaissent.
       - name: Tests des extensions Ava
         run: uv run pytest ava_extensions/tests/ -q
+
+      - name: "Contrat : aucune telemetrie externe implicite"
+        run: AVA_PERCEPTION=0 uv run pytest tests/analytics/test_identity.py -q
+
+      - name: "Frontiere HTTP Ava : identite, relation et conversations"
+        run: >-
+          AVA_PERCEPTION=0 uv run pytest
+          tests/server/test_routes.py
+          tests/server/test_relationship_identity.py
+          tests/server/test_durable_conversation.py
+          ava_extensions/tests/test_conversation.py
+          ava_extensions/tests/test_tts_route.py
+          -q
+
+      - name: "Contrat : livraison Ava atomique depuis un commit propre"
+        run: >-
+          AVA_PERCEPTION=0 uv run pytest
+          tests/deploy/test_deploy_vm_contract.py
+          tests/deploy/test_build_rust_attestation_contract.py
+          -q
 
       # ⚠ ET LES MEMES TESTS APRES CEUX DE L'AMONT — ce n'est pas une redondance.
       #   Un test peut passer SEUL et echouer dans une suite complete : c'est arrive le
@@ -94,7 +146,6 @@ jobs:
           attendus = [
               ("outil", ToolRegistry, "avalon_status"),
               ("outil", ToolRegistry, "home_assistant"),
-              ("outil", ToolRegistry, "memoire"),
               ("outil", ToolRegistry, "journal"),
               ("outil", ToolRegistry, "logs"),
               ("voix", TTSRegistry, "kokoro-fr"),
@@ -165,6 +216,32 @@ jobs:
       - name: Formatage
         run: uv run ruff format --check ava_extensions/
 
+      - name: "Wheel installee hors checkout : Ava demarre"
+        run: |
+          uv build --wheel --out-dir dist
+          cible="$(mktemp -d)"
+          uv pip install --target "$cible/site" --no-deps dist/*.whl
+          cd "$cible"
+          AVA_PERCEPTION=0 PYTHONPATH="$cible/site" "$GITHUB_WORKSPACE/.venv/bin/python" - <<'PY'
+          import importlib.metadata
+          import sys
+
+          import ava_extensions
+          import openjarvis
+
+          entree = next(
+              item
+              for item in importlib.metadata.entry_points(group="console_scripts")
+              if item.name == "jarvis" and item.dist.name.lower() == "openjarvis"
+          )
+          sys.argv = ["jarvis", "--help"]
+          try:
+              entree.load()()
+          except SystemExit as exc:
+              if exc.code not in (None, 0):
+                  raise
+          PY
+
   frontend:
     name: Frontend (types + build)
     runs-on: ubuntu-latest
@@ -183,6 +260,9 @@ jobs:
 
       - name: Verification des types
         run: npx tsc --noEmit
+
+      - name: Tests frontend
+        run: npm test
 
       - name: Build
         run: npm run build

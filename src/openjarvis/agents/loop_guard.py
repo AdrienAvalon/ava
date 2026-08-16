@@ -29,6 +29,7 @@ class LoopVerdict:
     blocked: bool = False
     reason: str = ""
     warned: bool = False
+    cycle_key: str = ""
 
 
 class LoopGuard:
@@ -53,6 +54,9 @@ class LoopGuard:
         self._per_tool_counts: dict[str, int] = {}
         # Track cycle keys that have already been warned (for warn-before-block)
         self._warned_cycles: set[str] = set()
+        # A blocked Rust verdict repeats on every retry. Telemetry describes the
+        # cycle transition, not every rejected attempt, so publish it once per cycle.
+        self._triggered_cycles: set[str] = set()
 
         try:
             from openjarvis._rust_bridge import get_rust_module
@@ -71,22 +75,24 @@ class LoopGuard:
     def reinitialiser(self) -> None:
         """Repart de zero — a appeler au DEBUT de chaque requete.
 
-        ⚠ POURQUOI. Le garde-fou vit sur l'instance d'agent, elle-meme partagee par tout le
-          service. Ses compteurs s'accumulaient donc sur la VIE DU PROCESSUS : passe trois
-          appels identiques, un outil devenait DEFINITIVEMENT bloque jusqu'au redemarrage.
-          Mesure du 2026-08-06 : Ava ne pouvait plus relire `cartographie-si.md` — apres
-          quatre lectures reussies, la cinquieme et toutes les suivantes ont ete refusees,
-          y compris la premiere d'une conversation NEUVE.
-        ⚠ Une boucle est un phenomene INTERNE A UNE TACHE : relire le meme document demain
-          est legitime, le relire dix fois dans la meme reponse ne l'est pas. Le compteur
-          doit donc avoir la duree de la tache, pas celle du service.
+        ⚠ POURQUOI. Le garde-fou vit sur l'instance d'agent, elle-meme partagee par tout
+          le service. Ses compteurs s'accumulaient donc sur la VIE DU PROCESSUS : passe
+          trois appels identiques, un outil devenait DEFINITIVEMENT bloque jusqu'au
+          redemarrage. Mesure du 2026-08-06 : Ava ne pouvait plus relire
+          `cartographie-si.md` — apres quatre lectures reussies, la cinquieme et toutes
+          les suivantes ont ete refusees, y compris la premiere d'une conversation
+          NEUVE.
+        ⚠ Une boucle est un phenomene INTERNE A UNE TACHE : relire le meme document
+          demain est legitime, le relire dix fois dans la meme reponse ne l'est pas. Le
+          compteur doit donc avoir la duree de la tache, pas celle du service.
         """
         self._call_counts.clear()
         self._per_tool_counts.clear()
         self._warned_cycles.clear()
+        self._triggered_cycles.clear()
         if self._rust_impl is not None:
-            # Le module Rust garde ses propres compteurs : on le reconstruit, faute d'une
-            # methode de remise a zero exposee.
+            # Le module Rust garde ses propres compteurs : on le reconstruit, faute
+            # d'une methode de remise a zero exposee.
             try:
                 from openjarvis._rust_bridge import get_rust_module
 
@@ -111,8 +117,19 @@ class LoopGuard:
             if isinstance(rust_result, LoopVerdict):
                 verdict = rust_result
             elif rust_result is not None:
-                self._emit_triggered("rust_guard", tool_name)
-                verdict = LoopVerdict(blocked=True, reason=rust_result)
+                cycle_key = self._stable_cycle_key(
+                    tool_name,
+                    arguments,
+                    rust_result,
+                )
+                if cycle_key not in self._triggered_cycles:
+                    self._triggered_cycles.add(cycle_key)
+                    self._emit_triggered("rust_guard", tool_name)
+                verdict = LoopVerdict(
+                    blocked=True,
+                    reason=rust_result,
+                    cycle_key=cycle_key,
+                )
             else:
                 verdict = LoopVerdict()
         else:
@@ -120,21 +137,50 @@ class LoopGuard:
 
         # Wrap with warn-before-block logic
         if verdict.blocked and self._config.warn_before_block:
-            cycle_key = verdict.reason
+            cycle_key = verdict.cycle_key or self._stable_cycle_key(
+                tool_name,
+                arguments,
+                verdict.reason,
+            )
             if cycle_key not in self._warned_cycles:
                 self._warned_cycles.add(cycle_key)
-                return LoopVerdict(blocked=False, warned=True, reason=verdict.reason)
+                return LoopVerdict(
+                    blocked=False,
+                    warned=True,
+                    reason=verdict.reason,
+                    cycle_key=cycle_key,
+                )
         return verdict
+
+    @staticmethod
+    def _stable_cycle_key(tool_name: str, arguments: str, reason: str) -> str:
+        """Name a loop independently of counters embedded in its message."""
+
+        normalized = reason.casefold()
+        if "identical" in normalized:
+            digest = hashlib.sha256(f"{tool_name}:{arguments}".encode()).hexdigest()[
+                :16
+            ]
+            return f"identical:{digest}"
+        if "ping-pong" in normalized or "repetitive tool" in normalized:
+            return "ping-pong"
+        if "poll budget" in normalized:
+            return "poll-budget"
+        return "other:" + hashlib.sha256(reason.encode()).hexdigest()[:16]
 
     def _python_check(self, tool_name: str, arguments: str) -> LoopVerdict:
         """Pure-Python fallback when Rust backend is not available."""
         # 1. Hash tracking — identical calls
         call_hash = hashlib.sha256(f"{tool_name}:{arguments}".encode()).hexdigest()[:16]
         self._call_counts[call_hash] = self._call_counts.get(call_hash, 0) + 1
-        if self._call_counts[call_hash] > self._config.max_identical_calls:
-            self._emit_triggered("identical_call", tool_name)
+        if self._call_counts[call_hash] >= self._config.max_identical_calls:
+            # Emit once at the threshold. A warned call may be retried, but repeated
+            # blocked attempts must not manufacture duplicate alert events.
+            if self._call_counts[call_hash] == self._config.max_identical_calls:
+                self._emit_triggered("identical_call", tool_name)
             return LoopVerdict(
                 blocked=True,
+                cycle_key=f"identical:{call_hash}",
                 reason=(
                     f"Identical call to '{tool_name}' repeated "
                     f"{self._call_counts[call_hash]} times "
@@ -148,6 +194,7 @@ class LoopGuard:
             self._emit_triggered("poll_budget", tool_name)
             return LoopVerdict(
                 blocked=True,
+                cycle_key="poll-budget",
                 reason=(
                     f"Tool '{tool_name}' exceeded poll budget "
                     f"({self._config.poll_tool_budget})."
@@ -161,6 +208,7 @@ class LoopGuard:
                 self._emit_triggered("ping_pong", tool_name)
                 return LoopVerdict(
                     blocked=True,
+                    cycle_key="ping-pong",
                     reason="Repetitive tool-calling pattern detected (ping-pong).",
                 )
 
@@ -250,6 +298,7 @@ class LoopGuard:
         self._tool_sequence.clear()
         self._per_tool_counts.clear()
         self._warned_cycles.clear()
+        self._triggered_cycles.clear()
         if self._rust_impl is not None:
             self._rust_impl.reset()
 

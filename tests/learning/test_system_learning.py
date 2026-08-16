@@ -12,16 +12,16 @@ class TestSystemLearningIntegration:
         result = SystemBuilder._setup_learning_orchestrator(config)
         assert result is None
 
-    def test_learning_orchestrator_created_when_enabled(self):
-        """When training_enabled=True, orchestrator is created."""
+    def test_learning_orchestrator_refused_when_enabled(self):
+        """Ava refuses the upstream orchestrator even when config requests it."""
         from openjarvis.core.config import JarvisConfig
-        from openjarvis.learning.learning_orchestrator import LearningOrchestrator
         from openjarvis.system import SystemBuilder
 
         config = JarvisConfig()
         config.learning.training_enabled = True
         result = SystemBuilder._setup_learning_orchestrator(config)
-        assert isinstance(result, LearningOrchestrator)
+        assert result is None
+        assert config.learning.training_enabled is False
 
     def test_config_has_training_fields(self):
         """LearningConfig has the training pipeline fields."""

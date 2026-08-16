@@ -80,7 +80,8 @@ def test_reconcile_detects_stalled_agent(tmp_path):
             "max_stall_retries": 3,
         },
     )
-    mgr.update_agent(agent["id"], status="running", last_activity_at=time.time() - 30)
+    mgr.start_tick(agent["id"])
+    mgr.update_agent(agent["id"], last_activity_at=time.time() - 30)
 
     scheduler._reconcile()
 
@@ -104,7 +105,8 @@ def test_reconcile_skips_active_agent(tmp_path):
     scheduler = AgentScheduler(mgr, executor, event_bus=bus)
 
     agent = mgr.create_agent("active", config={"timeout_seconds": 10})
-    mgr.update_agent(agent["id"], status="running", last_activity_at=time.time() - 2)
+    mgr.start_tick(agent["id"])
+    mgr.update_agent(agent["id"], last_activity_at=time.time() - 2)
 
     scheduler._reconcile()
 
@@ -113,8 +115,8 @@ def test_reconcile_skips_active_agent(tmp_path):
     mgr.close()
 
 
-def test_reconcile_retries_exhausted_sets_error(tmp_path):
-    """After max_stall_retries, agent goes to error status."""
+def test_reconcile_retries_exhausted_keeps_owner_lock(tmp_path):
+    """Observation cannot release a worker that may still have live effects."""
     mgr = AgentManager(str(tmp_path / "test.db"))
     bus = EventBus()
     executor = AgentExecutor(mgr, bus)
@@ -129,9 +131,9 @@ def test_reconcile_retries_exhausted_sets_error(tmp_path):
             "max_stall_retries": 2,
         },
     )
+    mgr.start_tick(agent["id"])
     mgr.update_agent(
         agent["id"],
-        status="running",
         last_activity_at=time.time() - 30,
         stall_retries=2,
     )
@@ -139,5 +141,5 @@ def test_reconcile_retries_exhausted_sets_error(tmp_path):
     scheduler._reconcile()
 
     updated = mgr.get_agent(agent["id"])
-    assert updated["status"] == "error"
+    assert updated["status"] == "running"
     mgr.close()

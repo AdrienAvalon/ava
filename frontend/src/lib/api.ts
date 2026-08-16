@@ -712,6 +712,9 @@ export async function sendAgentMessage(
     let lastUsage: Record<string, number> | undefined;
     let lastTelemetry: Record<string, unknown> | undefined;
     let currentEvent: string | undefined;
+    let terminalError: string | undefined;
+    let sawDone = false;
+    let terminalFinishReason: string | undefined;
     try {
       while (true) {
         const { done, value } = await reader.read();
@@ -730,6 +733,7 @@ export async function sendAgentMessage(
           }
           const data = line.slice(6);
           if (data === '[DONE]') {
+            sawDone = true;
             currentEvent = undefined;
             continue;
           }
@@ -765,6 +769,12 @@ export async function sendAgentMessage(
 
           try {
             const chunk = JSON.parse(data);
+            if (chunk.error) {
+              terminalError = typeof chunk.error.message === 'string'
+                ? chunk.error.message
+                : 'Managed agent generation failed';
+              continue;
+            }
             // Deep-research branch still uses tool_progress in a data chunk
             const toolProgress = chunk.choices?.[0]?.tool_progress;
             if (toolProgress) {
@@ -777,12 +787,24 @@ export async function sendAgentMessage(
             }
             if (chunk.usage) lastUsage = chunk.usage;
             if (chunk.telemetry) lastTelemetry = chunk.telemetry;
+            const finishReason = chunk.choices?.[0]?.finish_reason;
+            if (typeof finishReason === 'string') terminalFinishReason = finishReason;
           } catch {
             /* skip malformed chunks */
           }
         }
       }
-    } catch { /* stream ended */ }
+    } catch (error) {
+      await reader.cancel().catch(() => undefined);
+      throw error;
+    }
+
+    if (terminalError) {
+      throw new Error(terminalError);
+    }
+    if (!sawDone || terminalFinishReason !== 'stop') {
+      throw new Error('Managed agent stream ended without a complete response');
+    }
 
     callbacks?.onDone?.(fullContent, lastUsage, lastTelemetry);
 

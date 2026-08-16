@@ -9,15 +9,14 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from pathlib import Path
 from typing import Literal
+from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-# Ensure TTS backends self-register (kokoro, cartesia, openai_tts, ...)
-import openjarvis.speech  # noqa: F401
+from ava_extensions.server.principal import resolve_request_principal
 from openjarvis.core.registry import TTSRegistry
 
 logger = logging.getLogger(__name__)
@@ -108,16 +107,19 @@ def speak(req: SpeakRequest) -> Response:
     if not text:
         raise HTTPException(status_code=400, detail="empty text")
 
+    from openjarvis.speech import register_builtin_backends
+
+    register_builtin_backends(req.backend)
     if not TTSRegistry.contains(req.backend):
         # ⚠ NE PLUS ÉNUMÉRER LE REGISTRE. Le message d'origine renvoyait
         #   `list(TTSRegistry.keys())`, c'est-à-dire l'inventaire des backends
         #   configurés — donc des intégrations en place et des clés d'API détenues.
-        #   Portée exacte (mesurée) : l'appelant est authentifié par `OPENJARVIS_API_KEY`,
-        #   donc ce n'était pas une fuite publique — mais cette clé est **injectée dans le
-        #   bundle du frontend au build**, elle n'a donc pas la valeur d'un secret fort.
-        #   Ne pas divulguer l'inventaire reste le bon réflexe ; ce n'était simplement pas
-        #   une urgence. La liste des backends valides est déjà dans la description du
-        #   champ, à destination des clients légitimes.
+        #   Portée exacte (mesurée) : l'appelant est authentifié par
+        #   `OPENJARVIS_API_KEY`, donc ce n'était pas une fuite publique — mais cette
+        #   clé est **injectée dans le bundle du frontend au build**, elle n'a donc pas
+        #   la valeur d'un secret fort. Ne pas divulguer l'inventaire reste le bon
+        #   réflexe ; ce n'était simplement pas une urgence. La liste des backends
+        #   valides est déjà dans la description du champ, pour les clients légitimes.
         logger.warning("tts: backend inconnu demandé (%r)", req.backend[:40])
         raise HTTPException(status_code=404, detail="unknown tts backend")
 
@@ -188,39 +190,14 @@ def speak_health() -> dict:
 
 
 # === Persona ===
-# Exposes the current Ava system prompt so the frontend can inject it as a
-# system message. The OpenAI-compat /v1/chat/completions streaming path does
-# not apply the agent's configured system prompt; sending it explicitly from
-# the client is the simplest reliable fix.
-_PERSONA_LOCK = threading.Lock()
-_PERSONA_CACHE: dict[str, object] = {"mtime": 0.0, "text": ""}
-
-
+# Compatibility/read-only endpoint: it exposes only the versioned common
+# persona. Private relationship overlays are selected and composed inside the
+# chat route after authentication and are never returned to the browser.
 def _load_persona() -> str:
-    """Load the Ava persona system prompt, respecting config.agent.system_prompt_path."""
-    try:
-        from openjarvis.core.config import load_config
+    """Return the bundled common persona, never a private overlay."""
+    from ava_extensions.patches.system_prompt_loader import load_common_persona
 
-        cfg = load_config()
-        path = getattr(getattr(cfg, "agent", None), "system_prompt_path", None)
-    except Exception:
-        path = None
-    if not path:
-        path = os.path.expanduser("~/ava/ava_extensions/identity/system_prompts/ava.md")
-    p = Path(path)
-    if not p.exists():
-        return ""
-    try:
-        mtime = p.stat().st_mtime
-    except OSError:
-        mtime = 0.0
-    with _PERSONA_LOCK:
-        if mtime == _PERSONA_CACHE["mtime"]:
-            return str(_PERSONA_CACHE["text"])
-        text = p.read_text(encoding="utf-8").strip()
-        _PERSONA_CACHE["mtime"] = mtime
-        _PERSONA_CACHE["text"] = text
-        return text
+    return load_common_persona()
 
 
 @router.get("/persona")
@@ -283,7 +260,7 @@ class LigneEntrante(BaseModel):
     #   `ajouter()` GARDE son filtre : c'est une fonction publique, appelable hors
     #   de cette route. Deux couches, chacune à sa place.
     role: Literal["user", "assistant"]
-    texte: str = Field(max_length=8000)
+    texte: str = Field(max_length=128 * 1024)
     horodatage: float | None = None
 
 
@@ -291,6 +268,9 @@ class EnvoiConversation(BaseModel):
     # ⚠ `max_length` sur la liste : sans borne, un client pouvait faire matérialiser un
     #   corps arbitrairement grand en mémoire, sur la boucle d'événements.
     lignes: list[LigneEntrante] = Field(default_factory=list, max_length=50)
+    # Optional only for backward compatibility with imports from clients older than the
+    # durable chat contract. New writes identify one immutable user/assistant pair.
+    turn_id: UUID | None = None
 
 
 # ⚠ CES TROIS ROUTES SONT `def` ET NON `async def` — c'est délibéré, et l'incohérence
@@ -308,10 +288,15 @@ def lire_conversation(request: Request) -> dict:
 
     utilisateur = conv.identite(request.headers)
     if utilisateur is None:
-        # ⚠ Pas d'identité → pas d'historique, et surtout PAS de seau commun : c'était
-        #   une fuite réelle (deux jetons expirés partageaient la même conversation).
-        return {"utilisateur": None, "lignes": []}
-    return {"utilisateur": utilisateur, "lignes": conv.lire(utilisateur, limite=400)}
+        # A forged or expired token is not the same as a legitimately empty
+        # history.  Returning 200 + [] would make the browser erase its local
+        # cache even though the server established no principal.
+        raise HTTPException(status_code=401, detail="identité absente ou illisible")
+    try:
+        lignes = conv.lire_strict(utilisateur, limite=400)
+    except conv.ConversationStorageError as exc:
+        raise HTTPException(status_code=503, detail="historique indisponible") from exc
+    return {"utilisateur": utilisateur, "lignes": lignes}
 
 
 @router.post("/conversation")
@@ -326,11 +311,41 @@ def ajouter_conversation(envoi: EnvoiConversation, request: Request) -> dict:
 
     utilisateur = conv.identite(request.headers)
     if utilisateur is None:
-        # ⚠ 401 plutôt qu'un écrit mutualisé : mieux vaut perdre la mémoire d'une session
-        #   que mélanger celles de deux personnes.
+        # ⚠ 401 plutôt qu'un écrit mutualisé : mieux vaut perdre la mémoire d'une
+        #   session que mélanger celles de deux personnes.
         raise HTTPException(status_code=401, detail="identité absente ou illisible")
     lignes = [x.model_dump() for x in envoi.lignes]
-    return {"ecrites": conv.ajouter(utilisateur, lignes)}
+    if envoi.turn_id is None:
+        return {"ecrites": conv.ajouter(utilisateur, lignes), "created": True}
+    if len(lignes) != 2 or [ligne["role"] for ligne in lignes] != [
+        "user",
+        "assistant",
+    ]:
+        raise HTTPException(
+            status_code=422,
+            detail="un turn_id exige exactement une question et une réponse",
+        )
+    try:
+        result = conv.ajouter_tour(
+            utilisateur,
+            envoi.turn_id,
+            lignes[0]["texte"],
+            lignes[1]["texte"],
+            horodatage=lignes[0]["horodatage"],
+        )
+    except conv.TurnCollisionError as exc:
+        raise HTTPException(status_code=409, detail="turn_id en collision") from exc
+    except conv.TurnKeyLimitError as exc:
+        raise HTTPException(status_code=429, detail="journal de tours sature") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="tour invalide") from exc
+    except conv.ConversationStorageError as exc:
+        raise HTTPException(status_code=503, detail="historique indisponible") from exc
+    return {
+        "ecrites": 2 if result.created else 0,
+        "created": result.created,
+        "turn_id": result.turn.turn_id,
+    }
 
 
 @router.delete("/conversation")
@@ -342,3 +357,33 @@ def effacer_conversation(request: Request) -> dict:
     if utilisateur is None:
         raise HTTPException(status_code=401, detail="identité absente ou illisible")
     return {"effacees": conv.effacer(utilisateur)}
+
+
+@router.delete("/conversation/turn/{turn_id}")
+def abandonner_tour_pending(turn_id: UUID, request: Request) -> dict:
+    """Reconcile one ambiguous pending turn without deleting the conversation."""
+
+    from ava_extensions.server import conversation as conv
+
+    utilisateur = conv.identite(request.headers)
+    if utilisateur is None:
+        raise HTTPException(status_code=401, detail="identité absente ou illisible")
+    try:
+        result = conv.abandonner_tour(utilisateur, turn_id)
+    except conv.TurnCollisionError as exc:
+        raise HTTPException(status_code=409, detail="tour non réconciliable") from exc
+    except conv.ConversationStorageError as exc:
+        raise HTTPException(status_code=503, detail="historique indisponible") from exc
+    return {"turn_id": result.turn_id, "abandoned": result.abandoned}
+
+
+@router.get("/principal/verify")
+def verifier_principal_service(request: Request) -> dict[str, bool | str]:
+    """Prove the CP-to-Ava assertion contract without model or memory access."""
+
+    principal = resolve_request_principal(request.headers)
+    if principal is None:
+        raise HTTPException(status_code=401, detail="assertion absente ou invalide")
+    if principal.provider != "service":
+        raise HTTPException(status_code=403, detail="principal de service requis")
+    return {"ok": True, "provider": "service"}

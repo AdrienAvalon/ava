@@ -206,6 +206,13 @@ IDEOF
     grep -q '"install_uv":' "$OPENJARVIS_HOME/.state/install-state.json"
 }
 
+@test "install does not create an analytics identity without explicit opt-in" {
+    unset OPENJARVIS_ENABLE_ANALYTICS DO_NOT_TRACK OPENJARVIS_NO_ANALYTICS
+    run bash "$SCRIPT" --no-bg-orchestrator --minimal
+    [ "$status" -eq 0 ]
+    [ ! -e "$OPENJARVIS_HOME/anon_id" ]
+}
+
 @test "mark_done is idempotent — second mark of same key doesn't duplicate" {
     run bash "$SCRIPT" --no-bg-orchestrator
     [ "$status" -eq 0 ]

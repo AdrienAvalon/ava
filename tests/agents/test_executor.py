@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -73,8 +74,9 @@ class TestExecutorBasic:
         original_start = manager.start_tick
 
         def track_start(aid):
-            original_start(aid)
+            token = original_start(aid)
             statuses.append(manager.get_agent(aid)["status"])
+            return token
 
         manager.start_tick = track_start
 
@@ -127,6 +129,43 @@ class TestExecutorBasic:
 
         assert manager.get_agent(agent["id"])["status"] == "error"
 
+    def test_tick_claims_and_completes_exactly_one_queued_message(
+        self, executor, manager
+    ):
+        agent = manager.create_agent(name="paired", agent_type="monitor_operative")
+        first = manager.send_message(agent["id"], "first")
+        second = manager.send_message(agent["id"], "second")
+
+        with patch.object(
+            executor,
+            "_invoke_agent",
+            return_value=AgentResult(content="first answer"),
+        ):
+            executor.execute_tick(agent["id"])
+
+        messages = manager.list_messages(agent["id"])
+        by_id = {message["id"]: message for message in messages}
+        response = next(
+            message for message in messages if message["direction"] == "agent_to_user"
+        )
+        assert by_id[first["id"]]["status"] == "delivered"
+        assert by_id[second["id"]]["status"] == "pending"
+        assert response["reply_to_id"] == first["id"]
+
+    def test_failed_tick_terminally_fails_only_its_claim(self, executor, manager):
+        agent = manager.create_agent(name="failed", agent_type="monitor_operative")
+        first = manager.send_message(agent["id"], "first")
+        second = manager.send_message(agent["id"], "second")
+
+        with patch.object(executor, "_invoke_agent", side_effect=FatalError("boom")):
+            executor.execute_tick(agent["id"])
+
+        by_id = {
+            message["id"]: message for message in manager.list_messages(agent["id"])
+        }
+        assert by_id[first["id"]]["status"] == "failed"
+        assert by_id[second["id"]]["status"] == "pending"
+
     def test_execute_tick_concurrency_guard(self, executor, manager):
         agent = manager.create_agent(name="test", agent_type="monitor_operative")
         manager.start_tick(agent["id"])  # Simulate already running
@@ -150,16 +189,110 @@ def test_finalize_tick_reads_agent_result_metadata(tmp_path):
     executor = AgentExecutor(mgr, bus)
 
     agent = mgr.create_agent("budget-agent")
-    mgr.start_tick(agent["id"])
+    tick_token = mgr.start_tick(agent["id"])
 
     result = AgentResult(
         content="done",
         metadata={"tokens_used": 500, "cost": 0.05},
     )
-    executor._finalize_tick(agent["id"], result, error=None, duration=1.0)
+    executor._finalize_tick(
+        agent["id"], result, error=None, duration=1.0, tick_token=tick_token
+    )
 
     updated = mgr.get_agent(agent["id"])
     assert updated["total_tokens"] == 500
     assert updated["total_cost"] == 0.05
     assert updated["stall_retries"] == 0
     mgr.close()
+
+
+def test_http_tick_uses_common_identity_without_private_agent_state(
+    manager, event_bus, monkeypatch
+):
+    """Managed HTTP turns must not ingest or overwrite installation persona state."""
+    from openjarvis.agents import AgentRegistry
+    from openjarvis.agents.executor import AgentExecutor
+
+    captured = {}
+
+    class CapturingAgent:
+        accepts_tools = False
+
+        def __init__(self, engine, model, **kwargs):
+            captured["engine"] = engine
+            captured["model"] = model
+            captured["kwargs"] = kwargs
+
+        def run(self, input_text, context=None):
+            captured["input"] = input_text
+            captured["context"] = context
+            return AgentResult(content="public answer")
+
+    monkeypatch.setattr(AgentRegistry, "get", lambda _key: CapturingAgent)
+    engine = object()
+    trace_store = MagicMock()
+    executor = AgentExecutor(
+        manager=manager,
+        event_bus=event_bus,
+        trace_store=trace_store,
+    )
+    executor.set_system(
+        SimpleNamespace(
+            engine=engine,
+            model="fallback-model",
+            config=None,
+            http_boundary=True,
+            memory_backend=None,
+        )
+    )
+    agent = manager.create_agent(
+        name="http",
+        agent_type="capture",
+        config={
+            "temperature": 0.25,
+            "max_tokens": 321,
+            "max_turns": 4,
+        },
+    )
+    manager.update_summary_memory(agent["id"], "PRIVATE_LEGACY_CANARY")
+    claimed = manager.send_claimed_message(agent["id"], "question")
+
+    tick_token = manager.start_tick(agent["id"])
+    executor.execute_tick(
+        agent["id"],
+        lock_already_held=True,
+        tick_token=tick_token,
+        claimed_message=claimed,
+    )
+
+    assert captured["engine"] is engine
+    assert captured["kwargs"] == {
+        "bus": event_bus,
+        "temperature": 0.25,
+        "max_tokens": 321,
+        "max_turns": 4,
+    }
+    assert "PRIVATE_LEGACY_CANARY" not in captured["input"]
+    identity = captured["context"].metadata["server_identity_prompt"]
+    assert "Ava" in identity
+    assert manager.get_agent(agent["id"])["summary_memory"] == ("PRIVATE_LEGACY_CANARY")
+    trace = trace_store.save.call_args.args[0]
+    assert trace.query == "question"
+    assert "PRIVATE_LEGACY_CANARY" not in trace.query
+
+
+def test_claim_failure_releases_tick_as_error(manager, event_bus, monkeypatch):
+    from openjarvis.agents.executor import AgentExecutor
+
+    executor = AgentExecutor(manager=manager, event_bus=event_bus)
+    agent = manager.create_agent(name="claim-failure", agent_type="simple")
+    monkeypatch.setattr(
+        manager,
+        "claim_next_message",
+        lambda _agent_id: (_ for _ in ()).throw(RuntimeError("claim failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="claim failed"):
+        executor.execute_tick(agent["id"])
+
+    assert manager.get_agent(agent["id"])["status"] == "error"

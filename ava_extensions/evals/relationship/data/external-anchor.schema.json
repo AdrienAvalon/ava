@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ava:relationship:external-anchor:v1",
+  "title": "Ancrage externe des adjudications relationnelles Ava v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "anchor_id", "backend", "statement_sha256",
+    "human_adjudication_sha256", "independent_adjudication_sha256", "receipt_sha256",
+    "signing_key_id", "signing_key_sha256", "signature_base64",
+    "immutable", "outside_ava_process", "canonical_knowledge"
+  ],
+  "properties": {
+    "schema_version": {"const": "ava.relationship.external-anchor/v1"},
+    "anchor_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._:-]{2,127}$"},
+    "backend": {"type": "string", "minLength": 1},
+    "statement_sha256": {"$ref": "#/$defs/sha256"},
+    "human_adjudication_sha256": {"$ref": "#/$defs/sha256"},
+    "independent_adjudication_sha256": {"$ref": "#/$defs/sha256"},
+    "receipt_sha256": {"$ref": "#/$defs/sha256"},
+    "signing_key_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._:-]{2,127}$"},
+    "signing_key_sha256": {"$ref": "#/$defs/sha256"},
+    "signature_base64": {"type": "string", "pattern": "^[A-Za-z0-9_-]{86}$"},
+    "immutable": {"const": true},
+    "outside_ava_process": {"const": true},
+    "canonical_knowledge": {"const": false}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  }
+}

@@ -9,6 +9,11 @@ instructions.
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
+import pytest
+
+from openjarvis.agents._stubs import AgentContext
 from openjarvis.core.config import MemoryFilesConfig, SystemPromptConfig
 from openjarvis.prompt.builder import SystemPromptBuilder
 
@@ -94,3 +99,36 @@ class TestPersistentAgentsReceivePromptBuilder:
         agent = MonitorOperativeAgent(object(), "m")
         assert agent._prompt_builder is None
         assert agent._apply_persona("BASE") == "BASE"
+
+
+@pytest.mark.parametrize("agent_name", ["operative", "monitor_operative"])
+def test_identite_serveur_remplace_la_persona_legacy_pour_tous_les_agents(
+    agent_name: str,
+    tmp_path,
+) -> None:
+    if agent_name == "operative":
+        from openjarvis.agents.operative import OperativeAgent as Agent
+    else:
+        from openjarvis.agents.monitor_operative import MonitorOperativeAgent as Agent
+
+    engine = MagicMock()
+    engine.generate.return_value = {"content": "ok", "usage": {}}
+    agent = Agent(
+        engine,
+        "m",
+        system_prompt="SPECIALIZED_AGENT_PROTOCOL",
+        prompt_builder=_builder_with_soul(tmp_path, "PRIVATE_LEGACY_CANARY"),
+    )
+    context = AgentContext()
+    context.metadata["server_identity_prompt"] = "COMMON_AVA_IDENTITY"
+
+    agent.run("hello", context=context)
+
+    messages = engine.generate.call_args.args[0]
+    system_messages = [
+        message.content for message in messages if message.role.value == "system"
+    ]
+    assert len(system_messages) == 1
+    assert "COMMON_AVA_IDENTITY" in system_messages[0]
+    assert "SPECIALIZED_AGENT_PROTOCOL" in system_messages[0]
+    assert "PRIVATE_LEGACY_CANARY" not in system_messages[0]

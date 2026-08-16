@@ -287,6 +287,7 @@ def chat(
                 user_input,
                 content,
                 source="cli.chat",
+                allow_legacy_memory=False,
             )
         except KeyboardInterrupt:
             console.print("\n[dim]Generation interrupted.[/dim]")
