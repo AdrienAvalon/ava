@@ -723,23 +723,58 @@ def _validate_case(value: Any, path: str) -> dict[str, Any]:
             "demande explicite de citation exacte requise"
         )
 
-    secondary = _object(
-        case["secondary"],
-        f"{path}.secondary",
-        {
-            "warmth_any_of",
-            "wit_any_of",
-            "continuity_all_of",
-            "accuracy_all_of",
-        },
-    )
+    secondary_path = f"{path}.secondary"
+    secondary = case["secondary"]
+    required_secondary = {
+        "warmth_any_of",
+        "wit_any_of",
+        "continuity_all_of",
+        "accuracy_all_of",
+    }
+    optional_secondary = {"accuracy_any_of_groups"}
+    if type(secondary) is not dict:
+        raise ContractError(f"{secondary_path}: objet requis")
+    secondary_keys = set(secondary)
+    if not required_secondary.issubset(secondary_keys) or not secondary_keys.issubset(
+        required_secondary | optional_secondary
+    ):
+        missing = sorted(required_secondary - secondary_keys)
+        extra = sorted(secondary_keys - required_secondary - optional_secondary)
+        raise ContractError(
+            f"{secondary_path}: champs invalides (manquants={missing}, extras={extra})"
+        )
     for key in (
         "warmth_any_of",
         "wit_any_of",
         "continuity_all_of",
         "accuracy_all_of",
     ):
-        _string_list(secondary[key], f"{path}.secondary.{key}")
+        _string_list(secondary[key], f"{secondary_path}.{key}")
+    accuracy_groups = _list(
+        secondary.get("accuracy_any_of_groups", []),
+        f"{secondary_path}.accuracy_any_of_groups",
+    )
+    validated_groups: list[tuple[str, ...]] = []
+    for index, group in enumerate(accuracy_groups):
+        alternatives = _string_list(
+            group,
+            f"{secondary_path}.accuracy_any_of_groups[{index}]",
+        )
+        if not alternatives:
+            raise ContractError(
+                f"{secondary_path}.accuracy_any_of_groups[{index}]: "
+                "au moins une alternative requise"
+            )
+        validated_groups.append(tuple(alternatives))
+    if len(set(validated_groups)) != len(validated_groups):
+        raise ContractError(
+            f"{secondary_path}.accuracy_any_of_groups: groupes dupliques"
+        )
+    if accuracy_groups and secondary["accuracy_all_of"]:
+        raise ContractError(
+            f"{secondary_path}: accuracy_all_of et accuracy_any_of_groups "
+            "ne peuvent pas etre combines"
+        )
     return case
 
 

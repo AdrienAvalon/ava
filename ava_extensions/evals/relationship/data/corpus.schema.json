@@ -24,6 +24,16 @@
       "uniqueItems": true,
       "items": {"$ref": "#/$defs/nonEmptyString"}
     },
+    "stringGroups": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "array",
+        "minItems": 1,
+        "uniqueItems": true,
+        "items": {"$ref": "#/$defs/nonEmptyString"}
+      }
+    },
     "indexArray": {
       "type": "array",
       "uniqueItems": true,
@@ -95,7 +105,8 @@
             "warmth_any_of": {"$ref": "#/$defs/stringArray"},
             "wit_any_of": {"$ref": "#/$defs/stringArray"},
             "continuity_all_of": {"$ref": "#/$defs/stringArray"},
-            "accuracy_all_of": {"$ref": "#/$defs/stringArray"}
+            "accuracy_all_of": {"$ref": "#/$defs/stringArray"},
+            "accuracy_any_of_groups": {"$ref": "#/$defs/stringGroups"}
           }
         }
       }

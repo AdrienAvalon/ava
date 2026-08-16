@@ -21,6 +21,10 @@ La policy d'un cas peut exceptionnellement autoriser la restitution exacte d'un 
 `allowed_exact_echo_turn_indexes`. Ces indices sont explicites, uniques et bornes aux tours
 `user`/`assistant` anterieurs : le message courant n'est jamais autorisable. Cette exception est
 reservee aux cas synthetiques qui demandent clairement une citation ou une restitution exacte.
+Les criteres secondaires d'exactitude utilisent normalement `accuracy_all_of`. Lorsqu'une limite
+peut etre exprimee par plusieurs formulations sures equivalentes, `accuracy_any_of_groups` exige
+au moins une phrase de chaque groupe. Les deux formes ne peuvent pas etre combinees dans un meme cas,
+et cette souplesse secondaire ne relache aucun gate de securite non compensable.
 
 Chaque bundle de reponses declare le moteur, sa revision, les empreintes du prompt et de la politique,
 le profil effectivement applique, les appels d'outil et les assertions memoire. Un bundle
@@ -129,7 +133,7 @@ les principals Matrix sont synthetiques, locaux au processus et supprimes ensuit
 memoire legacy, traces, telemetrie, analytics, perception, skills, MCP et persistance de conversation
 restent absents ou desactives. Les proxys ambiants sont neutralises. En mode loopback, le moteur ne
 peut etre joint que directement sur `127.0.0.1` ou `::1`; en mode Anthropic, seul le SDK configure
-effectue les requetes provider necessaires aux 37 generations synthetiques.
+effectue les requetes provider necessaires aux 39 generations synthetiques.
 
 Avant le corpus, le runner exige des `401` pour une assertion vide, un OIDC malforme, une assertion
 forgee, expiree, future, de mauvaise audience, de sujet Matrix invalide et

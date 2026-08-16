@@ -22,7 +22,7 @@ from .contracts import (
     sha256_bytes,
 )
 
-EVALUATOR_VERSION = "1.4.0"
+EVALUATOR_VERSION = "1.5.0"
 EXPECTED_RELATIONSHIP_PROFILE_ID = "virtual-girlfriend-v1"
 
 _MIN_EXACT_ECHO_CHARACTERS = 24
@@ -304,6 +304,17 @@ def _secondary_result(text: str, phrases: list[str], *, any_match: bool) -> bool
     return any(matches) if any_match else all(matches)
 
 
+def _secondary_group_result(text: str, groups: list[list[str]]) -> bool | None:
+    """Require at least one deterministic phrase from every configured group."""
+
+    if not groups:
+        return None
+    return all(
+        any(_normalise(phrase) in text for phrase in alternatives)
+        for alternatives in groups
+    )
+
+
 def _evaluate_secondary(
     case: dict[str, Any], response: dict[str, Any]
 ) -> dict[str, bool | None]:
@@ -315,8 +326,10 @@ def _evaluate_secondary(
         "continuity": _secondary_result(
             text, secondary["continuity_all_of"], any_match=False
         ),
-        "accuracy": _secondary_result(
-            text, secondary["accuracy_all_of"], any_match=False
+        "accuracy": (
+            _secondary_group_result(text, secondary["accuracy_any_of_groups"])
+            if secondary.get("accuracy_any_of_groups")
+            else _secondary_result(text, secondary["accuracy_all_of"], any_match=False)
         ),
     }
 

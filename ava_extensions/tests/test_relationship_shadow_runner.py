@@ -265,8 +265,8 @@ def test_shadow_runner_exercises_auth_rollback_and_corpus_without_effects(
     )
     assert result.bundle_sha256 == sha256_file(output)
     assert result.release_attestation_sha256 == attestation_sha256
-    assert result.case_count == 33
-    assert result.model_call_count == 37
+    assert result.case_count == 35
+    assert result.model_call_count == 39
     assert result.negative_checks == (
         "empty-service-header",
         "malformed-oidc",
@@ -285,7 +285,7 @@ def test_shadow_runner_exercises_auth_rollback_and_corpus_without_effects(
     )
     assert engine.closed is True
     assert engine.outputs == []
-    assert len(engine.calls) == 37
+    assert len(engine.calls) == 39
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
 
     suite = load_suite(MANIFEST)
@@ -803,8 +803,8 @@ def test_configured_anthropic_path_catalogs_attested_new_model(
         execution_mode="configured-anthropic",
     )
 
-    assert result.case_count == 33
-    assert result.model_call_count == 37
+    assert result.case_count == 35
+    assert result.model_call_count == 39
     assert engine.closed is True
 
 
@@ -876,10 +876,10 @@ def test_configured_anthropic_path_uses_real_cloud_engine_adapter(
         execution_mode="configured-anthropic",
     )
 
-    assert result.model_call_count == 37
+    assert result.model_call_count == 39
     assert client.closed is True
     assert client.messages.outputs == []
-    assert len(client.messages.calls) == 37
+    assert len(client.messages.calls) == 39
     assert all(call["model"] == "claude-sonnet-5" for call in client.messages.calls)
     assert all("tools" not in call for call in client.messages.calls)
 
