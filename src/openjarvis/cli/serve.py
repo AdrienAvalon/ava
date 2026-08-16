@@ -287,8 +287,6 @@ def serve(
             if AgentRegistry.contains(agent_key):
                 agent_cls = AgentRegistry.get(agent_key)
                 agent_kwargs = {"bus": bus}
-                if sec.capability_policy is not None:
-                    agent_kwargs["capability_policy"] = sec.capability_policy
 
                 # MCP transports persisted on the agent at the bottom of
                 # this block — initialise here so the reference is valid
@@ -353,6 +351,18 @@ def serve(
                     agent_kwargs["max_turns"] = config.agent.max_turns
 
                 agent = agent_cls(engine, model_name, **agent_kwargs)
+                from openjarvis.agents._stubs import (
+                    configure_tool_execution_security,
+                )
+
+                configure_tool_execution_security(
+                    agent,
+                    capability_policy=sec.capability_policy,
+                    boundary_guard=getattr(sec, "boundary_guard", None),
+                    # Per-request copies receive verified Principal provenance
+                    # at the HTTP boundary; the shared instance must not invent it.
+                    principal_provenance=None,
+                )
                 # Pin MCP transports to the agent's lifetime so HTTP
                 # connections don't close mid-request (#461).
                 if mcp_clients:
@@ -443,6 +453,8 @@ def serve(
             model=model_name,
             agent_name=channel_agent,
             tools=_channel_tools,
+            capability_policy=sec.capability_policy,
+            boundary_guard=getattr(sec, "boundary_guard", None),
         )
         _wire_system.wire_channel(channel_bridge)
 
@@ -561,7 +573,14 @@ def serve(
                     logger.debug("Scheduler session store init failed: %s", exc)
 
             _sched_tool_executor = (
-                ToolExecutor(resolved_tools, bus) if resolved_tools else None
+                ToolExecutor(
+                    resolved_tools,
+                    bus,
+                    capability_policy=sec.capability_policy,
+                    boundary_guard=getattr(sec, "boundary_guard", None),
+                )
+                if resolved_tools
+                else None
             )
 
             system = JarvisSystem(
@@ -579,6 +598,7 @@ def serve(
                 trace_store=_trace_store,
                 session_store=_sched_session_store,
                 capability_policy=sec.capability_policy,
+                boundary_guard=getattr(sec, "boundary_guard", None),
                 agent_manager=agent_manager,
                 agent_executor=executor,
             )
@@ -590,6 +610,14 @@ def serve(
                 event_bus=bus,
             )
             for ag in agent_manager.list_agents():
+                owner_provenance = ag.get("owner_provenance")
+                if not (isinstance(owner_provenance, str) and owner_provenance.strip()):
+                    logger.warning(
+                        "Skipping automatic registration for legacy agent %s "
+                        "without owner provenance",
+                        ag.get("id", "unknown"),
+                    )
+                    continue
                 sched_type = ag.get("config", {}).get("schedule_type", "manual")
                 if sched_type in ("cron", "interval") and ag["status"] not in (
                     "archived",

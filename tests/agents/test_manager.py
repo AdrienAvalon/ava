@@ -525,6 +525,61 @@ def test_learning_log_crud(tmp_path):
 
 
 class TestSchemaAndThreading:
+    def test_legacy_agents_gain_nullable_owner_without_implicit_claim(self, tmp_path):
+        import sqlite3
+
+        from openjarvis.agents.manager import AgentManager
+
+        database = tmp_path / "legacy-agents.db"
+        connection = sqlite3.connect(database)
+        connection.execute(
+            "CREATE TABLE managed_agents ("
+            "id TEXT PRIMARY KEY, name TEXT NOT NULL,"
+            "agent_type TEXT NOT NULL DEFAULT 'monitor_operative',"
+            "config_json TEXT NOT NULL DEFAULT '{}',"
+            "status TEXT NOT NULL DEFAULT 'idle', tick_token TEXT,"
+            "summary_memory TEXT NOT NULL DEFAULT '',"
+            "created_at REAL NOT NULL, updated_at REAL NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO managed_agents"
+            " (id, name, agent_type, config_json, status, summary_memory,"
+            " created_at, updated_at) VALUES"
+            " ('legacy-agent', 'legacy', 'simple', '{}', 'idle', '', 1, 1)"
+        )
+        connection.commit()
+        connection.close()
+
+        migrated = AgentManager(str(database))
+        columns = {
+            row[1]
+            for row in migrated._conn.execute("PRAGMA table_info(managed_agents)")
+        }
+        indexes = {
+            row[1]
+            for row in migrated._conn.execute("PRAGMA index_list(managed_agents)")
+        }
+        legacy = migrated.get_agent("legacy-agent")
+        owner = "principal:oidc:sha256:" + ("a" * 64)
+        owned = migrated.create_agent(
+            "owned",
+            agent_type="simple",
+            owner_provenance=owner,
+        )
+
+        assert "owner_provenance" in columns
+        assert "idx_managed_agents_owner" in indexes
+        assert legacy is not None
+        assert legacy["owner_provenance"] is None
+        assert migrated.get_agent_for_owner("legacy-agent", owner) is None
+        assert [a["id"] for a in migrated.list_agents_for_owner(owner)] == [owned["id"]]
+        migrated.close()
+
+        reopened = AgentManager(str(database))
+        assert reopened.get_agent("legacy-agent")["owner_provenance"] is None
+        assert [a["id"] for a in reopened.list_agents_for_owner(owner)] == [owned["id"]]
+        reopened.close()
+
     def test_legacy_message_schema_is_migrated_before_reply_index(self, tmp_path):
         import sqlite3
 

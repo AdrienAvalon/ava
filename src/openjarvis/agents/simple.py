@@ -25,11 +25,14 @@ class SimpleAgent(BaseAgent):
 
         messages = self._build_messages(input, context)
         result = self._generate(messages)
-        content = result.get("content", "")
+        content = self._check_continuation(result, messages)
 
         self._emit_turn_end(content_length=len(content))
 
-        return AgentResult(content=content, turns=1)
+        usage = result.get("usage")
+        metadata = dict(usage) if isinstance(usage, dict) else {}
+        metadata["finish_reason"] = result.get("finish_reason")
+        return AgentResult(content=content, turns=1, metadata=metadata)
 
 
 __all__ = ["SimpleAgent"]

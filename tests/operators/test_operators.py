@@ -26,10 +26,30 @@ class FakeEngine:
     def generate(self, messages, **kwargs):
         self.calls.append({"messages": messages, **kwargs})
         if self._call_idx < len(self._responses):
-            resp = self._responses[self._call_idx]
+            resp = dict(self._responses[self._call_idx])
             self._call_idx += 1
+            resp.setdefault(
+                "finish_reason",
+                "tool_calls" if resp.get("tool_calls") else "stop",
+            )
+            resp.setdefault(
+                "usage",
+                {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                },
+            )
             return resp
-        return {"content": "Fallback."}
+        return {
+            "content": "Fallback.",
+            "finish_reason": "stop",
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+            },
+        }
 
     def list_models(self):
         return ["test-model"]
@@ -512,11 +532,41 @@ class TestOperativeAgent:
         result = agent.run("Execute tick")
 
         assert result.content == "Response with prompt."
+        assert result.metadata["finish_reason"] == "stop"
         # Check system prompt was in messages
         call = engine.calls[0]
         messages = call["messages"]
         assert any(
             m.role.value == "system" and "test operator" in m.content for m in messages
+        )
+
+    @pytest.mark.parametrize("finish_reason", ["length", "max_tokens", None])
+    def test_incomplete_native_tool_call_is_not_executed(self, finish_reason):
+        from openjarvis.agents.operative import OperativeAgent
+
+        engine = FakeEngine(
+            [
+                {
+                    "content": "partial",
+                    "finish_reason": finish_reason,
+                    "tool_calls": [
+                        {
+                            "id": "partial",
+                            "name": "think",
+                            "arguments": '{"thought":"partial"}',
+                        }
+                    ],
+                }
+            ]
+        )
+        agent = OperativeAgent(engine, "test-model")
+        agent._executor.execute = MagicMock()
+
+        result = agent.run("Do not execute")
+
+        agent._executor.execute.assert_not_called()
+        assert result.metadata["finish_reason"] == (
+            "length" if finish_reason == "max_tokens" else finish_reason
         )
 
     def test_run_loads_session(self):

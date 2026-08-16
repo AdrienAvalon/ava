@@ -42,6 +42,7 @@ def _serialized_database(method):
 _CREATE_AGENTS = """\
 CREATE TABLE IF NOT EXISTS managed_agents (
     id              TEXT PRIMARY KEY,
+    owner_provenance TEXT,
     name            TEXT NOT NULL,
     agent_type      TEXT NOT NULL DEFAULT 'monitor_operative',
     config_json     TEXT NOT NULL DEFAULT '{}',
@@ -149,6 +150,9 @@ class AgentManager:
             "ALTER TABLE managed_agents ADD COLUMN input_tokens INTEGER DEFAULT 0",
             "ALTER TABLE managed_agents ADD COLUMN output_tokens INTEGER DEFAULT 0",
             "ALTER TABLE managed_agents ADD COLUMN tick_token TEXT",
+            # Ava HTTP ownership.  Legacy rows deliberately remain NULL: no
+            # identity can claim them implicitly after the migration.
+            "ALTER TABLE managed_agents ADD COLUMN owner_provenance TEXT",
             # JSON-encoded array of {tool, arguments, result, success, latency}
             "ALTER TABLE agent_messages ADD COLUMN tool_calls TEXT",
             # Exact user-message linkage for concurrent streaming turns.
@@ -163,6 +167,10 @@ class AgentManager:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_messages_reply"
             " ON agent_messages(agent_id, reply_to_id)"
             " WHERE direction = 'agent_to_user' AND reply_to_id IS NOT NULL"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_managed_agents_owner"
+            " ON managed_agents(owner_provenance, status, updated_at DESC)"
         )
         self._conn.commit()
         # Only the authoritative long-running process (the API server, which
@@ -227,6 +235,8 @@ class AgentManager:
         name: str,
         agent_type: str = "monitor_operative",
         config: Optional[Dict[str, Any]] = None,
+        *,
+        owner_provenance: str | None = None,
     ) -> Dict[str, Any]:
         agent_id = uuid.uuid4().hex[:12]
         now = time.time()
@@ -243,10 +253,18 @@ class AgentManager:
         config_json = json.dumps(config)
         self._conn.execute(
             "INSERT INTO managed_agents"
-            " (id, name, agent_type, config_json,"
+            " (id, owner_provenance, name, agent_type, config_json,"
             " status, summary_memory, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, 'idle', '', ?, ?)",
-            (agent_id, name, agent_type, config_json, now, now),
+            " VALUES (?, ?, ?, ?, ?, 'idle', '', ?, ?)",
+            (
+                agent_id,
+                owner_provenance,
+                name,
+                agent_type,
+                config_json,
+                now,
+                now,
+            ),
         )
         self._conn.commit()
         return self.get_agent(agent_id)  # type: ignore[return-value]
@@ -261,9 +279,48 @@ class AgentManager:
         return [self._row_to_agent(r) for r in rows]
 
     @_serialized_database
+    def list_agents_for_owner(
+        self,
+        owner_provenance: str,
+        include_archived: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Return only agents owned by one already-verified principal.
+
+        SQL equality intentionally excludes legacy ``NULL`` owners.  An empty
+        or otherwise missing provenance also returns nothing instead of
+        broadening the query to legacy/global rows.
+        """
+
+        if not isinstance(owner_provenance, str) or not owner_provenance:
+            return []
+        query = "SELECT * FROM managed_agents WHERE owner_provenance = ?"
+        params: list[Any] = [owner_provenance]
+        if not include_archived:
+            query += " AND status != 'archived'"
+        query += " ORDER BY updated_at DESC"
+        rows = self._conn.execute(query, params).fetchall()
+        return [self._row_to_agent(r) for r in rows]
+
+    @_serialized_database
     def get_agent(self, agent_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
             "SELECT * FROM managed_agents WHERE id = ?", (agent_id,)
+        ).fetchone()
+        return self._row_to_agent(row) if row else None
+
+    @_serialized_database
+    def get_agent_for_owner(
+        self,
+        agent_id: str,
+        owner_provenance: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve an agent only inside one verified ownership scope."""
+
+        if not isinstance(owner_provenance, str) or not owner_provenance:
+            return None
+        row = self._conn.execute(
+            "SELECT * FROM managed_agents WHERE id = ? AND owner_provenance = ?",
+            (agent_id, owner_provenance),
         ).fetchone()
         return self._row_to_agent(row) if row else None
 
@@ -757,7 +814,12 @@ class AgentManager:
 
     @_serialized_database
     def create_from_template(
-        self, template_id: str, name: str, overrides: Optional[Dict[str, Any]] = None
+        self,
+        template_id: str,
+        name: str,
+        overrides: Optional[Dict[str, Any]] = None,
+        *,
+        owner_provenance: str | None = None,
     ) -> Dict[str, Any]:
         """Create an agent from a template with optional overrides."""
         templates = self.list_templates()
@@ -778,7 +840,12 @@ class AgentManager:
                 instruction=instruction or "(No specific instruction provided)",
             )
 
-        return self.create_agent(name=name, agent_type=agent_type, config=config)
+        return self.create_agent(
+            name=name,
+            agent_type=agent_type,
+            config=config,
+            owner_provenance=owner_provenance,
+        )
 
     # ── Message queue ─────────────────────────────────────────────
 
@@ -1184,6 +1251,7 @@ class AgentManager:
         config_raw = row["config_json"]
         return {
             "id": row["id"],
+            "owner_provenance": row["owner_provenance"],
             "name": row["name"],
             "agent_type": row["agent_type"],
             "config": json.loads(config_raw) if config_raw else {},

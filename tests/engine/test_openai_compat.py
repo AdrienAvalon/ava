@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -106,6 +108,73 @@ class TestOpenAICompatGenerate:
                 engine.generate(
                     [Message(role=Role.USER, content="Hi")], model="qwen3:8b"
                 )
+
+
+@pytest.mark.parametrize(
+    ("finish_reason", "include_reason", "expected"),
+    [
+        ("stop", True, "stop"),
+        ("length", True, "length"),
+        (None, True, None),
+        (None, False, None),
+    ],
+)
+def test_generate_preserves_openai_compatible_terminal(
+    engine: VLLMEngine,
+    finish_reason,
+    include_reason: bool,
+    expected,
+) -> None:
+    choice = {"message": {"content": "partial"}}
+    if include_reason:
+        choice["finish_reason"] = finish_reason
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [choice], "usage": {}, "model": "test"},
+            request=request,
+        )
+
+    engine._client.close()
+    engine._client = httpx.Client(
+        base_url="http://testhost:8000",
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = engine.generate(
+        [Message(role=Role.USER, content="Hi")],
+        model="test",
+    )
+
+    assert result["finish_reason"] == expected
+
+
+@pytest.mark.asyncio
+async def test_stream_full_rejects_malformed_frame_before_stop(
+    engine: VLLMEngine,
+) -> None:
+    body = "\n".join(
+        [
+            'data: {"choices":[{"delta":{"content":"lost"}}]',
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=body, request=request)
+
+    engine._async_transport = httpx.MockTransport(handler)
+
+    with pytest.raises(json.JSONDecodeError):
+        _ = [
+            chunk
+            async for chunk in engine.stream_full(
+                [Message(role=Role.USER, content="Hi")],
+                model="test",
+            )
+        ]
 
 
 @requires_respx

@@ -211,3 +211,54 @@ def test_executor_receives_required_system_attrs(tmp_path, monkeypatch):
     assert system.engine is not None
     assert system.model == "test-model"
     assert system.config is not None
+
+
+def test_scheduler_registers_only_agents_with_owner_provenance(tmp_path, monkeypatch):
+    """Legacy/global rows must never resume automatic execution on boot."""
+    _repopulate_registries()
+
+    from openjarvis.agents.manager import AgentManager
+    from openjarvis.agents.scheduler import AgentScheduler
+
+    manager = AgentManager(db_path=str(tmp_path / "agents.db"))
+    legacy = manager.create_agent(
+        name="legacy",
+        config={"schedule_type": "interval", "schedule_value": 60},
+    )
+    blank_owner = manager.create_agent(
+        name="blank-owner",
+        config={"schedule_type": "cron", "schedule_value": "0 9 * * *"},
+        owner_provenance="   ",
+    )
+    owned_interval = manager.create_agent(
+        name="owned-interval",
+        config={"schedule_type": "interval", "schedule_value": 60},
+        owner_provenance="oidc:principal-a",
+    )
+    owned_manual = manager.create_agent(
+        name="owned-manual",
+        config={"schedule_type": "manual"},
+        owner_provenance="oidc:principal-a",
+    )
+    manager.close()
+
+    registered: list[str] = []
+    monkeypatch.setattr(
+        AgentScheduler,
+        "register_agent",
+        lambda _self, agent_id: registered.append(agent_id),
+    )
+    monkeypatch.setattr(AgentScheduler, "start", lambda _self: None)
+
+    result = _run_serve(
+        tmp_path,
+        monkeypatch,
+        build_spy=MagicMock(),
+        set_system_spy=MagicMock(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert registered == [owned_interval["id"]]
+    assert legacy["id"] not in registered
+    assert blank_owner["id"] not in registered
+    assert owned_manual["id"] not in registered

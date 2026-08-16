@@ -128,11 +128,28 @@ _MANAGED_AGENT_MAX_TURNS = 50
 _MANAGED_HISTORY_TURNS = 25
 
 
-def _managed_runtime_values(config: Dict[str, Any]) -> Tuple[float, int, int]:
-    """Validate bounded sampler values before any managed-agent effect."""
+def _managed_runtime_values(
+    config: Dict[str, Any],
+    *,
+    server_config: Any = None,
+) -> Tuple[float, int, int]:
+    """Resolve and validate bounded sampler values before any agent effect.
+
+    A managed-agent ``max_tokens`` is an optional, explicit override.  When
+    absent, resolve the current server intelligence limit without copying it
+    into the durable user-owned agent configuration.
+    """
 
     temperature = config.get("temperature", 0.7)
-    max_tokens = config.get("max_tokens", 1024)
+    if "max_tokens" in config:
+        max_tokens = config["max_tokens"]
+    else:
+        if server_config is None:
+            from openjarvis.core.config import load_config
+
+            server_config = load_config()
+        intelligence = getattr(server_config, "intelligence", None)
+        max_tokens = getattr(intelligence, "max_tokens", None)
     max_turns = config.get("max_turns", 10)
     max_total_tokens = config.get("max_total_tokens", 0)
     if (
@@ -236,6 +253,58 @@ def _trace_has_disallowed_managed_tool(trace: Any) -> bool:
         if name not in _MANAGED_AGENT_ALLOWED_TOOL_NAMES:
             return True
     return False
+
+
+def _require_managed_owner(request: Request) -> str:
+    """Return the pseudonymous owner established at Ava's trust boundary.
+
+    Managed agents are durable and may contain private instructions, messages,
+    state and traces.  Unlike the common chat persona, no anonymous mode is
+    meaningful here: an absent, invalid or ambiguous credential therefore
+    fails closed before any database lookup or side effect.
+    """
+
+    from ava_extensions.server.principal import resolve_request_principal
+
+    principal = resolve_request_principal(request.headers)
+    if principal is None:
+        raise HTTPException(status_code=401, detail="Verified principal required")
+    provenance = principal.provenance
+    if not provenance:
+        raise HTTPException(status_code=401, detail="Verified principal required")
+    return provenance
+
+
+def _require_owned_agent(
+    manager: AgentManager,
+    request: Request,
+    agent_id: str,
+) -> tuple[str, dict[str, Any]]:
+    """Resolve one agent without revealing another principal's identifier."""
+
+    owner_provenance = _require_managed_owner(request)
+    agent = manager.get_agent_for_owner(agent_id, owner_provenance)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return owner_provenance, agent
+
+
+_MANAGED_RUNTIME_CHANNEL_TYPES = frozenset({"imessage", "sendblue", "slack", "twilio"})
+_MANAGED_RUNTIME_CHANNEL_ERROR = "Channel binding is unavailable"
+
+
+def _reject_managed_runtime_channel(channel_type: Any) -> None:
+    """Block principal-owned bindings backed by process-global runtimes.
+
+    The managed-agent rows are owner-scoped, but these channel daemons and the
+    SendBlue webhook bridge are still singletons.  Until runtime instances are
+    mapped to a verified owner, HTTP must never replace or stop another
+    principal's process-global channel as a side effect of binding mutation.
+    """
+
+    normalized = channel_type.strip().lower() if isinstance(channel_type, str) else ""
+    if normalized in _MANAGED_RUNTIME_CHANNEL_TYPES:
+        raise HTTPException(status_code=409, detail=_MANAGED_RUNTIME_CHANNEL_ERROR)
 
 
 def _resolve_memory_backend(config: Any) -> Any:
@@ -1095,7 +1164,6 @@ async def _stream_managed_agent(
         or getattr(engine, "_model", "")
     )
     system_prompt = config.get("system_prompt")
-    temperature, max_tokens, max_turns = _managed_runtime_values(config)
 
     # Build conversation messages from history + current input
     llm_messages: List[Message] = []
@@ -1107,6 +1175,11 @@ async def _stream_managed_agent(
         from openjarvis.core.config import load_config
 
         app_config = load_config()
+
+    temperature, max_tokens, max_turns = _managed_runtime_values(
+        config,
+        server_config=app_config,
+    )
 
     final_system_prompt = _build_managed_system_prompt(system_prompt or "", app_config)
 
@@ -1147,7 +1220,10 @@ async def _stream_managed_agent(
                 import threading
                 import time as _dr_time
 
-                from openjarvis.agents._stubs import AgentContext
+                from openjarvis.agents._stubs import (
+                    AgentContext,
+                    normalize_finish_reason,
+                )
                 from openjarvis.agents.deep_research import DeepResearchAgent
 
                 progress_q: queue.Queue = queue.Queue()
@@ -1267,15 +1343,38 @@ async def _stream_managed_agent(
                     terminal_status = "error"
                     try:
                         result = dr_agent.run(user_content, context=dr_context)
-                        content = result.content or "No results found."
-                        agent_metadata = result.metadata or {}
-                        manager.complete_message_turn(
-                            agent_id,
-                            message_id,
-                            content,
-                            tool_calls=dr_tool_calls or None,
+                        content = result.content or ""
+                        agent_metadata = dict(result.metadata or {})
+                        finish_reason = normalize_finish_reason(
+                            agent_metadata.get("finish_reason")
                         )
-                        terminal_status = "idle"
+                        agent_metadata["finish_reason"] = finish_reason
+                        is_complete = bool(
+                            content.strip()
+                            and finish_reason == "stop"
+                            and not agent_metadata.get("max_turns_exceeded", False)
+                            and not agent_metadata.get("incomplete_tool_call", False)
+                        )
+                        if is_complete:
+                            manager.complete_message_turn(
+                                agent_id,
+                                message_id,
+                                content,
+                                tool_calls=dr_tool_calls or None,
+                            )
+                            terminal_status = "idle"
+                        else:
+                            manager.mark_message_failed(message_id)
+                            logger.warning(
+                                "Deep-research managed turn incomplete: "
+                                "finish_reason=%r max_turns_exceeded=%s "
+                                "incomplete_tool_call=%s content_len=%d",
+                                finish_reason,
+                                bool(agent_metadata.get("max_turns_exceeded", False)),
+                                bool(agent_metadata.get("incomplete_tool_call", False)),
+                                len(content),
+                            )
+                            content = "Error: managed deep-research response incomplete"
                     except Exception:
                         manager.mark_message_failed(message_id)
                         logger.error(
@@ -1288,7 +1387,7 @@ async def _stream_managed_agent(
 
                     # Log BEFORE queue put (put triggers SSE end)
                     try:
-                        is_err = content.startswith("Error:")
+                        is_err = terminal_status != "idle"
                         manager.add_learning_log(
                             agent_id,
                             "query_error" if is_err else "query_complete",
@@ -1312,7 +1411,7 @@ async def _stream_managed_agent(
                     )
                     progress_q.put(
                         {
-                            "type": "error" if content.startswith("Error:") else "done",
+                            "type": "error" if terminal_status != "idle" else "done",
                             "content": content,
                             "metadata": agent_metadata,
                             "elapsed": elapsed,
@@ -1421,7 +1520,8 @@ async def _stream_managed_agent(
                         word_count = len(words)
                         speed = round(word_count / elapsed_s) if elapsed_s > 0 else 0
 
-                        # Final chunk with usage + telemetry
+                        # Final chunk with the verified terminal reason. The
+                        # worker only emits a ``done`` event for exact ``stop``.
                         finish_data = {
                             "id": chunk_id,
                             "object": "chat.completion.chunk",
@@ -1430,7 +1530,7 @@ async def _stream_managed_agent(
                                 {
                                     "index": 0,
                                     "delta": {},
-                                    "finish_reason": "stop",
+                                    "finish_reason": meta.get("finish_reason"),
                                 }
                             ],
                             "usage": {
@@ -1919,11 +2019,13 @@ def create_agent_manager_router(
     # ── Agent lifecycle ──────────────────────────────────────
 
     @agents_router.get("")
-    async def list_agents():
-        return {"agents": manager.list_agents()}
+    async def list_agents(request: Request):
+        owner_provenance = _require_managed_owner(request)
+        return {"agents": manager.list_agents_for_owner(owner_provenance)}
 
     @agents_router.post("")
     async def create_agent(req: CreateAgentRequest, request: Request):
+        owner_provenance = _require_managed_owner(request)
         effective_config = dict(req.config or {})
         if req.template_id:
             template = next(
@@ -1943,17 +2045,26 @@ def create_agent_manager_router(
             }
             effective_config.update(req.config or {})
         try:
-            _managed_runtime_values(effective_config)
+            _managed_runtime_values(
+                effective_config,
+                server_config=getattr(request.app.state, "config", None),
+            )
             _validate_managed_tool_config(effective_config)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if req.template_id:
             agent = manager.create_from_template(
-                req.template_id, req.name, overrides=req.config
+                req.template_id,
+                req.name,
+                overrides=req.config,
+                owner_provenance=owner_provenance,
             )
         else:
             agent = manager.create_agent(
-                name=req.name, agent_type=req.agent_type, config=req.config
+                name=req.name,
+                agent_type=req.agent_type,
+                config=req.config,
+                owner_provenance=owner_provenance,
             )
 
         # Register with scheduler if cron/interval
@@ -1965,16 +2076,17 @@ def create_agent_manager_router(
         return agent
 
     @agents_router.get("/{agent_id}")
-    async def get_agent(agent_id: str):
-        agent = manager.get_agent(agent_id)
-        if not agent:
-            raise HTTPException(status_code=404, detail="Agent not found")
+    async def get_agent(agent_id: str, request: Request):
+        _owner_provenance, agent = _require_owned_agent(manager, request, agent_id)
         return agent
 
     @agents_router.patch("/{agent_id}")
-    async def update_agent(agent_id: str, req: UpdateAgentRequest):
-        if not manager.get_agent(agent_id):
-            raise HTTPException(status_code=404, detail="Agent not found")
+    async def update_agent(
+        agent_id: str,
+        req: UpdateAgentRequest,
+        request: Request,
+    ):
+        _require_owned_agent(manager, request, agent_id)
         kwargs: Dict[str, Any] = {}
         if req.name is not None:
             kwargs["name"] = req.name
@@ -1982,7 +2094,10 @@ def create_agent_manager_router(
             kwargs["agent_type"] = req.agent_type
         if req.config is not None:
             try:
-                _managed_runtime_values(req.config)
+                _managed_runtime_values(
+                    req.config,
+                    server_config=getattr(request.app.state, "config", None),
+                )
                 _validate_managed_tool_config(req.config)
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -1990,9 +2105,8 @@ def create_agent_manager_router(
         return manager.update_agent(agent_id, **kwargs)
 
     @agents_router.delete("/{agent_id}")
-    async def delete_agent(agent_id: str):
-        if not manager.get_agent(agent_id):
-            raise HTTPException(status_code=404, detail="Agent not found")
+    async def delete_agent(agent_id: str, request: Request):
+        _require_owned_agent(manager, request, agent_id)
         try:
             manager.delete_agent(agent_id)
         except ValueError as exc:
@@ -2000,9 +2114,8 @@ def create_agent_manager_router(
         return {"status": "archived"}
 
     @agents_router.post("/{agent_id}/pause")
-    async def pause_agent(agent_id: str):
-        if not manager.get_agent(agent_id):
-            raise HTTPException(status_code=404, detail="Agent not found")
+    async def pause_agent(agent_id: str, request: Request):
+        _require_owned_agent(manager, request, agent_id)
         try:
             manager.pause_agent(agent_id)
         except ValueError as exc:
@@ -2010,9 +2123,8 @@ def create_agent_manager_router(
         return {"status": "paused"}
 
     @agents_router.post("/{agent_id}/resume")
-    async def resume_agent(agent_id: str):
-        if not manager.get_agent(agent_id):
-            raise HTTPException(status_code=404, detail="Agent not found")
+    async def resume_agent(agent_id: str, request: Request):
+        _require_owned_agent(manager, request, agent_id)
         try:
             manager.resume_agent(agent_id)
         except ValueError as exc:
@@ -2023,9 +2135,7 @@ def create_agent_manager_router(
     async def run_agent(agent_id: str, request: Request):
         import threading
 
-        agent = manager.get_agent(agent_id)
-        if not agent:
-            raise HTTPException(status_code=404, detail="Agent not found")
+        _owner_provenance, agent = _require_owned_agent(manager, request, agent_id)
         # Acquire tick BEFORE spawning thread — prevents race
         try:
             tick_token = manager.start_tick(agent_id)
@@ -2088,9 +2198,8 @@ def create_agent_manager_router(
     # ── Recover ──────────────────────────────────────────────
 
     @agents_router.post("/{agent_id}/recover")
-    def recover_agent(agent_id: str):
-        if not manager.get_agent(agent_id):
-            raise HTTPException(status_code=404, detail="Agent not found")
+    def recover_agent(agent_id: str, request: Request):
+        _require_owned_agent(manager, request, agent_id)
         try:
             checkpoint = manager.recover_agent(agent_id)
         except ValueError as exc:
@@ -2100,24 +2209,42 @@ def create_agent_manager_router(
     # ── Tasks ────────────────────────────────────────────────
 
     @agents_router.get("/{agent_id}/tasks")
-    async def list_tasks(agent_id: str, status: Optional[str] = None):
+    async def list_tasks(
+        agent_id: str,
+        request: Request,
+        status: Optional[str] = None,
+    ):
+        _require_owned_agent(manager, request, agent_id)
         return {"tasks": manager.list_tasks(agent_id, status=status)}
 
     @agents_router.post("/{agent_id}/tasks")
-    async def create_task(agent_id: str, req: CreateTaskRequest):
-        if not manager.get_agent(agent_id):
-            raise HTTPException(status_code=404, detail="Agent not found")
+    async def create_task(
+        agent_id: str,
+        req: CreateTaskRequest,
+        request: Request,
+    ):
+        _require_owned_agent(manager, request, agent_id)
         return manager.create_task(agent_id, description=req.description)
 
     @agents_router.get("/{agent_id}/tasks/{task_id}")
-    async def get_task(agent_id: str, task_id: str):
+    async def get_task(agent_id: str, task_id: str, request: Request):
+        _require_owned_agent(manager, request, agent_id)
         task = manager._get_task(task_id)
-        if not task:
+        if not task or task["agent_id"] != agent_id:
             raise HTTPException(status_code=404, detail="Task not found")
         return task
 
     @agents_router.patch("/{agent_id}/tasks/{task_id}")
-    async def update_task(agent_id: str, task_id: str, req: UpdateTaskRequest):
+    async def update_task(
+        agent_id: str,
+        task_id: str,
+        req: UpdateTaskRequest,
+        request: Request,
+    ):
+        _require_owned_agent(manager, request, agent_id)
+        task = manager._get_task(task_id)
+        if not task or task["agent_id"] != agent_id:
+            raise HTTPException(status_code=404, detail="Task not found")
         kwargs: Dict[str, Any] = {}
         if req.description is not None:
             kwargs["description"] = req.description
@@ -2130,14 +2257,19 @@ def create_agent_manager_router(
         return manager.update_task(task_id, **kwargs)
 
     @agents_router.delete("/{agent_id}/tasks/{task_id}")
-    async def delete_task(agent_id: str, task_id: str):
+    async def delete_task(agent_id: str, task_id: str, request: Request):
+        _require_owned_agent(manager, request, agent_id)
+        task = manager._get_task(task_id)
+        if not task or task["agent_id"] != agent_id:
+            raise HTTPException(status_code=404, detail="Task not found")
         manager.delete_task(task_id)
         return {"status": "deleted"}
 
     # ── Channel bindings ─────────────────────────────────────
 
     @agents_router.get("/{agent_id}/channels")
-    async def list_channels(agent_id: str):
+    async def list_channels(agent_id: str, request: Request):
+        _require_owned_agent(manager, request, agent_id)
         return {"bindings": manager.list_channel_bindings(agent_id)}
 
     @agents_router.post("/{agent_id}/channels")
@@ -2146,8 +2278,8 @@ def create_agent_manager_router(
         req: BindChannelRequest,
         request: Request,
     ):
-        if not manager.get_agent(agent_id):
-            raise HTTPException(status_code=404, detail="Agent not found")
+        _require_owned_agent(manager, request, agent_id)
+        _reject_managed_runtime_channel(req.channel_type)
         binding = manager.bind_channel(
             agent_id,
             channel_type=req.channel_type,
@@ -2338,22 +2470,25 @@ def create_agent_manager_router(
         binding_id: str,
         request: Request,
     ):
+        _require_owned_agent(manager, request, agent_id)
+        binding = manager._get_binding(binding_id)
+        if not binding or binding["agent_id"] != agent_id:
+            raise HTTPException(status_code=404, detail="Channel binding not found")
+        _reject_managed_runtime_channel(binding.get("channel_type"))
         try:
-            binding = manager._get_binding(binding_id)
-            if binding:
-                ch_type = binding.get("channel_type")
-                if ch_type == "imessage":
-                    from openjarvis.channels.imessage_daemon import (
-                        stop_daemon,
-                    )
+            ch_type = binding.get("channel_type")
+            if ch_type == "imessage":
+                from openjarvis.channels.imessage_daemon import (
+                    stop_daemon,
+                )
 
-                    stop_daemon()
-                elif ch_type == "slack":
-                    from openjarvis.channels.slack_daemon import (
-                        stop_daemon as stop_slack_daemon,
-                    )
+                stop_daemon()
+            elif ch_type == "slack":
+                from openjarvis.channels.slack_daemon import (
+                    stop_daemon as stop_slack_daemon,
+                )
 
-                    stop_slack_daemon()
+                stop_slack_daemon()
         except Exception:
             pass
         manager.unbind_channel(binding_id)
@@ -2362,20 +2497,26 @@ def create_agent_manager_router(
     # ── Messaging ────────────────────────────────────────────
 
     @agents_router.get("/{agent_id}/messages")
-    def list_messages(agent_id: str):
+    def list_messages(agent_id: str, request: Request):
+        _require_owned_agent(manager, request, agent_id)
         return {"messages": _sanitize_managed_history(manager.list_messages(agent_id))}
 
     @agents_router.post("/{agent_id}/messages")
     async def send_message(agent_id: str, req: SendMessageRequest, request: Request):
-        agent_record = manager.get_agent(agent_id)
-        if not agent_record:
-            raise HTTPException(status_code=404, detail="Agent not found")
+        _owner_provenance, agent_record = _require_owned_agent(
+            manager,
+            request,
+            agent_id,
+        )
         if agent_record["status"] == "archived":
             raise HTTPException(status_code=409, detail="Agent is archived")
 
         if req.stream or req.mode == "immediate":
             try:
-                _managed_runtime_values(agent_record.get("config", {}))
+                _managed_runtime_values(
+                    agent_record.get("config", {}),
+                    server_config=getattr(request.app.state, "config", None),
+                )
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -2487,10 +2628,12 @@ def create_agent_manager_router(
     # ── State inspection ─────────────────────────────────────
 
     @agents_router.get("/{agent_id}/state")
-    def get_agent_state(agent_id: str):
-        agent = manager.get_agent(agent_id)
-        if agent is None:
-            raise HTTPException(status_code=404, detail="Agent not found")
+    def get_agent_state(agent_id: str, request: Request):
+        _owner_provenance, agent = _require_owned_agent(
+            manager,
+            request,
+            agent_id,
+        )
         return {
             "agent": agent,
             "tasks": manager.list_tasks(agent_id),
@@ -2502,15 +2645,13 @@ def create_agent_manager_router(
     # ── Learning ─────────────────────────────────────────────
 
     @agents_router.get("/{agent_id}/learning")
-    def get_learning_log(agent_id: str):
-        if not manager.get_agent(agent_id):
-            raise HTTPException(status_code=404, detail="Agent not found")
+    def get_learning_log(agent_id: str, request: Request):
+        _require_owned_agent(manager, request, agent_id)
         return {"learning_log": manager.list_learning_log(agent_id)}
 
     @agents_router.post("/{agent_id}/learning/run")
-    def trigger_learning(agent_id: str):
-        if not manager.get_agent(agent_id):
-            raise HTTPException(status_code=404, detail="Agent not found")
+    def trigger_learning(agent_id: str, request: Request):
+        _require_owned_agent(manager, request, agent_id)
         from openjarvis.core.events import EventType, get_event_bus
 
         bus = get_event_bus()
@@ -2520,9 +2661,12 @@ def create_agent_manager_router(
     # ── Traces ───────────────────────────────────────────────
 
     @agents_router.get("/{agent_id}/traces")
-    def list_traces(agent_id: str, limit: int = 20):
-        if not manager.get_agent(agent_id):
-            raise HTTPException(status_code=404, detail="Agent not found")
+    def list_traces(agent_id: str, request: Request, limit: int = 20):
+        owner_provenance, _agent = _require_owned_agent(
+            manager,
+            request,
+            agent_id,
+        )
         try:
             from openjarvis.core.config import load_config
             from openjarvis.core.paths import get_config_dir
@@ -2532,7 +2676,11 @@ def create_agent_manager_router(
             store = TraceStore(
                 config.traces.db_path or str(get_config_dir() / "traces.db")
             )
-            traces = store.list_traces(agent=agent_id, limit=limit)
+            traces = store.list_traces(
+                agent=agent_id,
+                provenance=owner_provenance,
+                limit=limit,
+            )
             return {
                 "traces": [
                     {
@@ -2550,9 +2698,12 @@ def create_agent_manager_router(
             raise HTTPException(status_code=500, detail=str(exc))
 
     @agents_router.get("/{agent_id}/traces/{trace_id}")
-    def get_trace(agent_id: str, trace_id: str):
-        if not manager.get_agent(agent_id):
-            raise HTTPException(status_code=404, detail="Agent not found")
+    def get_trace(agent_id: str, trace_id: str, request: Request):
+        owner_provenance, _agent = _require_owned_agent(
+            manager,
+            request,
+            agent_id,
+        )
         try:
             from openjarvis.core.config import load_config
             from openjarvis.core.paths import get_config_dir
@@ -2563,9 +2714,12 @@ def create_agent_manager_router(
                 config.traces.db_path or str(get_config_dir() / "traces.db")
             )
             trace = store.get(trace_id)
+            trace_metadata = getattr(trace, "metadata", {}) if trace is not None else {}
             if (
                 trace is None
                 or trace.agent != agent_id
+                or not isinstance(trace_metadata, dict)
+                or trace_metadata.get("provenance") != owner_provenance
                 or _trace_has_disallowed_managed_tool(trace)
             ):
                 raise HTTPException(status_code=404, detail="Trace not found")
@@ -2598,7 +2752,12 @@ def create_agent_manager_router(
         return {"templates": AgentManager.list_templates()}
 
     @templates_router.post("/{template_id}/instantiate")
-    async def instantiate_template(template_id: str, req: CreateAgentRequest):
+    async def instantiate_template(
+        template_id: str,
+        req: CreateAgentRequest,
+        request: Request,
+    ):
+        owner_provenance = _require_managed_owner(request)
         templates = manager.list_templates()
         template = next(
             (item for item in templates if item.get("id") == template_id),
@@ -2613,19 +2772,28 @@ def create_agent_manager_router(
         }
         merged.update(req.config or {})
         try:
-            _managed_runtime_values(merged)
+            _managed_runtime_values(
+                merged,
+                server_config=getattr(request.app.state, "config", None),
+            )
             _validate_managed_tool_config(merged)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return manager.create_from_template(template_id, req.name, overrides=req.config)
+        return manager.create_from_template(
+            template_id,
+            req.name,
+            overrides=req.config,
+            owner_provenance=owner_provenance,
+        )
 
     # ── Global agent endpoints ───────────────────────────────
 
     global_router = APIRouter(tags=["agents-global"])
 
     @global_router.get("/v1/agents/errors")
-    def list_error_agents():
-        all_agents = manager.list_agents()
+    def list_error_agents(request: Request):
+        owner_provenance = _require_managed_owner(request)
+        all_agents = manager.list_agents_for_owner(owner_provenance)
         error_agents = [
             a
             for a in all_agents
@@ -2634,8 +2802,9 @@ def create_agent_manager_router(
         return {"agents": error_agents}
 
     @global_router.get("/v1/agents/health")
-    def agents_health():
-        all_agents = manager.list_agents()
+    def agents_health(request: Request):
+        owner_provenance = _require_managed_owner(request)
+        all_agents = manager.list_agents_for_owner(owner_provenance)
         from collections import Counter
 
         counts = Counter(a["status"] for a in all_agents)

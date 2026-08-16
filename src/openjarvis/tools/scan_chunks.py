@@ -12,11 +12,13 @@ from typing import Any, List, Optional
 from openjarvis.connectors.store import KnowledgeStore
 from openjarvis.core.registry import ToolRegistry
 from openjarvis.core.types import Message, Role, ToolResult
+from openjarvis.engine._finish import conservative_finish_reason
 from openjarvis.engine._stubs import InferenceEngine
 from openjarvis.tools._stubs import BaseTool, ToolSpec
 
 _DEFAULT_MAX_CHUNKS = 200
 _DEFAULT_BATCH_SIZE = 20
+_INCOMPLETE_SCAN = "Chunk scan could not complete."
 
 
 @ToolRegistry.register("scan_chunks")
@@ -30,10 +32,21 @@ class ScanChunksTool(BaseTool):
         store: Optional[KnowledgeStore] = None,
         engine: Optional[InferenceEngine] = None,
         model: str = "",
+        max_tokens: Optional[int] = None,
     ) -> None:
         self._store = store
         self._engine = engine
         self._model = model
+        self._max_tokens = max_tokens
+
+    def _completion_limit(self) -> int:
+        """Resolve the caller override or inherit the current runtime limit."""
+        if self._max_tokens is not None:
+            return self._max_tokens
+
+        from openjarvis.core.config import load_config
+
+        return int(load_config().intelligence.max_tokens)
 
     @property
     def spec(self) -> ToolSpec:
@@ -141,6 +154,7 @@ class ScanChunksTool(BaseTool):
                 metadata={"chunks_scanned": 0},
             )
 
+        completion_limit = self._completion_limit()
         findings: List[str] = []
         for i in range(0, len(rows), batch_size):
             batch = rows[i : i + batch_size]
@@ -164,9 +178,23 @@ class ScanChunksTool(BaseTool):
                 ),
             ]
 
-            result = self._engine.generate(messages, model=self._model, max_tokens=1024)
-            content = result.get("content", "").strip()
-            if content and "NOTHING_RELEVANT" not in content:
+            result = self._engine.generate(
+                messages,
+                model=self._model,
+                max_tokens=completion_limit,
+            )
+            content = str(result.get("content") or "").strip()
+            if (
+                conservative_finish_reason(result.get("finish_reason")) != "stop"
+                or not content
+            ):
+                return ToolResult(
+                    tool_name="scan_chunks",
+                    content=_INCOMPLETE_SCAN,
+                    success=False,
+                    metadata={"chunks_scanned": min(i + len(batch), len(rows))},
+                )
+            if content != "NOTHING_RELEVANT":
                 findings.append(content)
 
         if not findings:

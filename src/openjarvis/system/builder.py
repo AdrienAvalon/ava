@@ -187,7 +187,16 @@ class SystemBuilder:
             memory_backend,
             channel_backend,
         )
-        tool_executor = ToolExecutor(tool_list, bus) if tool_list else None
+        tool_executor = (
+            ToolExecutor(
+                tool_list,
+                bus,
+                capability_policy=sec.capability_policy,
+                boundary_guard=sec.boundary_guard,
+            )
+            if tool_list
+            else None
+        )
 
         skill_manager = None
         skill_few_shot_examples: List[str] = []
@@ -212,7 +221,12 @@ class SystemBuilder:
                 )
                 tool_list.extend(skill_tools)
                 if tool_list:
-                    tool_executor = ToolExecutor(tool_list, bus)
+                    tool_executor = ToolExecutor(
+                        tool_list,
+                        bus,
+                        capability_policy=sec.capability_policy,
+                        boundary_guard=sec.boundary_guard,
+                    )
                 skill_few_shot_examples = skill_manager.get_few_shot_examples()
             except Exception as exc:
                 logger.warning("Failed to initialize skills: %s", exc)
@@ -233,6 +247,7 @@ class SystemBuilder:
                 logger.warning("Failed to initialize TraceStore", exc_info=True)
 
         capability_policy = sec.capability_policy
+        boundary_guard = sec.boundary_guard
         learning_orchestrator = self._setup_learning_orchestrator(config)
 
         agent_manager = None
@@ -308,6 +323,7 @@ class SystemBuilder:
             workflow_engine=workflow_engine,
             session_store=session_store,
             capability_policy=capability_policy,
+            boundary_guard=boundary_guard,
             audit_logger=sec.audit_logger,
             agent_manager=agent_manager,
             agent_scheduler=agent_scheduler,

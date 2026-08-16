@@ -2,11 +2,29 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 
 import click
 from rich.console import Console
 from rich.table import Table
+
+from openjarvis.engine._finish import conservative_finish_reason
+
+logger = logging.getLogger(__name__)
+
+_CHANNEL_FAILURE_MESSAGE = "Sorry, I couldn't complete that response. Please try again."
+
+
+def _completed_agent_text(result: object) -> str:
+    """Return agent text only when its terminal metadata proves completion."""
+
+    content = getattr(result, "content", "")
+    metadata = getattr(result, "metadata", {}) or {}
+    finish_reason = conservative_finish_reason(metadata.get("finish_reason"))
+    if finish_reason == "stop" and isinstance(content, str) and content.strip():
+        return content
+    return _CHANNEL_FAILURE_MESSAGE
 
 
 @click.group("channels")
@@ -132,8 +150,11 @@ def imessage_start(
         )
 
         def handler(text: str) -> str:
-            result = agent.run(text)
-            return result.content or "No results found."
+            try:
+                return _completed_agent_text(agent.run(text))
+            except Exception:
+                logger.exception("iMessage agent generation failed")
+                return _CHANNEL_FAILURE_MESSAGE
 
         run_daemon(
             chat_identifier=chat_identifier,

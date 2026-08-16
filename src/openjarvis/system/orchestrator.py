@@ -6,6 +6,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from openjarvis.core.types import Message, Role
+from openjarvis.engine._finish import conservative_finish_reason
 from openjarvis.tools._stubs import BaseTool
 
 if TYPE_CHECKING:
@@ -88,6 +89,7 @@ class QueryOrchestrator:
         return {
             "content": result.get("content", ""),
             "usage": result.get("usage", {}),
+            "finish_reason": conservative_finish_reason(result.get("finish_reason")),
             "model": s.model,
             "engine": s.engine_key,
         }
@@ -160,8 +162,6 @@ class QueryOrchestrator:
                 agent_kwargs["skill_few_shot_examples"] = examples
         if system_prompt is not None:
             agent_kwargs["system_prompt"] = system_prompt
-        if s.capability_policy is not None:
-            agent_kwargs["capability_policy"] = s.capability_policy
         if operator_id is not None:
             agent_kwargs["operator_id"] = operator_id
             agent_kwargs["session_store"] = s.session_store
@@ -200,6 +200,16 @@ class QueryOrchestrator:
                 ag = agent_cls(s.engine, s.model)
             except TypeError:
                 ag = agent_cls()
+
+        from openjarvis.agents._stubs import configure_tool_execution_security
+
+        configure_tool_execution_security(
+            ag,
+            capability_policy=s.capability_policy,
+            boundary_guard=getattr(s, "boundary_guard", None),
+            # QueryOrchestrator receives no authenticated Principal object.
+            principal_provenance=None,
+        )
 
         telemetry_events: List[Dict[str, Any]] = []
 
@@ -272,6 +282,10 @@ class QueryOrchestrator:
                 "total_inference_latency": total_latency,
             }
 
+        metadata = dict(getattr(result, "metadata", {}) or {})
+        finish_reason = conservative_finish_reason(metadata.get("finish_reason"))
+        metadata["finish_reason"] = finish_reason
+
         return {
             "content": result.content,
             "usage": getattr(result, "usage", {}),
@@ -285,7 +299,8 @@ class QueryOrchestrator:
                 for tr in getattr(result, "tool_results", [])
             ],
             "turns": getattr(result, "turns", 1),
-            "metadata": getattr(result, "metadata", {}),
+            "metadata": metadata,
+            "finish_reason": finish_reason,
             "model": s.model,
             "engine": s.engine_key,
             "_telemetry": _telemetry,

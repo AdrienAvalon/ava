@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
-import { getBase } from './api';
+import { jetonOidc } from '../components/immersive/memoireServeur';
+import { getApiKey, getBase } from './api';
 
 export interface AgentEvent {
   type: string;
@@ -7,19 +8,54 @@ export interface AgentEvent {
   data: Record<string, unknown>;
 }
 
-function buildWsUrl(agentId?: string): string {
+export const AGENT_EVENTS_SUBPROTOCOL = 'ava-agent-events-v1';
+const OIDC_SUBPROTOCOL_PREFIX = 'ava-oidc-v1.';
+const API_KEY_SUBPROTOCOL_PREFIX = 'ava-api-key-v1.';
+
+function encodeProtocolCredential(value: string): string {
+  // Protocol-token encoding is not encryption. It keeps credentials out of
+  // request URLs and lets the server echo only the fixed protocol marker.
+  const bytes = new TextEncoder().encode(value);
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+export function buildAgentEventsProtocols(
+  oidcToken: string,
+  apiKey = '',
+): string[] {
+  const protocols = [
+    AGENT_EVENTS_SUBPROTOCOL,
+    `${OIDC_SUBPROTOCOL_PREFIX}${encodeProtocolCredential(oidcToken)}`,
+  ];
+  if (apiKey) {
+    protocols.push(
+      `${API_KEY_SUBPROTOCOL_PREFIX}${encodeProtocolCredential(apiKey)}`,
+    );
+  }
+  return protocols;
+}
+
+export function buildAgentEventsWsUrl(agentId: string): string {
   const base = getBase();
   let origin: string;
   if (base) {
-    origin = base.replace(/^http/, 'ws');
+    origin = base.replace(/^http/, 'ws').replace(/\/+$/, '');
   } else {
     const loc = window.location;
     origin = `${loc.protocol === 'https:' ? 'wss:' : 'ws:'}//${loc.host}`;
   }
-  const path = '/v1/agents/events';
-  return agentId
-    ? `${origin}${path}?agent_id=${encodeURIComponent(agentId)}`
-    : `${origin}${path}`;
+  return `${origin}/v1/agents/events?agent_id=${encodeURIComponent(agentId)}`;
+}
+
+export function openAgentEventsSocket(agentId: string): WebSocket | null {
+  const oidcToken = jetonOidc();
+  if (!oidcToken) return null;
+  return new WebSocket(
+    buildAgentEventsWsUrl(agentId),
+    buildAgentEventsProtocols(oidcToken, getApiKey()),
+  );
 }
 
 /**
@@ -46,7 +82,11 @@ export function useAgentEvents(
     const connect = () => {
       if (closed) return;
       try {
-        ws = new WebSocket(buildWsUrl(agentId));
+        ws = openAgentEventsSocket(agentId);
+        if (!ws) {
+          schedule();
+          return;
+        }
       } catch {
         schedule();
         return;

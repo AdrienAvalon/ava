@@ -25,7 +25,7 @@ class _MockEngine(InferenceEngine):
             self._call_idx += 1
         else:
             content = "FINAL_ANSWER: fallback"
-        return {"content": content}
+        return {"content": content, "finish_reason": "stop"}
 
     def stream(self, messages, **kwargs):
         raise NotImplementedError
@@ -66,7 +66,9 @@ class TestStructuredMode:
         """Test full structured loop: TOOL call -> FINAL_ANSWER."""
         engine = _MockEngine(
             [
-                "THOUGHT: I need to calculate\nTOOL: calculator\nINPUT: 2+2",
+                "THOUGHT: I need to calculate\n"
+                "TOOL: calculator\n"
+                'INPUT: {"expression":"2+2"}',
                 "THOUGHT: Got result\nFINAL_ANSWER: 4",
             ]
         )
@@ -116,7 +118,7 @@ class TestStructuredMode:
         """Test that max_turns terminates the loop."""
         # Always returns a tool call, never a final answer
         responses = [
-            "THOUGHT: calc\nTOOL: calculator\nINPUT: 1+1",
+            'THOUGHT: calc\nTOOL: calculator\nINPUT: {"expression":"1+1"}',
         ] * 5
         engine = _MockEngine(responses)
         agent = OrchestratorAgent(

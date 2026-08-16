@@ -40,6 +40,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from ava_extensions.tool_capabilities import HOME_OBSERVE, NETWORK_FETCH
 from openjarvis.core.registry import ToolRegistry
 from openjarvis.core.types import ToolResult
 from openjarvis.tools._stubs import BaseTool, ToolSpec
@@ -285,7 +286,7 @@ class HomeAssistantTool(BaseTool):
     """Lit l'état de la maison via le control plane Avalon (lecture seule)."""
 
     tool_id = "home_assistant"
-    is_local = True
+    is_local = False
 
     @property
     def spec(self) -> ToolSpec:
@@ -316,6 +317,9 @@ class HomeAssistantTool(BaseTool):
             category="maison",
             latency_estimate=1.0,
             timeout_seconds=12.0,
+            required_capabilities=[NETWORK_FETCH, HOME_OBSERVE],
+            requires_capability_policy=True,
+            metadata={"fixed_destination": "avalon-control-plane"},
         )
 
     def execute(self, **params: Any) -> ToolResult:

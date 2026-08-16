@@ -18,6 +18,7 @@ from openjarvis.engine._base import (
     estimate_prompt_tokens,
     messages_to_dicts,
 )
+from openjarvis.engine._finish import conservative_finish_reason
 from openjarvis.engine._http_async import (
     STREAM_TRANSPORT_ERRORS,
     AsyncHTTPEngineMixin,
@@ -208,7 +209,7 @@ class OllamaEngine(AsyncHTTPEngineMixin, InferenceEngine):
                 "total_tokens": prompt_tokens + completion_tokens,
             },
             "model": data.get("model", model),
-            "finish_reason": "stop",
+            "finish_reason": conservative_finish_reason(data.get("done_reason")),
         }
         # Extract timing from Ollama response (nanoseconds → seconds)
         result["ttft"] = data.get("prompt_eval_duration", 0) / 1e9
@@ -301,10 +302,7 @@ class OllamaEngine(AsyncHTTPEngineMixin, InferenceEngine):
                 async for line in resp.aiter_lines():
                     if not line.strip():
                         continue
-                    try:
-                        chunk = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+                    chunk = json.loads(line)
                     content = chunk.get("message", {}).get("content", "")
                     if content:
                         yield content
@@ -422,10 +420,7 @@ class OllamaEngine(AsyncHTTPEngineMixin, InferenceEngine):
                 async for line in resp.aiter_lines():
                     if not line.strip():
                         continue
-                    try:
-                        chunk = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+                    chunk = json.loads(line)
 
                     message = chunk.get("message", {}) or {}
                     content = message.get("content", "")
@@ -485,10 +480,15 @@ class OllamaEngine(AsyncHTTPEngineMixin, InferenceEngine):
                             "completion_tokens": comp,
                             "total_tokens": full_prompt + comp,
                         }
-                        if finish_reason is None:
-                            finish_reason = chunk.get("done_reason") or "stop"
+                        provider_reason = conservative_finish_reason(
+                            chunk.get("done_reason")
+                        )
+                        if finish_reason == "tool_calls" and provider_reason == "stop":
+                            terminal_reason = "tool_calls"
+                        else:
+                            terminal_reason = provider_reason
                         yield StreamChunk(
-                            finish_reason=finish_reason,
+                            finish_reason=terminal_reason,
                             usage=dict(self._last_stream_usage),
                         )
                         break

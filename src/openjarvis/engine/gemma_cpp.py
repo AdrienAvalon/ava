@@ -125,7 +125,9 @@ class GemmaCppEngine(InferenceEngine):
                 "total_tokens": prompt_tokens + completion_tokens,
             },
             "model": self._model_type,
-            "finish_reason": "stop",
+            # pygemma completion() returns only text. Without a provider
+            # terminal cause, a returned string cannot be certified complete.
+            "finish_reason": "length",
         }
 
     async def stream(

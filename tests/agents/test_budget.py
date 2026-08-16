@@ -13,7 +13,10 @@ def test_budget_exceeded_sets_status(tmp_path):
     agent = mgr.create_agent("expensive", config={"max_cost": 1.0})
     tick_token = mgr.start_tick(agent["id"])
 
-    result = AgentResult(content="done", metadata={"cost": 1.50, "tokens_used": 100})
+    result = AgentResult(
+        content="done",
+        metadata={"finish_reason": "stop", "cost": 1.50, "tokens_used": 100},
+    )
     executor._finalize_tick(
         agent["id"], result, error=None, duration=1.0, tick_token=tick_token
     )
@@ -37,7 +40,10 @@ def test_budget_not_exceeded_stays_idle(tmp_path):
     agent = mgr.create_agent("cheap", config={"max_cost": 10.0})
     tick_token = mgr.start_tick(agent["id"])
 
-    result = AgentResult(content="done", metadata={"cost": 0.50, "tokens_used": 50})
+    result = AgentResult(
+        content="done",
+        metadata={"finish_reason": "stop", "cost": 0.50, "tokens_used": 50},
+    )
     executor._finalize_tick(
         agent["id"], result, error=None, duration=1.0, tick_token=tick_token
     )
@@ -58,7 +64,11 @@ def test_budget_unlimited_skips_check(tmp_path):
 
     result = AgentResult(
         content="done",
-        metadata={"cost": 999.99, "tokens_used": 1000000},
+        metadata={
+            "finish_reason": "stop",
+            "cost": 999.99,
+            "tokens_used": 1000000,
+        },
     )
     executor._finalize_tick(
         agent["id"], result, error=None, duration=1.0, tick_token=tick_token
@@ -78,7 +88,10 @@ def test_token_budget_exceeded(tmp_path):
     agent = mgr.create_agent("token-heavy", config={"max_total_tokens": 1000})
     tick_token = mgr.start_tick(agent["id"])
 
-    result = AgentResult(content="done", metadata={"cost": 0.01, "tokens_used": 1500})
+    result = AgentResult(
+        content="done",
+        metadata={"finish_reason": "stop", "cost": 0.01, "tokens_used": 1500},
+    )
     executor._finalize_tick(
         agent["id"], result, error=None, duration=1.0, tick_token=tick_token
     )
@@ -96,7 +109,10 @@ def test_per_call_token_limit_is_not_a_cumulative_budget(tmp_path):
 
     agent = mgr.create_agent("per-call", config={"max_tokens": 1000})
     tick_token = mgr.start_tick(agent["id"])
-    result = AgentResult(content="done", metadata={"tokens_used": 1500})
+    result = AgentResult(
+        content="done",
+        metadata={"finish_reason": "stop", "tokens_used": 1500},
+    )
 
     executor._finalize_tick(
         agent["id"], result, error=None, duration=1.0, tick_token=tick_token

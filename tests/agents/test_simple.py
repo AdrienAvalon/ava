@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from openjarvis.agents._stubs import AgentContext, AgentResult
 from openjarvis.agents.simple import SimpleAgent
 from openjarvis.core.events import EventBus, EventType
@@ -30,7 +32,31 @@ class TestSimpleAgent:
         assert isinstance(result, AgentResult)
         assert result.content == "Hello there!"
         assert result.turns == 1
+        assert result.metadata["finish_reason"] == "stop"
         engine.generate.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("finish_reason", "expected_reason", "expected_calls"),
+        [
+            (None, None, 1),
+            ("length", "length", 3),
+            ("max_tokens", "length", 3),
+        ],
+    )
+    def test_non_terminal_reason_is_propagated_without_fabricating_stop(
+        self,
+        finish_reason,
+        expected_reason,
+        expected_calls,
+    ):
+        engine = _make_mock_engine("partial")
+        engine.generate.return_value["finish_reason"] = finish_reason
+        agent = SimpleAgent(engine, "test-model")
+
+        result = agent.run("Hello")
+
+        assert result.metadata["finish_reason"] == expected_reason
+        assert engine.generate.call_count == expected_calls
 
     def test_agent_id(self):
         engine = _make_mock_engine()

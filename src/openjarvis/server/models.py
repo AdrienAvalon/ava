@@ -39,7 +39,10 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str
+    # Empty means "use the model selected by the daemon".  Ava's browser and
+    # Control Plane are first-party clients and must not duplicate that mutable
+    # runtime choice; an explicit OpenAI-compatible client may still override it.
+    model: str = ""
     messages: List[ChatMessage]
     temperature: float = Field(default=0.7, ge=0.0, le=2.0, allow_inf_nan=False)
     max_tokens: int = Field(default=1024, ge=1, le=MAX_COMPLETION_TOKENS)

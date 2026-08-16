@@ -118,7 +118,9 @@ class TestDefaultStreamFull:
         assert chunks[0].content == "Hello"
         assert chunks[1].content == " world"
         assert chunks[2].content == "!"
-        assert chunks[3].finish_reason == "stop"
+        # The base wrapper has content but no provider terminal metadata.  It must
+        # fail closed instead of inventing a successful stop.
+        assert chunks[3].finish_reason == "length"
         assert chunks[3].content is None
 
     @pytest.mark.asyncio
@@ -133,7 +135,7 @@ class TestDefaultStreamFull:
 
         # Should have just the finish chunk
         assert len(chunks) == 1
-        assert chunks[0].finish_reason == "stop"
+        assert chunks[0].finish_reason == "length"
 
     @pytest.mark.asyncio
     async def test_kwargs_passed_through(self):

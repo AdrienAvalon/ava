@@ -91,11 +91,20 @@ export async function lireConversation(): Promise<LigneServeur[] | null> {
   }
 }
 
-/** Efface l'historique de l'utilisateur courant, et de lui seul. */
-export async function effacerConversation(): Promise<void> {
+/**
+ * Efface l'historique de l'utilisateur courant, et de lui seul.
+ *
+ * Le booléen est l'acquittement serveur : un rejet HTTP ou réseau ne doit jamais
+ * autoriser l'appelant à vider sa copie locale et masquer l'échec durable.
+ */
+export async function effacerConversation(): Promise<boolean> {
   try {
-    await fetch('/v1/ava/conversation', { method: 'DELETE', headers: entetesIdentite() });
+    const reponse = await fetch('/v1/ava/conversation', {
+      method: 'DELETE',
+      headers: entetesIdentite(),
+    });
+    return reponse.ok;
   } catch {
-    /* rien à faire : l'affichage est vidé de toute façon */
+    return false;
   }
 }

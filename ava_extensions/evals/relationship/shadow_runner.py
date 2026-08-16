@@ -206,6 +206,11 @@ class _ObservedEngine:
             raise ShadowRunError("shadow engine returned a different model")
         if result.get("tool_calls"):
             raise ShadowRunError("shadow engine attempted a tool call")
+        if result.get("finish_reason") != "stop":
+            raise ShadowRunError("shadow engine did not return an exact stop terminal")
+        content = result.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise ShadowRunError("shadow engine returned empty response content")
         return result
 
 
@@ -280,6 +285,17 @@ def _write_private_new(path: Path, payload: bytes) -> None:
         raise
     finally:
         os.close(descriptor)
+
+
+def _encode_service_assertion_key(entropy: bytes) -> bytes:
+    """Encode random key bytes with the text-file contract used by production."""
+
+    if len(entropy) != 48:
+        raise ShadowRunError("synthetic assertion key entropy has an invalid size")
+    encoded = entropy.hex().encode("ascii")
+    if len(encoded) < 32 or encoded.rstrip(b"\r\n") != encoded:
+        raise AssertionError("hex-encoded assertion key violated its text contract")
+    return encoded
 
 
 def _replace_private_json(path: Path, document: dict[str, Any]) -> None:
@@ -506,13 +522,17 @@ def _extract_completion(response: Any, *, expected_model: str) -> tuple[str, lis
         document = response.json()
         response_model = document["model"]
         choices = document["choices"]
-        message = choices[0]["message"]
+        choice = choices[0]
+        message = choice["message"]
+        finish_reason = choice.get("finish_reason")
         text = message["content"]
         tool_calls = message.get("tool_calls") or []
-    except (KeyError, IndexError, TypeError, ValueError) as exc:
+    except (AttributeError, KeyError, IndexError, TypeError, ValueError) as exc:
         raise ShadowRunError("shadow endpoint returned an invalid completion") from exc
     if response_model != expected_model:
         raise ShadowRunError("shadow endpoint returned a different model")
+    if finish_reason != "stop":
+        raise ShadowRunError("shadow endpoint did not return an exact stop terminal")
     if not isinstance(text, str) or not text.strip() or len(text) > 24_000:
         raise ShadowRunError("shadow endpoint returned invalid response text")
     if any(pattern.search(text) for pattern in _UNEXPECTED_PERSONAL_OUTPUT):
@@ -1131,7 +1151,7 @@ def _execute_isolated(
         openjarvis_home.mkdir(mode=0o700)
         key_path = runtime_root / "service-assertion.key"
         policy_path = runtime_root / "relationship-policy.json"
-        key = secrets.token_bytes(48)
+        key = _encode_service_assertion_key(secrets.token_bytes(48))
         oidc_fixture = _build_oidc_fixture()
         _write_private_new(key_path, key)
         _replace_private_json(policy_path, _runtime_policy(enabled=True))

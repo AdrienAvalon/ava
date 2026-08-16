@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ava:infra-autonomy:shadow-manifest:v3",
+  "title": "Manifeste du shadow d'autonomie infrastructure Ava v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "manifest_id", "artifact", "freeze", "provenance", "execution_policy", "files"],
+  "properties": {
+    "schema_version": {"const": "ava.infra-autonomy.shadow-manifest/v3"},
+    "manifest_id": {"type": "string", "minLength": 1},
+    "artifact": {"type": "object"},
+    "freeze": {"type": "object"},
+    "provenance": {"type": "object"},
+    "execution_policy": {"type": "object"},
+    "files": {"type": "object"}
+  }
+}

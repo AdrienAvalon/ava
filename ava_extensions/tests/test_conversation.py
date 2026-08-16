@@ -25,10 +25,15 @@ TURN_ID = uuid.UUID("4d593ddf-cf92-4d85-9d5d-68a961f5827b")
 REQUEST_SHA256 = "a" * 64
 
 
-def _response_json(content: str) -> str:
+def _response_json(content: str, *, finish_reason: str = "stop") -> str:
     return ChatCompletionResponse(
         model="synthetic-test",
-        choices=[Choice(message=ChoiceMessage(content=content))],
+        choices=[
+            Choice(
+                message=ChoiceMessage(content=content),
+                finish_reason=finish_reason,
+            )
+        ],
     ).model_dump_json()
 
 
@@ -151,7 +156,8 @@ def test_une_base_illisible_ne_leve_pas(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(conv, "CHEMIN_BASE", Path("/proc/interdit/x.db"))
     assert conv.lire("u") == []
     assert conv.ajouter("u", [{"role": "user", "texte": "x"}]) == 0
-    assert conv.effacer("u") == 0
+    with pytest.raises(conv.ConversationStorageError):
+        conv.effacer("u")
 
 
 def test_l_horodatage_est_pose_s_il_manque() -> None:
@@ -300,6 +306,63 @@ def test_une_limite_de_lecture_ne_retourne_jamais_une_demi_paire() -> None:
         "ligne legacy recente",
     ]
     assert all(ligne["turn_id"] != str(premier) for ligne in historique)
+
+
+def test_historique_quarantaine_les_reponses_length_anciennement_completees() -> None:
+    turn_id = uuid.UUID("04aa402e-48dc-4afe-8516-c6261d8debad")
+    conv.reserver_tour(
+        "sub:u",
+        turn_id,
+        "question historique",
+        request_sha256=REQUEST_SHA256,
+    )
+    conv.finaliser_tour(
+        "sub:u",
+        turn_id,
+        "question historique",
+        "réponse coupée au milieu de",
+        response_json=_response_json(
+            "réponse coupée au milieu de",
+            finish_reason="length",
+        ),
+    )
+
+    assert conv.lire_strict("sub:u") == []
+    entry = conv.lire_statut_tour("sub:u", turn_id)
+    assert entry is not None
+    assert entry.state == "completed"
+    assert entry.assistant_text == "réponse coupée au milieu de"
+
+
+def test_historique_quarantaine_un_tour_genere_sans_enveloppe_terminale() -> None:
+    turn_id = uuid.UUID("7c5cc234-7d24-4bb9-a1df-c10570195324")
+    conv.reserver_tour(
+        "sub:u",
+        turn_id,
+        "question historique",
+        request_sha256=REQUEST_SHA256,
+    )
+    conv.finaliser_tour(
+        "sub:u",
+        turn_id,
+        "question historique",
+        "réponse initialement complète",
+        response_json=_response_json("réponse initialement complète"),
+    )
+    with sqlite3.connect(conv.CHEMIN_BASE) as connection:
+        connection.execute(
+            "UPDATE tours SET response_json = NULL "
+            "WHERE utilisateur = ? AND turn_id = ?",
+            ("sub:u", str(turn_id)),
+        )
+
+    assert conv.lire_strict("sub:u") == []
+    with sqlite3.connect(conv.CHEMIN_BASE) as connection:
+        assert connection.execute(
+            "SELECT state, assistant_text FROM tours "
+            "WHERE utilisateur = ? AND turn_id = ?",
+            ("sub:u", str(turn_id)),
+        ).fetchone() == ("completed", "réponse initialement complète")
 
 
 @pytest.mark.parametrize(

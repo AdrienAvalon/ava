@@ -56,4 +56,20 @@ describe('streamChat generic desktop path', () => {
 
     await expect(generator.next()).rejects.toThrow('Chat generation failed');
   });
+
+  it('refuse une frame JSON malformee meme si stop et DONE suivent', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      'data: {"choices":[{"delta":{"content":"lost"}}]\n\n'
+        + 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        + 'data: [DONE]\n\n',
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+    )));
+    const generator = streamChat({
+      model: 'test-model',
+      messages: [{ role: 'user', content: 'hello' }],
+      stream: true,
+    });
+
+    await expect(generator.next()).rejects.toThrow('malformed data');
+  });
 });

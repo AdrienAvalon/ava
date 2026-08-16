@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from openjarvis.agents._stubs import AgentContext, AgentResult, BaseAgent
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.types import StepType, Trace, TraceStep
+from openjarvis.engine._finish import conservative_finish_reason
 from openjarvis.traces.store import TraceStore
 
 
@@ -131,6 +132,19 @@ class TraceCollector:
             for s in trace.steps
             if s.step_type == StepType.TOOL_CALL and s.output.get("success") is False
         ]
+        # ToolExecutor deliberately emits TOOL_CALL_START only after registry,
+        # capability, boundary and confirmation checks.  A denied or malformed
+        # attempt therefore exists in AgentResult.tool_results but has no trace step.
+        # Ignoring it here would let a later successful plan-only sequence erase the
+        # refused attempt and make the trace look fully completed.  Inspect only the
+        # server-owned success bit; never persist the rejected arguments or result.
+        echecs_avant_demarrage = [
+            tool_result
+            for tool_result in getattr(result, "tool_results", [])
+            if type(getattr(tool_result, "success", None)) is not bool
+            or tool_result.success is False
+        ]
+        echec_outil = bool(echecs or echecs_avant_demarrage)
         # ⚠ CE QUI SUIT CORRIGE UN DEFAUT DE MA PROPRE MESURE, et il etait pire que le
         # silence qu'il pretendait eviter. En ne notant QUE les echecs, 154 traces sur
         #   171
@@ -168,9 +182,12 @@ class TraceCollector:
         #   FAIT,
         #   on ne juge pas la qualite.
         contenu = (result.content or "").strip() if hasattr(result, "content") else ""
+        metadata = getattr(result, "metadata", {})
+        motif_arret = conservative_finish_reason(metadata.get("finish_reason"))
         tronquee = (
-            bool(getattr(result, "metadata", {}).get("max_turns_exceeded"))
+            bool(metadata.get("max_turns_exceeded"))
             or not contenu
+            or motif_arret != "stop"
         )
         # ⚠ LA MACHINE N'ECRIT PLUS DANS `feedback`, ET C'EST LA MEME DISTINCTION QUE
         #   `update_feedback` vient de retablir une couche plus haut : `outcome` porte
@@ -184,11 +201,11 @@ class TraceCollector:
         #   4 fois negativement par quelqu'un qui ne l'avait jamais jugee.
         # ⚠ Le champ reste donc NULL tant qu'un humain n'a rien dit — et `feedback is
         #   not None` signifie desormais exactement « quelqu'un a juge cette reponse ».
-        if echecs and not contenu:
+        if echec_outil and not contenu:
             trace.outcome = "tool_failure"
         elif tronquee:
             trace.outcome = "incomplete"
-        elif echecs:
+        elif echec_outil:
             # ⚠ Pas de `feedback = 0.0` ici : le tour a abouti. Une note nulle sur une
             #   reussite est exactement ce que le correctif supprime.
             trace.outcome = "recovered"

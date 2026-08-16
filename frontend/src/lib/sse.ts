@@ -57,30 +57,27 @@ export async function* streamChat(
             }
             return;
           }
+          let parsed: {
+            error?: { message?: unknown };
+            choices?: Array<{ finish_reason?: unknown }>;
+          };
           try {
-            const parsed = JSON.parse(data) as {
-              error?: { message?: unknown };
-              choices?: Array<{ finish_reason?: unknown }>;
-            };
-            if (parsed.error) {
-              throw new Error(
-                typeof parsed.error.message === 'string'
-                  ? parsed.error.message
-                  : 'Chat generation failed',
-              );
-            }
-            const finishReason = parsed.choices?.[0]?.finish_reason;
-            if (finishReason === 'stop' || finishReason === 'tool_calls') {
-              sawTerminal = true;
-            } else if (finishReason != null) {
-              throw new Error('Chat stream ended without a complete response');
-            }
-          } catch (error) {
-            if (error instanceof SyntaxError) {
-              // Preserve extension events that are intentionally not JSON.
-            } else {
-              throw error;
-            }
+            parsed = JSON.parse(data) as typeof parsed;
+          } catch {
+            throw new Error('Chat stream contained malformed data');
+          }
+          if (parsed.error) {
+            throw new Error(
+              typeof parsed.error.message === 'string'
+                ? parsed.error.message
+                : 'Chat generation failed',
+            );
+          }
+          const finishReason = parsed.choices?.[0]?.finish_reason;
+          if (finishReason === 'stop') {
+            sawTerminal = true;
+          } else if (finishReason != null) {
+            throw new Error('Chat stream ended without a complete response');
           }
           yield { event: currentEvent, data };
           currentEvent = undefined;
@@ -119,6 +116,35 @@ export async function* streamResearch(
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let sawSynthesis = false;
+
+  const parseEvent = (data: string): ResearchEvent => {
+    if (data === '[DONE]') {
+      throw new Error('Research stream used a legacy terminal sentinel');
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      throw new Error('Research stream returned malformed data');
+    }
+    if (!parsed || typeof parsed !== 'object' || !('type' in parsed)) {
+      throw new Error('Research stream returned an invalid event');
+    }
+
+    const event = parsed as ResearchEvent;
+    if (event.type === 'error') {
+      throw new Error(event.message || 'Research failed before completion');
+    }
+    if (event.type === 'synthesis') {
+      if (typeof event.text !== 'string') {
+        throw new Error('Research stream returned an invalid synthesis chunk');
+      }
+      sawSynthesis ||= event.text.trim().length > 0;
+    }
+    return event;
+  };
 
   try {
     while (true) {
@@ -132,16 +158,22 @@ export async function* streamResearch(
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
         const data = line.slice(6);
-        if (data === '[DONE]') return;
-        try {
-          const parsed = JSON.parse(data) as ResearchEvent;
-          yield parsed;
-          if (parsed.type === 'done') return;
-        } catch {
-          // skip malformed chunks
+        const event = parseEvent(data);
+        if (event.type === 'done') {
+          if (event.status !== 'success') {
+            throw new Error('Research failed before completion');
+          }
+          if (!sawSynthesis) {
+            throw new Error('Research stream ended without a complete synthesis');
+          }
+          yield event;
+          return;
         }
+        yield event;
       }
     }
+
+    throw new Error('Research stream ended without an explicit done event');
   } finally {
     reader.releaseLock();
   }

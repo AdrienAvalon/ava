@@ -9,7 +9,7 @@ import logging
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, WebSocket
 from fastapi.responses import StreamingResponse
 
 from openjarvis.core.paths import get_config_dir
@@ -34,6 +34,10 @@ router = APIRouter()
 
 class IdentityPromptUnavailableError(RuntimeError):
     """The server-owned Ava identity could not be built safely."""
+
+
+class ToolCapabilityPolicyUnavailableError(RuntimeError):
+    """The request-scoped model tool surface could not be authorized safely."""
 
 
 def _to_messages(chat_messages) -> list[Message]:
@@ -160,14 +164,21 @@ def _sanitize_client_identity(
 
 
 def _relationship_context(headers):
-    """Resolve principal and profile together in the worker thread."""
+    """Resolve principal, relationship and presentation context together."""
 
+    from ava_extensions.identity.principal_context import principal_context_for
     from ava_extensions.identity.relationship import relationship_selection_for
     from ava_extensions.server.principal import resolve_request_principal
 
     principal = resolve_request_principal(headers)
     selection = relationship_selection_for(principal)
-    return principal, selection.overlay, selection.protect_legacy_memory
+    principal_context = principal_context_for(principal)
+    return (
+        principal,
+        selection.overlay,
+        selection.protect_legacy_memory,
+        principal_context,
+    )
 
 
 def _identity_header_present(headers) -> bool:
@@ -191,27 +202,24 @@ def _declares_legacy_memory_tool(tools: list[dict[str, Any]] | None) -> bool:
     return False
 
 
-def _trusted_interlocutor_context(principal, relationship_overlay) -> str:
-    """Return a bounded server-established interlocutor label for the agent.
+def _trusted_relationship_display_context(relationship_overlay) -> str:
+    """Backfill a trusted relationship display name without exposing IDs.
 
-    OIDC subjects are opaque identifiers and never belong in a model prompt.
-    A display name is accepted only from the matched relationship policy.  A
-    Control Plane assertion may instead carry its already verified Matrix
-    sender as ``matrix:<sender>``.
+    Runtime policies normally append the approved name to the overlay prompt
+    themselves.  The fallback preserves compatibility with server-created
+    overlays that carry the trusted metadata but not that prose.  Raw OIDC or
+    Matrix subjects are never suitable model context.
     """
 
-    if relationship_overlay is not None and relationship_overlay.display_name:
+    if (
+        relationship_overlay is not None
+        and relationship_overlay.display_name
+        and relationship_overlay.display_name not in relationship_overlay.prompt
+    ):
         return (
-            "Nom d'affichage de l'interlocuteur vérifié par la politique serveur : "
+            "Nom d'affichage approuvé par la politique relationnelle serveur : "
             f"{relationship_overlay.display_name}."
         )
-    if (
-        principal is not None
-        and principal.provider == "service"
-        and principal.subject.startswith("matrix:")
-    ):
-        sender = principal.subject.removeprefix("matrix:")
-        return f"Identifiant Matrix de l'interlocuteur vérifié : {sender}."
     return ""
 
 
@@ -222,10 +230,11 @@ def _trusted_interlocutor_context(principal, relationship_overlay) -> str:
 #:   a rendu `end_turn`, qui n'existe pas cote OpenAI. J'avais teste les cas que
 #:   j'imaginais (`stop`, `max_tokens`, `length`) et pas celui que le modele emet
 #:   reellement en regime nominal.
-#: ⚠ Table FERMEE, repli sur `stop` : un motif inconnu ne doit pas fuiter, et le
-#:   seul repli sur qui les clients savent se comporter est `stop`. Les vrais
-#:   incidents — troncature, budget de tours — sont couverts par `length` ci-dessus,
-#:   donc ce repli ne masque rien.
+#: ⚠ Table FERMEE, repli sur `length` : un motif inconnu ne doit ni fuiter, ni etre
+#:   consacre comme une fin normale. Les SDK ajoutent de nouveaux motifs (`pause_turn`,
+#:   fenetre de contexte, etc.) ; les transformer en `stop` ferait publier une reponse
+#:   potentiellement incomplete. `length` est le terminal OpenAI conservateur que les
+#:   clients et le relais savent refuser ou signaler.
 _TRADUCTION = {
     "end_turn": "stop",
     "stop": "stop",
@@ -235,6 +244,9 @@ _TRADUCTION = {
     "tool_use": "tool_calls",
     "tool_calls": "tool_calls",
     "content_filter": "content_filter",
+    "pause_turn": "length",
+    "model_context_window_exceeded": "length",
+    "refusal": "content_filter",
 }
 
 
@@ -257,7 +269,65 @@ def _motif_arret(metadata: dict) -> str:
     """
     if metadata.get("max_turns_exceeded"):
         return "length"
-    return _TRADUCTION.get(str(metadata.get("finish_reason") or ""), "stop")
+    return _TRADUCTION.get(str(metadata.get("finish_reason") or ""), "length")
+
+
+def _runtime_completion_limit(request: Request | WebSocket) -> int:
+    """Return the server-owned generation limit for a client omission.
+
+    The immersive UI and the Matrix relay are first-party clients. They must not
+    duplicate this mutable runtime setting: an old browser was still sending 800
+    after the daemon had been raised to 16384, silently cutting otherwise simple
+    answers. Explicit OpenAI-compatible callers retain their bounded override.
+    """
+
+    config = getattr(request.app.state, "config", None)
+    intelligence = getattr(config, "intelligence", None)
+    configured = getattr(intelligence, "max_tokens", None)
+    if type(configured) is int and 1 <= configured <= MAX_COMPLETION_TOKENS:
+        return configured
+    raise HTTPException(
+        status_code=503,
+        detail="Ava runtime completion limit unavailable",
+    )
+
+
+def _apply_complexity_budget(
+    request_body: ChatCompletionRequest,
+    model: str,
+) -> tuple[ComplexityInfo | None, str]:
+    """Apply the local complexity floor before durable request fingerprinting."""
+
+    query_text = ""
+    for message in reversed(request_body.messages):
+        if message.role == "user" and message.content:
+            query_text = message.content
+            break
+    if not query_text:
+        return None, ""
+    try:
+        from openjarvis.learning.routing.complexity import (
+            adjust_tokens_for_model,
+            score_complexity,
+        )
+
+        result = score_complexity(query_text)
+        suggested = adjust_tokens_for_model(result.suggested_max_tokens, model)
+        bounded_suggestion = min(suggested, MAX_COMPLETION_TOKENS)
+        info = ComplexityInfo(
+            score=result.score,
+            tier=result.tier,
+            suggested_max_tokens=bounded_suggestion,
+        )
+        if bounded_suggestion > request_body.max_tokens:
+            request_body.max_tokens = bounded_suggestion
+        return info, query_text
+    except Exception:
+        logging.getLogger("openjarvis.server").debug(
+            "Complexity analysis failed",
+            exc_info=True,
+        )
+        return None, query_text
 
 
 @router.post("/v1/chat/completions")
@@ -265,17 +335,37 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     """Handle chat completion requests (streaming and non-streaming)."""
     engine = request.app.state.engine
     agent = getattr(request.app.state, "agent", None)
-    model = request_body.model
+    model = (
+        request_body.model.strip()
+        or str(getattr(request.app.state, "model", "") or "").strip()
+    )
+    if not model:
+        raise HTTPException(status_code=503, detail="Ava model unavailable")
+    # Resolve before the durable request fingerprint is computed. A retry without
+    # an explicit client model must name the same concrete effect as the first call.
+    request_body.model = model
+    if "max_tokens" not in request_body.model_fields_set:
+        request_body.max_tokens = _runtime_completion_limit(request)
+    # This mutates the effective generation budget, so it must happen before the
+    # durable request digest. Otherwise the idempotency key describes a different
+    # request from the one dispatched to the backend.
+    complexity_info, query_text_for_complexity = _apply_complexity_budget(
+        request_body,
+        model,
+    )
 
     # Authentication and profile selection happen once, on the server.  A
-    # malformed/expired token or policy disables the overlay; request text and
-    # the OpenAI ``user`` field are never consulted.
+    # malformed/expired token or invalid configured policy fails closed before
+    # the model; request text and the OpenAI ``user`` field are never consulted.
     try:
         relationship_context = await asyncio.to_thread(
             _relationship_context,
             request.headers,
         )
     except Exception as exc:
+        from ava_extensions.identity.principal_context import (
+            PrincipalContextPolicyError,
+        )
         from ava_extensions.identity.relationship import RelationshipPolicyError
 
         if isinstance(exc, RelationshipPolicyError):
@@ -283,14 +373,29 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                 status_code=503,
                 detail="Ava relationship policy unavailable",
             ) from exc
+        if isinstance(exc, PrincipalContextPolicyError):
+            raise HTTPException(
+                status_code=503,
+                detail="Ava principal context policy unavailable",
+            ) from exc
         raise
     # Tests and third-party extensions written against the former private
     # helper may still return the old pair. The third value is deliberately
     # ignored: shared legacy memory is unavailable to every HTTP principal.
+    principal_context = None
     if len(relationship_context) == 2:
         principal, relationship_overlay = relationship_context
-    else:
+    elif len(relationship_context) == 3:
         principal, relationship_overlay, _protect_legacy_memory = relationship_context
+    elif len(relationship_context) == 4:
+        (
+            principal,
+            relationship_overlay,
+            _protect_legacy_memory,
+            principal_context,
+        ) = relationship_context
+    else:
+        raise RuntimeError("invalid Ava identity context result")
     if principal is None and _identity_header_present(request.headers):
         # A malformed, expired or ambiguous credential is an authentication
         # failure, not an invitation to fall back to anonymous/base mode with
@@ -313,6 +418,25 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
             status_code=422,
             detail="agent conversations require a final user message",
         )
+
+    principal_provenance = principal.provenance if principal is not None else None
+    agent_tool_surface: frozenset[str] | None = None
+    if agent is not None and not request_body.stream and not request_body.tools:
+        try:
+            agent_tool_surface = _request_agent_tool_surface(
+                agent,
+                _HTTP_DISABLED_TOOLS,
+                principal_provenance=principal_provenance,
+            )
+        except ToolCapabilityPolicyUnavailableError as exc:
+            logging.getLogger("openjarvis.server").error(
+                "Ava request tool capability surface is unavailable",
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Ava tool capability policy unavailable",
+            ) from exc
 
     # An immersive request may opt into durable, idempotent turn semantics. The
     # header is never an identity input: storage remains scoped exclusively by
@@ -342,6 +466,7 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
             durable_request_sha256 = _durable_request_sha256(
                 request_body,
                 relationship_overlay,
+                principal_context,
             )
             existing_response = await _resolve_existing_durable_turn(
                 conversation_store,
@@ -372,7 +497,27 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
             _base_identity_prompt,
             config,
         )
+        from ava_extensions.identity.principal_context import (
+            compose_principal_context_prompt,
+        )
+
+        base_identity_prompt = compose_principal_context_prompt(
+            base_identity_prompt,
+            principal_context,
+            display_name_already_present=bool(
+                relationship_overlay is not None and relationship_overlay.display_name
+            ),
+        )
     except IdentityPromptUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Ava identity unavailable",
+        ) from exc
+    except Exception as exc:
+        logging.getLogger("openjarvis.server").error(
+            "Server-owned Ava principal context could not be composed",
+            exc_info=True,
+        )
         raise HTTPException(
             status_code=503,
             detail="Ava identity unavailable",
@@ -381,41 +526,6 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     # HTTP/Matrix requests must never read the mono-tenant legacy fact store.
     # Future personal recall belongs to the governed principal-scoped ledger.
     trusted_context_messages: list[Message] = []
-
-    # Run complexity analysis on the last user message
-    complexity_info = None
-    query_text_for_complexity = ""
-    for m in reversed(request_body.messages):
-        if m.role == "user" and m.content:
-            query_text_for_complexity = m.content
-            break
-    if query_text_for_complexity:
-        try:
-            from openjarvis.learning.routing.complexity import (
-                adjust_tokens_for_model,
-                score_complexity,
-            )
-
-            cr = score_complexity(query_text_for_complexity)
-            suggested = adjust_tokens_for_model(
-                cr.suggested_max_tokens,
-                model,
-            )
-            bounded_suggestion = min(suggested, MAX_COMPLETION_TOKENS)
-            complexity_info = ComplexityInfo(
-                score=cr.score,
-                tier=cr.tier,
-                suggested_max_tokens=bounded_suggestion,
-            )
-            # Bump max_tokens when complexity suggests more than what
-            # the client requested — never reduce below the request value.
-            if bounded_suggestion > request_body.max_tokens:
-                request_body.max_tokens = bounded_suggestion
-        except Exception:
-            logging.getLogger("openjarvis.server").debug(
-                "Complexity analysis failed",
-                exc_info=True,
-            )
 
     # Commit the idempotency/effect barrier immediately before dispatch. Everything
     # above is local validation or read-only context preparation; everything below may
@@ -545,11 +655,9 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
             bus=getattr(request.app.state, "bus", None),
             base_identity_prompt=base_identity_prompt,
             relationship_overlay=relationship_overlay,
-            principal=principal,
             trusted_context_messages=trusted_context_messages,
-            principal_provenance=(
-                principal.provenance if principal is not None else None
-            ),
+            principal_provenance=principal_provenance,
+            tool_surface=agent_tool_surface,
         )
     else:
         bus = getattr(request.app.state, "bus", None)
@@ -570,29 +678,21 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
         from ava_extensions.server import conversation as conversation_store
 
         assistant_text = _response_content(response)
-        response_json = response.model_dump_json()
-        terminal_reason: str | None = None
-        terminal_detail = ""
-        if not assistant_text:
-            terminal_reason = "empty_assistant_response"
-            terminal_detail = "Ava returned no durable reply"
-        elif len(assistant_text) > conversation_store.MAX_CAR_TEXTE:
-            terminal_reason = "assistant_response_too_large"
-            terminal_detail = "Ava durable reply exceeds the storage limit"
-        elif (
-            len(response_json.encode("utf-8"))
-            > conversation_store.MAX_RESPONSE_JSON_BYTES
-        ):
-            terminal_reason = "response_envelope_too_large"
-            terminal_detail = "Ava durable response envelope exceeds the storage limit"
-        if terminal_reason is not None:
+
+        async def abandon_generated_response(
+            reason: str,
+            detail: str,
+            assistant_for_audit: str | None = assistant_text,
+        ) -> None:
+            """Make an already-generated but unstorable response terminal."""
+
             try:
                 await asyncio.to_thread(
                     conversation_store.abandonner_tour,
                     durable_conversation_key,
                     durable_turn_id,
-                    reason=terminal_reason,
-                    assistant_text=assistant_text,
+                    reason=reason,
+                    assistant_text=assistant_for_audit,
                 )
             except conversation_store.ConversationStorageError as exc:
                 raise HTTPException(
@@ -604,7 +704,52 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                     status_code=409,
                     detail="Ava durable turn cannot be abandoned",
                 ) from exc
-            raise HTTPException(status_code=502, detail=terminal_detail)
+            raise HTTPException(status_code=502, detail=detail)
+
+        response_json: str | None = None
+        terminal_reason: str | None = None
+        terminal_detail = ""
+        if _response_finish_reason(response) != "stop":
+            # A token/context/tool-turn limit is not a completed answer.  Committing it
+            # would make the idempotent replay preserve and the UI display exactly the
+            # mid-sentence fragments this durable path is meant to prevent.
+            terminal_reason = "incomplete_response"
+            terminal_detail = "Ava returned an incomplete durable reply"
+        elif not assistant_text:
+            terminal_reason = "empty_assistant_response"
+            terminal_detail = "Ava returned no durable reply"
+        else:
+            try:
+                assistant_utf8_size = len(assistant_text.encode("utf-8"))
+            except UnicodeEncodeError:
+                terminal_reason = "assistant_response_invalid_utf8"
+                terminal_detail = "Ava durable reply is not valid UTF-8"
+            else:
+                if assistant_utf8_size > conversation_store.MAX_CAR_TEXTE:
+                    terminal_reason = "assistant_response_too_large"
+                    terminal_detail = "Ava durable reply exceeds the storage limit"
+        if terminal_reason is None:
+            try:
+                response_json = response.model_dump_json()
+                response_json_size = len(response_json.encode("utf-8"))
+            except (TypeError, ValueError):
+                terminal_reason = "response_envelope_invalid"
+                terminal_detail = "Ava durable response envelope is invalid"
+            else:
+                if response_json_size > conversation_store.MAX_RESPONSE_JSON_BYTES:
+                    terminal_reason = "response_envelope_too_large"
+                    terminal_detail = (
+                        "Ava durable response envelope exceeds the storage limit"
+                    )
+        if terminal_reason is not None:
+            await abandon_generated_response(
+                terminal_reason,
+                terminal_detail,
+                None
+                if terminal_reason == "assistant_response_invalid_utf8"
+                else assistant_text,
+            )
+        assert response_json is not None
         try:
             await asyncio.to_thread(
                 conversation_store.finaliser_tour,
@@ -618,8 +763,11 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
             raise HTTPException(
                 status_code=409, detail="Ava turn id collision"
             ) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail="invalid Ava turn") from exc
+        except ValueError:
+            await abandon_generated_response(
+                "response_envelope_invalid",
+                "Ava durable response envelope is invalid",
+            )
         except conversation_store.ConversationStorageError as exc:
             raise HTTPException(
                 status_code=503,
@@ -649,6 +797,16 @@ def _response_content(response) -> str:
     return content
 
 
+def _response_finish_reason(response) -> str:
+    """Extract the first OpenAI-compatible terminal reason, or an empty value."""
+
+    choices = getattr(response, "choices", None)
+    if not choices:
+        return ""
+    reason = getattr(choices[0], "finish_reason", "")
+    return reason if isinstance(reason, str) else ""
+
+
 def _last_user_text(request_body: ChatCompletionRequest) -> str:
     """Return the exact dispatched user input, only when it is the final message."""
 
@@ -662,6 +820,7 @@ def _last_user_text(request_body: ChatCompletionRequest) -> str:
 def _durable_request_sha256(
     request_body: ChatCompletionRequest,
     relationship_overlay,
+    principal_context=None,
 ) -> str:
     """Bind one idempotency key to the complete effective client request.
 
@@ -685,6 +844,14 @@ def _durable_request_sha256(
             overlay_prompt.encode("utf-8")
         ).hexdigest(),
     }
+    if principal_context is not None:
+        from ava_extensions.identity.principal_context import (
+            principal_context_sha256,
+        )
+
+        payload["principal_context_sha256"] = principal_context_sha256(
+            principal_context
+        )
     canonical = json.dumps(
         payload,
         ensure_ascii=False,
@@ -788,6 +955,14 @@ async def _resolve_existing_durable_turn(
     if _response_content(response) != entry.assistant_text:
         raise conversation_store.ConversationStorageError(
             "durable replay envelope diverges from conversation content"
+        )
+    if _response_finish_reason(response) != "stop" or not entry.assistant_text.strip():
+        # Daemon versions before the terminal guard stored length/unknown
+        # responses as completed. Keep their audit rows, but never replay the
+        # fragment as a successful answer or put it back into model history.
+        raise HTTPException(
+            status_code=410,
+            detail="Ava durable turn is incomplete and cannot be replayed",
         )
     return response
 
@@ -942,7 +1117,9 @@ def _handle_direct(
         choices=[
             Choice(
                 message=choice_msg,
-                finish_reason=result.get("finish_reason", "stop"),
+                finish_reason=_motif_arret(
+                    {"finish_reason": result.get("finish_reason")}
+                ),
             )
         ],
         usage=UsageInfo(
@@ -976,6 +1153,147 @@ _HTTP_DISABLED_TOOLS = frozenset(
     }
 )
 
+_AVA_VEILLE_SCHEDULER_TOOLS = frozenset({"avalon_status", "lire_doc", "proposer_plan"})
+
+
+def _is_ava_veille_scheduler(principal_provenance: str | None) -> bool:
+    """Recognize only the server-established scheduler principal."""
+
+    if not isinstance(principal_provenance, str) or not principal_provenance:
+        return False
+    from ava_extensions.server.principal import Principal
+
+    expected = Principal(
+        "service",
+        "avalon-control-plane",
+        "scheduler:ava-veille",
+    ).provenance
+    return principal_provenance == expected
+
+
+def _request_agent_tool_surface(
+    agent,
+    disabled_tools: frozenset[str],
+    *,
+    principal_provenance: str | None,
+) -> frozenset[str]:
+    """Authorize the exact tool names a request may expose to its model.
+
+    Execution-time checks remain mandatory, but they are too late to constrain
+    model choice: an unavailable tool advertised in the prompt can still steer
+    reasoning or provoke repeated denied calls.  This gate therefore evaluates
+    every declared capability before the request copy reaches ``generate``.
+
+    The long-lived agent and executor are treated as one integrity domain.  A
+    mismatch, malformed tool contract, missing policy, or policy exception makes
+    the whole request surface unavailable rather than exposing a partial or stale
+    registry.  Agents without a concrete tool collection have an empty surface.
+    """
+
+    tools = getattr(agent, "_tools", None)
+    if not isinstance(tools, (list, tuple)) or not tools:
+        return frozenset()
+
+    executor = getattr(agent, "_executor", None)
+    registered = getattr(executor, "_tools", None)
+    if executor is None or not isinstance(registered, dict):
+        raise ToolCapabilityPolicyUnavailableError("tool registries unavailable")
+
+    by_name: dict[str, Any] = {}
+    for tool in tools:
+        try:
+            name = tool.spec.name
+        except Exception as exc:
+            raise ToolCapabilityPolicyUnavailableError(
+                "tool specification unavailable"
+            ) from exc
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in by_name
+            or registered.get(name) is not tool
+        ):
+            raise ToolCapabilityPolicyUnavailableError(
+                "tool registries are inconsistent"
+            )
+        by_name[name] = tool
+    if set(registered) != set(by_name):
+        raise ToolCapabilityPolicyUnavailableError("tool registries are inconsistent")
+
+    exact_surface = (
+        _AVA_VEILLE_SCHEDULER_TOOLS
+        if _is_ava_veille_scheduler(principal_provenance)
+        else None
+    )
+    candidates = {
+        name: tool
+        for name, tool in by_name.items()
+        if name not in disabled_tools
+        and (exact_surface is None or name in exact_surface)
+    }
+    if not candidates:
+        if exact_surface:
+            raise ToolCapabilityPolicyUnavailableError(
+                "scheduler tool surface unavailable"
+            )
+        return frozenset()
+
+    policy = getattr(executor, "_capability_policy", None)
+    policy_check = getattr(policy, "check", None)
+    if policy is None or not callable(policy_check):
+        raise ToolCapabilityPolicyUnavailableError("capability policy unavailable")
+
+    subject = (
+        principal_provenance.strip()
+        if isinstance(principal_provenance, str) and principal_provenance.strip()
+        else ""
+    )
+    authorized: set[str] = set()
+    for name, tool in candidates.items():
+        try:
+            spec = tool.spec
+            capabilities = spec.required_capabilities
+            requires_policy = spec.requires_capability_policy
+        except Exception as exc:
+            raise ToolCapabilityPolicyUnavailableError(
+                "tool capability contract unavailable"
+            ) from exc
+        if (
+            not isinstance(capabilities, (list, tuple))
+            or any(not isinstance(cap, str) or not cap for cap in capabilities)
+            or len(set(capabilities)) != len(capabilities)
+            or not isinstance(requires_policy, bool)
+            or (requires_policy and not capabilities)
+        ):
+            raise ToolCapabilityPolicyUnavailableError(
+                "invalid tool capability contract"
+            )
+
+        allowed = True
+        for capability in capabilities:
+            try:
+                decision = policy_check(subject, capability, name)
+            except Exception as exc:
+                raise ToolCapabilityPolicyUnavailableError(
+                    "capability policy check failed"
+                ) from exc
+            if type(decision) is not bool:
+                raise ToolCapabilityPolicyUnavailableError(
+                    "capability policy returned an invalid decision"
+                )
+            if not decision:
+                allowed = False
+                break
+        if allowed:
+            authorized.add(name)
+
+    surface = frozenset(authorized)
+    if exact_surface is not None and surface != exact_surface:
+        raise ToolCapabilityPolicyUnavailableError(
+            "scheduler tool surface denied or incomplete"
+        )
+    return surface
+
 
 def _copy_agent_for_request(
     agent,
@@ -985,6 +1303,8 @@ def _copy_agent_for_request(
     temperature: float,
     max_tokens: int,
     request_bus=None,
+    principal_provenance: str | None = None,
+    tool_surface: frozenset[str] | None = None,
 ):
     """Return an isolated shallow agent copy for one server request.
 
@@ -1014,24 +1334,39 @@ def _copy_agent_for_request(
     if hasattr(request_agent, "_operator_id"):
         request_agent._operator_id = None
 
+    if tool_surface is None:
+        tool_surface = _request_agent_tool_surface(
+            agent,
+            disabled_tools,
+            principal_provenance=principal_provenance,
+        )
+
     tools = getattr(agent, "_tools", None)
     if isinstance(tools, (list, tuple)):
         request_agent._tools = [
             tool
             for tool in tools
-            if getattr(getattr(tool, "spec", None), "name", None) not in disabled_tools
+            if getattr(getattr(tool, "spec", None), "name", None) in tool_surface
         ]
 
     executor = getattr(agent, "_executor", None)
     if executor is not None:
         request_executor = copy.copy(executor)
         request_executor._bus = request_bus
+        # Capability identity is issued by the authentication boundary.  It
+        # never comes from the OpenAI `user` field, message text, requested
+        # model, or any other client-controlled body value.  Anonymous and
+        # rejected identities use the empty subject, which a strict policy
+        # can never grant.
+        request_executor._principal_provenance = (
+            principal_provenance.strip()
+            if isinstance(principal_provenance, str) and principal_provenance.strip()
+            else ""
+        )
         registered = getattr(executor, "_tools", None)
         if isinstance(registered, dict):
             request_executor._tools = {
-                name: tool
-                for name, tool in registered.items()
-                if name not in disabled_tools
+                name: tool for name, tool in registered.items() if name in tool_surface
             }
         request_agent._executor = request_executor
 
@@ -1058,9 +1393,9 @@ def _handle_agent(
     bus=None,
     base_identity_prompt: str = "",
     relationship_overlay=None,
-    principal=None,
     trusted_context_messages: list[Message] | None = None,
     principal_provenance: str | None = None,
+    tool_surface: frozenset[str] | None = None,
 ) -> ChatCompletionResponse:
     """Run through agent.
 
@@ -1084,15 +1419,14 @@ def _handle_agent(
         base_identity_prompt,
         relationship_overlay,
     )
-    interlocutor_context = _trusted_interlocutor_context(
-        principal,
-        relationship_overlay,
+    relationship_display_context = _trusted_relationship_display_context(
+        relationship_overlay
     )
-    if interlocutor_context:
+    if relationship_display_context:
         server_identity_prompt = (
             f"{server_identity_prompt}\n\n"
             "## Contexte d'interlocuteur établi par le serveur\n"
-            f"{interlocutor_context}"
+            f"{relationship_display_context}"
         )
     ctx.metadata["server_identity_prompt"] = server_identity_prompt
     disabled_tools = _HTTP_DISABLED_TOOLS
@@ -1120,6 +1454,8 @@ def _handle_agent(
         temperature=req.temperature,
         max_tokens=req.max_tokens,
         request_bus=request_bus,
+        principal_provenance=principal_provenance,
+        tool_surface=tool_surface,
     )
     trace_id: str | None = None
     if trace_store is not None:
@@ -1342,8 +1678,8 @@ async def _handle_stream(
 
     from openjarvis.server.cloud_router import (
         is_cloud_model,
-        stream_cloud,
-        stream_local,
+        stream_cloud_full,
+        stream_local_full,
     )
 
     messages = _to_messages(req.messages)
@@ -1369,6 +1705,7 @@ async def _handle_stream(
     async def generate():
         started_at = time.time()
         full_content = ""
+        finish_reason: str | None = None
         # Send role chunk first
         first_chunk = ChatCompletionChunk(
             id=chunk_id,
@@ -1389,7 +1726,7 @@ async def _handle_stream(
             # confusion), which is detected by checking the routed engine's
             # is_cloud attribute.
             if use_cloud:
-                token_iter = stream_cloud(
+                chunk_iter = stream_cloud_full(
                     model, messages, req.temperature, req.max_tokens
                 )
             else:
@@ -1410,28 +1747,33 @@ async def _handle_stream(
                 except Exception:
                     pass
                 if _use_local_fallback:
-                    token_iter = stream_local(
+                    chunk_iter = stream_local_full(
                         model, messages, req.temperature, req.max_tokens
                     )
                 else:
-                    token_iter = engine.stream(
+                    chunk_iter = engine.stream_full(
                         messages,
                         model=model,
                         temperature=req.temperature,
                         max_tokens=req.max_tokens,
                     )
-            async for token in token_iter:
-                full_content += token
-                chunk = ChatCompletionChunk(
-                    id=chunk_id,
-                    model=model,
-                    choices=[
-                        StreamChoice(
-                            delta=DeltaMessage(content=token),
-                        )
-                    ],
-                )
-                yield f"data: {chunk.model_dump_json()}\n\n"
+            async for stream_chunk in chunk_iter:
+                if stream_chunk.content:
+                    full_content += stream_chunk.content
+                    chunk = ChatCompletionChunk(
+                        id=chunk_id,
+                        model=model,
+                        choices=[
+                            StreamChoice(
+                                delta=DeltaMessage(content=stream_chunk.content),
+                            )
+                        ],
+                    )
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+                if stream_chunk.finish_reason:
+                    finish_reason = _motif_arret(
+                        {"finish_reason": stream_chunk.finish_reason}
+                    )
         except Exception:
             import logging
 
@@ -1446,7 +1788,7 @@ async def _handle_stream(
             yield "data: [DONE]\n\n"
             return
 
-        if not full_content.strip():
+        if finish_reason != "stop" or not full_content.strip():
             yield (
                 'data: {"error":{"type":"empty_or_incomplete_response",'
                 '"message":"Chat generation returned no complete response"}}\n\n'
@@ -1481,7 +1823,7 @@ async def _handle_stream(
                 allow_legacy_memory=allow_legacy_memory,
             )
 
-        # Send finish chunk with usage data if available
+        # Send a success terminal only after the provider proved a complete answer.
         import json as _json
 
         finish_data = ChatCompletionChunk(

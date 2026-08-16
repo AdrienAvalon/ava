@@ -1,0 +1,24 @@
+{
+  "schema_version": "ava.infra-autonomy.capability-catalog/v1",
+  "catalog_id": "ava.runtime-tool-capabilities",
+  "version": "1.0.0",
+  "frozen": true,
+  "source_attestation": {
+    "path": "repo://ava/ava_extensions/tool_capabilities.py",
+    "sha256": "sha256:ee474d7e11f276cc9fb3708075242db0bc643a57fcd4ddd4845eb0e8de842204",
+    "extraction": "python-string-constants"
+  },
+  "capabilities": [
+    {"constant": "NETWORK_FETCH", "id": "network:fetch"},
+    {"constant": "FILE_READ", "id": "file:read"},
+    {"constant": "INFRA_OBSERVE", "id": "ava:infra:observe"},
+    {"constant": "INFRA_LOGS_READ", "id": "ava:infra:logs:read"},
+    {"constant": "HOME_OBSERVE", "id": "ava:home:observe"},
+    {"constant": "EVOLUTIONS_READ", "id": "ava:evolutions:read"},
+    {"constant": "DOCS_READ", "id": "ava:docs:read"},
+    {"constant": "DOCS_PLAN", "id": "ava:docs:plan"},
+    {"constant": "DOCS_PROPOSE", "id": "ava:docs:propose"},
+    {"constant": "JOURNAL_READ", "id": "ava:journal:read"},
+    {"constant": "INTROSPECTION_READ", "id": "ava:introspection:read"}
+  ]
+}

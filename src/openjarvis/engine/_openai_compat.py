@@ -17,6 +17,7 @@ from openjarvis.engine._base import (
     estimate_prompt_tokens,
     messages_to_dicts,
 )
+from openjarvis.engine._finish import conservative_finish_reason
 from openjarvis.engine._http_async import (
     STREAM_TRANSPORT_ERRORS,
     AsyncHTTPEngineMixin,
@@ -152,7 +153,7 @@ class _OpenAICompatibleEngine(AsyncHTTPEngineMixin, InferenceEngine):
                 "total_tokens": prompt_tokens + completion_tokens,
             },
             "model": data.get("model", model),
-            "finish_reason": choice.get("finish_reason", "stop"),
+            "finish_reason": conservative_finish_reason(choice.get("finish_reason")),
         }
         # Extract tool calls if present
         raw_tool_calls = choice["message"].get("tool_calls", [])
@@ -212,10 +213,7 @@ class _OpenAICompatibleEngine(AsyncHTTPEngineMixin, InferenceEngine):
                     data_str = line[len("data:") :].strip()
                     if data_str == "[DONE]":
                         break
-                    try:
-                        chunk = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
+                    chunk = json.loads(data_str)
                     delta = chunk.get("choices", [{}])[0].get("delta", {})
                     content = delta.get("content")
                     if content:
@@ -269,10 +267,7 @@ class _OpenAICompatibleEngine(AsyncHTTPEngineMixin, InferenceEngine):
                     data_str = line[len("data:") :].strip()
                     if data_str == "[DONE]":
                         break
-                    try:
-                        chunk = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
+                    chunk = json.loads(data_str)
                     choice = chunk.get("choices", [{}])[0]
                     delta = choice.get("delta", {})
                     finish = choice.get("finish_reason")

@@ -55,11 +55,12 @@ def _fake_anthropic_response(
     model: str = "claude-opus-4-6",
     input_tokens: int = 12,
     output_tokens: int = 8,
+    stop_reason: str | None = "end_turn",
 ) -> SimpleNamespace:
     usage = SimpleNamespace(input_tokens=input_tokens, output_tokens=output_tokens)
     text_block = SimpleNamespace(text=content)
     return SimpleNamespace(
-        content=[text_block], usage=usage, model=model, stop_reason="end_turn"
+        content=[text_block], usage=usage, model=model, stop_reason=stop_reason
     )
 
 
@@ -67,12 +68,18 @@ def _fake_gemini_response(
     content: str = "Hello!",
     prompt_tokens: int = 15,
     completion_tokens: int = 10,
+    finish_reason: object = "STOP",
 ) -> SimpleNamespace:
     usage = SimpleNamespace(
         prompt_token_count=prompt_tokens,
         candidates_token_count=completion_tokens,
     )
-    return SimpleNamespace(text=content, usage_metadata=usage)
+    part = SimpleNamespace(text=content, function_call=None)
+    candidate = SimpleNamespace(
+        content=SimpleNamespace(parts=[part]),
+        finish_reason=finish_reason,
+    )
+    return SimpleNamespace(text=content, usage_metadata=usage, candidates=[candidate])
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +315,33 @@ class TestCloudAnthropic:
         )
         assert "tool_calls" not in result
 
+    @pytest.mark.parametrize(
+        ("stop_reason", "expected"),
+        [
+            ("end_turn", "stop"),
+            ("max_tokens", "length"),
+            (None, None),
+        ],
+    )
+    def test_anthropic_preserves_terminal_truth(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        stop_reason,
+        expected,
+    ) -> None:
+        engine = _make_cloud_engine(monkeypatch)
+        fake_client = mock.MagicMock()
+        fake_client.messages.create.return_value = _fake_anthropic_response(
+            stop_reason=stop_reason
+        )
+        engine._anthropic_client = fake_client
+
+        result = engine.generate(
+            [Message(role=Role.USER, content="Hi")], model="claude-opus-4-6"
+        )
+
+        assert result["finish_reason"] == expected
+
     def test_anthropic_system_message(self, monkeypatch: pytest.MonkeyPatch) -> None:
         engine = _make_cloud_engine(monkeypatch)
         fake_client = mock.MagicMock()
@@ -380,6 +414,44 @@ class TestCloudGemini:
         assert result["model"] == "gemini-2.5-pro"
         assert result["usage"]["prompt_tokens"] == 15
         assert result["usage"]["completion_tokens"] == 10
+
+    @pytest.mark.parametrize(
+        ("finish_reason", "expected"),
+        [
+            ("STOP", "stop"),
+            ("MAX_TOKENS", "length"),
+            ("SAFETY", "content_filter"),
+            (None, None),
+        ],
+    )
+    def test_gemini_preserves_terminal_truth(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        finish_reason,
+        expected,
+    ) -> None:
+        engine = _make_cloud_engine(monkeypatch)
+        fake_client = mock.MagicMock()
+        fake_client.models.generate_content.return_value = _fake_gemini_response(
+            finish_reason=finish_reason
+        )
+        engine._google_client = fake_client
+        fake_types = mock.MagicMock()
+        fake_types.GenerateContentConfig.return_value = mock.MagicMock()
+
+        with mock.patch.dict(
+            "sys.modules",
+            {
+                "google": mock.MagicMock(),
+                "google.genai": mock.MagicMock(),
+                "google.genai.types": fake_types,
+            },
+        ):
+            result = engine.generate(
+                [Message(role=Role.USER, content="Hi")], model="gemini-2.5-pro"
+            )
+
+        assert result["finish_reason"] == expected
 
     def test_gemini_2_5_flash_generate(self, monkeypatch: pytest.MonkeyPatch) -> None:
         engine = _make_cloud_engine(monkeypatch)
@@ -462,7 +534,7 @@ class TestCloudGemini:
         fc = SimpleNamespace(name="calculator", args={"expression": "2+2"})
         fc_part = SimpleNamespace(text=None, function_call=fc)
         content_obj = SimpleNamespace(parts=[text_part, fc_part])
-        candidate = SimpleNamespace(content=content_obj)
+        candidate = SimpleNamespace(content=content_obj, finish_reason="MAX_TOKENS")
         usage = SimpleNamespace(prompt_token_count=10, candidates_token_count=8)
         fake_resp = SimpleNamespace(
             candidates=[candidate],
@@ -504,6 +576,7 @@ class TestCloudGemini:
         tc = result["tool_calls"][0]
         assert tc["name"] == "calculator"
         assert '"expression"' in tc["arguments"]
+        assert result["finish_reason"] == "length"
 
     def test_gemini_no_tool_calls_when_absent(
         self, monkeypatch: pytest.MonkeyPatch

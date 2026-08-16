@@ -451,6 +451,103 @@ class ResearchResult:
     usage: Dict[str, int] = field(default_factory=dict)
 
 
+class IncompleteResearchResponse(RuntimeError):
+    """Raised when a would-be final model response is not provably complete."""
+
+
+_COMPLETE_FINAL_REASONS = frozenset({"stop", "end_turn", "stop_sequence"})
+_COMPLETE_TOOL_REASONS = frozenset(
+    {
+        "tool_calls",
+        "tool_use",
+        "function_call",
+        "stop",
+        "end_turn",
+        "stop_sequence",
+    }
+)
+
+
+def _finish_reason(result: Dict[str, Any]) -> str:
+    raw_reason = result.get("finish_reason")
+    return str(raw_reason).strip().lower() if raw_reason is not None else ""
+
+
+def _require_complete_final_response(result: Dict[str, Any]) -> None:
+    """Reject a terminal response unless the provider proves normal completion.
+
+    Tool-call turns are deliberately checked by the caller only after it has
+    established that no tools were requested.  Providers use distinct
+    intermediate stop reasons (``tool_calls`` / ``tool_use``), which must not
+    be mistaken for an incomplete *final* synthesis.
+    """
+
+    reason = _finish_reason(result)
+    if reason not in _COMPLETE_FINAL_REASONS:
+        detail = reason or "missing"
+        raise IncompleteResearchResponse(
+            f"research synthesis did not complete normally ({detail})"
+        )
+
+
+def _require_complete_tool_response(result: Dict[str, Any]) -> None:
+    """Reject tool calls whose arguments may have been cut off or refused."""
+
+    reason = _finish_reason(result)
+    if reason not in _COMPLETE_TOOL_REASONS:
+        detail = reason or "missing"
+        raise IncompleteResearchResponse(
+            f"research tool call did not complete normally ({detail})"
+        )
+
+
+def _validated_tool_calls(
+    tool_calls: Any,
+) -> List[Tuple[Dict[str, Any], str, Dict[str, Any]]]:
+    """Validate provider tool payloads before any event or side effect."""
+
+    if not isinstance(tool_calls, list) or not tool_calls:
+        raise IncompleteResearchResponse("research tool payload is invalid")
+
+    validated: List[Tuple[Dict[str, Any], str, Dict[str, Any]]] = []
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            raise IncompleteResearchResponse("research tool payload is invalid")
+
+        name = tool_call.get("name")
+        if name not in {"search", "clarify"}:
+            raise IncompleteResearchResponse("research tool payload is invalid")
+
+        raw_arguments = tool_call.get("arguments")
+        try:
+            arguments = (
+                json.loads(raw_arguments)
+                if isinstance(raw_arguments, str)
+                else dict(raw_arguments)
+            )
+        except (json.JSONDecodeError, TypeError, ValueError):
+            raise IncompleteResearchResponse(
+                "research tool payload is invalid"
+            ) from None
+        if not isinstance(arguments, dict):
+            raise IncompleteResearchResponse("research tool payload is invalid")
+
+        validated.append((tool_call, name, arguments))
+
+    return validated
+
+
+def _configured_completion_limit() -> int:
+    """Resolve the legacy non-web caller default from runtime configuration."""
+
+    from openjarvis.core.config import load_config
+
+    configured = load_config().intelligence.max_tokens
+    if type(configured) is not int or configured < 1:
+        raise ValueError("intelligence.max_tokens must be a positive integer")
+    return configured
+
+
 class ResearchAgent:
     """Planner + executor loop over a single hybrid-search tool.
 
@@ -466,7 +563,10 @@ class ResearchAgent:
     max_iterations:
         Hard ceiling on tool calls before the loop is forced into synthesis.
     temperature, max_tokens, num_ctx:
-        Generation parameters passed through to ``engine.generate``.
+        Generation parameters passed through to ``engine.generate``. When
+        ``max_tokens`` is omitted by a legacy non-web caller, it is resolved
+        from the runtime ``intelligence.max_tokens`` configuration rather than
+        from a fixed research-only ceiling.
     on_event:
         Optional callback fired at loop milestones so callers (e.g. the SSE
         research router) can stream progress without rewriting the loop.
@@ -487,7 +587,7 @@ class ResearchAgent:
         model: str = DEFAULT_PLANNER_MODEL,
         max_iterations: int = 5,
         temperature: float = 0.3,
-        max_tokens: int = 1500,
+        max_tokens: Optional[int] = None,
         num_ctx: int = 16384,
         clarify_handler: Optional[Callable[[str], str]] = None,
         on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -498,7 +598,12 @@ class ResearchAgent:
         self._model = model
         self._max_iterations = int(max_iterations)
         self._temperature = float(temperature)
-        self._max_tokens = int(max_tokens)
+        resolved_max_tokens = (
+            _configured_completion_limit() if max_tokens is None else max_tokens
+        )
+        if type(resolved_max_tokens) is not int or resolved_max_tokens < 1:
+            raise ValueError("max_tokens must be a positive integer")
+        self._max_tokens = resolved_max_tokens
         self._num_ctx = int(num_ctx)
         self._clarify_handler = clarify_handler or _default_clarify_handler
         self._on_event = on_event
@@ -673,7 +778,11 @@ class ResearchAgent:
             content = result.get("content", "") or ""
             tool_calls_raw = result.get("tool_calls", []) or []
 
-            if not tool_calls_raw:
+            if tool_calls_raw:
+                _require_complete_tool_response(result)
+                validated_tool_calls = _validated_tool_calls(tool_calls_raw)
+            else:
+                _require_complete_final_response(result)
                 if content.strip():
                     answer, final_sources = _finalize(content.strip())
                     self._emit(
@@ -717,26 +826,15 @@ class ResearchAgent:
                 tool_calls=[
                     ToolCall(
                         id=tc.get("id", f"call_{i}"),
-                        name=tc.get("name", "search"),
-                        arguments=tc.get("arguments", "{}") or "{}",
+                        name=name,
+                        arguments=json.dumps(args, ensure_ascii=False),
                     )
-                    for i, tc in enumerate(tool_calls_raw)
+                    for i, (tc, name, args) in enumerate(validated_tool_calls)
                 ],
             )
             messages.append(assistant_msg)
 
-            for tc in tool_calls_raw:
-                name = tc.get("name", "")
-                raw_args = tc.get("arguments", "{}") or "{}"
-                try:
-                    args = (
-                        json.loads(raw_args)
-                        if isinstance(raw_args, str)
-                        else dict(raw_args)
-                    )
-                except json.JSONDecodeError:
-                    args = {}
-
+            for tc, name, args in validated_tool_calls:
                 if name == "search":
                     # Guard against the planner pre-empting clarify before any
                     # search has run — silently accept; the rule lives in the
@@ -856,6 +954,11 @@ class ResearchAgent:
         )
         for k in total_usage:
             total_usage[k] += int(final.get("usage", {}).get(k, 0))
+        if final.get("tool_calls"):
+            raise IncompleteResearchResponse(
+                "research synthesis returned a tool call after tools were disabled"
+            )
+        _require_complete_final_response(final)
         answer = (final.get("content", "") or "").strip()
         if not answer:
             answer = (
@@ -875,6 +978,7 @@ class ResearchAgent:
 __all__ = [
     "ResearchAgent",
     "ResearchResult",
+    "IncompleteResearchResponse",
     "ToolInvocation",
     "SEARCH_TOOL_SPEC",
     "CLARIFY_TOOL_SPEC",

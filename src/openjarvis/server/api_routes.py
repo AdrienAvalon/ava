@@ -6,7 +6,8 @@ import asyncio
 import inspect
 import json
 import logging
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
@@ -14,16 +15,6 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 
 # ---- Request/Response models ----
-
-
-class AgentCreateRequest(BaseModel):
-    agent_type: str
-    tools: Optional[List[str]] = None
-    agent_id: Optional[str] = None
-
-
-class AgentMessageRequest(BaseModel):
-    message: str
 
 
 class MemoryStoreRequest(BaseModel):
@@ -62,90 +53,50 @@ class OptimizeRunRequest(BaseModel):
 
 agents_router = APIRouter(prefix="/v1/agents", tags=["agents"])
 
+_LEGACY_AGENT_HTTP_QUARANTINE_DETAIL = (
+    "Legacy shared agent HTTP API is quarantined; use /v1/managed-agents"
+)
+
+
+def _reject_legacy_agent_http() -> None:
+    """Reject the global upstream agent store before any read or mutation."""
+
+    raise HTTPException(
+        status_code=410,
+        detail=_LEGACY_AGENT_HTTP_QUARANTINE_DETAIL,
+    )
+
 
 @agents_router.get("")
 async def list_agents(request: Request):
-    """List available agent types and running agents."""
-    registered = []
-    try:
-        import openjarvis.agents  # noqa: F401 — side-effect registration
-        from openjarvis.core.registry import AgentRegistry
+    """Quarantine the unscoped upstream agent registry."""
 
-        for key in sorted(AgentRegistry.keys()):
-            cls = AgentRegistry.get(key)
-            registered.append(
-                {
-                    "key": key,
-                    "class": cls.__name__,
-                    "accepts_tools": getattr(cls, "accepts_tools", False),
-                }
-            )
-    except Exception as exc:
-        logger.warning("Failed to list registered agents: %s", exc)
-
-    running = []
-    try:
-        from openjarvis.tools.agent_tools import _SPAWNED_AGENTS
-
-        running = [{"id": k, **v} for k, v in _SPAWNED_AGENTS.items()]
-    except ImportError:
-        pass
-
-    return {"registered": registered, "running": running}
+    del request
+    _reject_legacy_agent_http()
 
 
 @agents_router.post("")
-async def create_agent(req: AgentCreateRequest, request: Request):
-    """Spawn a new agent."""
-    try:
-        from openjarvis.tools.agent_tools import AgentSpawnTool
+async def create_agent(request: Request):
+    """Reject creation in the unscoped upstream agent registry."""
 
-        tool = AgentSpawnTool()
-        params = {"agent_type": req.agent_type}
-        if req.tools:
-            params["tools"] = ",".join(req.tools)
-        if req.agent_id:
-            params["agent_id"] = req.agent_id
-        result = tool.execute(**params)
-        if not result.success:
-            raise HTTPException(status_code=400, detail=result.content)
-        return {
-            "status": "created",
-            "content": result.content,
-            "metadata": result.metadata,
-        }
-    except ImportError:
-        raise HTTPException(status_code=501, detail="Agent tools not available")
+    del request
+    _reject_legacy_agent_http()
 
 
 @agents_router.delete("/{agent_id}")
 async def kill_agent(agent_id: str, request: Request):
-    """Kill a running agent."""
-    try:
-        from openjarvis.tools.agent_tools import AgentKillTool
+    """Reject mutation of the unscoped upstream agent registry."""
 
-        tool = AgentKillTool()
-        result = tool.execute(agent_id=agent_id)
-        if not result.success:
-            raise HTTPException(status_code=404, detail=result.content)
-        return {"status": "stopped", "agent_id": agent_id}
-    except ImportError:
-        raise HTTPException(status_code=501, detail="Agent tools not available")
+    del agent_id, request
+    _reject_legacy_agent_http()
 
 
 @agents_router.post("/{agent_id}/message")
-async def message_agent(agent_id: str, req: AgentMessageRequest, request: Request):
-    """Send a message to a running agent."""
-    try:
-        from openjarvis.tools.agent_tools import AgentSendTool
+async def message_agent(agent_id: str, request: Request):
+    """Reject messages to the unscoped upstream agent registry."""
 
-        tool = AgentSendTool()
-        result = tool.execute(agent_id=agent_id, message=req.message)
-        if not result.success:
-            raise HTTPException(status_code=404, detail=result.content)
-        return {"status": "sent", "content": result.content}
-    except ImportError:
-        raise HTTPException(status_code=501, detail="Agent tools not available")
+    del agent_id, request
+    _reject_legacy_agent_http()
 
 
 # ---- Memory routes ----
@@ -446,6 +397,12 @@ async def memory_index(req: MemoryIndexRequest, request: Request):
 
 traces_router = APIRouter(prefix="/v1/traces", tags=["traces"])
 
+_TOOL_PROOF_SCHEMA = "ava.tool-execution-proof/v1"
+_TOOL_PROOF_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+_TOOL_PROOF_MAX_STEPS = 256
+_TOOL_PROOF_MAX_CALLS = 64
+_TOOL_PROOF_MAX_DISTINCT = 16
+
 
 def _require_trace_principal(request: Request):
     """Return the verified principal that owns a trace-facing request.
@@ -490,6 +447,77 @@ def _serialise_trace(trace) -> dict:
     return d
 
 
+def _tool_execution_proof(trace: Any) -> dict[str, Any]:
+    """Project one trace to a bounded, content-free execution proof.
+
+    Tool arguments, outputs, metadata, timings and errors deliberately never cross
+    this boundary.  The names and success bits come from server-owned execution
+    events recorded after capability and confirmation checks, not from model prose.
+    """
+
+    from openjarvis.core.types import StepType
+
+    trace_id = getattr(trace, "trace_id", None)
+    result = getattr(trace, "result", None)
+    steps = getattr(trace, "steps", None)
+    if (
+        not isinstance(trace_id, str)
+        or not trace_id
+        or not isinstance(steps, list)
+        or len(steps) > _TOOL_PROOF_MAX_STEPS
+    ):
+        raise ValueError("invalid trace")
+
+    aggregate: dict[str, list[int]] = {}
+    call_count = 0
+    for step in steps:
+        step_type = getattr(step, "step_type", None)
+        if step_type not in {StepType.TOOL_CALL, StepType.TOOL_CALL.value}:
+            continue
+        call_count += 1
+        if call_count > _TOOL_PROOF_MAX_CALLS:
+            raise ValueError("too many tool calls")
+        input_data = getattr(step, "input", None)
+        output_data = getattr(step, "output", None)
+        if not isinstance(input_data, dict) or not isinstance(output_data, dict):
+            raise ValueError("invalid tool step")
+        name = input_data.get("tool")
+        success = output_data.get("success")
+        if (
+            not isinstance(name, str)
+            or _TOOL_PROOF_NAME.fullmatch(name) is None
+            or type(success) is not bool
+        ):
+            raise ValueError("invalid tool step")
+        counts = aggregate.setdefault(name, [0, 0])
+        if len(aggregate) > _TOOL_PROOF_MAX_DISTINCT:
+            raise ValueError("too many distinct tools")
+        counts[0] += 1
+        counts[1] += int(success)
+
+    calls = [
+        {
+            "tool": name,
+            "count": count,
+            "successes": successes,
+            "failures": count - successes,
+        }
+        for name, (count, successes) in sorted(aggregate.items())
+    ]
+    return {
+        "schema": _TOOL_PROOF_SCHEMA,
+        "trace_id": trace_id,
+        "complete": (
+            getattr(trace, "outcome", None) == "completed"
+            and isinstance(result, str)
+            and bool(result.strip())
+            and all(call["failures"] == 0 for call in calls)
+        ),
+        "call_count": call_count,
+        "calls": calls,
+    }
+
+
 @traces_router.get("")
 async def list_traces(request: Request, limit: int = 20):
     """List recent traces belonging to the verified request principal."""
@@ -506,6 +534,26 @@ async def list_traces(request: Request, limit: int = 20):
         return {"traces": items}
     except Exception as exc:
         return {"traces": [], "error": str(exc)}
+
+
+@traces_router.get("/{trace_id}/tool-execution-proof")
+async def get_tool_execution_proof(trace_id: str, request: Request):
+    """Return only a bounded proof of executed tools for the trace owner."""
+
+    principal = _require_trace_principal(request)
+    try:
+        store = getattr(request.app.state, "trace_store", None)
+        if store is None:
+            raise HTTPException(status_code=404, detail="Trace not found")
+        trace = store.get(trace_id)
+        if trace is None or not _trace_owned_by(trace, principal.provenance):
+            raise HTTPException(status_code=404, detail="Trace not found")
+        return _tool_execution_proof(trace)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.warning("Invalid trace tool proof", exc_info=True)
+        raise HTTPException(status_code=409, detail="Trace proof unavailable") from None
 
 
 @traces_router.get("/{trace_id}")
@@ -791,15 +839,36 @@ async def _websocket_trust_context(websocket: WebSocket):
         _relationship_context,
         websocket.headers,
     )
+    principal_context = None
     if len(relationship_context) == 2:
         principal, relationship_overlay = relationship_context
-    else:
+    elif len(relationship_context) == 3:
         principal, relationship_overlay, _protect_legacy_memory = relationship_context
+    elif len(relationship_context) == 4:
+        (
+            principal,
+            relationship_overlay,
+            _protect_legacy_memory,
+            principal_context,
+        ) = relationship_context
+    else:
+        raise RuntimeError("invalid Ava identity context result")
     if principal is None and _identity_header_present(websocket.headers):
         raise _WebSocketIdentityRejectedError
     base_identity_prompt = await asyncio.to_thread(
         _base_identity_prompt,
         getattr(websocket.app.state, "config", None),
+    )
+    from ava_extensions.identity.principal_context import (
+        compose_principal_context_prompt,
+    )
+
+    base_identity_prompt = compose_principal_context_prompt(
+        base_identity_prompt,
+        principal_context,
+        display_name_already_present=bool(
+            relationship_overlay is not None and relationship_overlay.display_name
+        ),
     )
     return principal, relationship_overlay, base_identity_prompt
 
@@ -900,13 +969,18 @@ async def websocket_chat_stream(websocket: WebSocket):
                 continue
 
             from openjarvis.core.types import Message, Role
-            from openjarvis.server.routes import _ensure_identity_prompt
+            from openjarvis.server.routes import (
+                _ensure_identity_prompt,
+                _motif_arret,
+                _runtime_completion_limit,
+            )
 
             messages = _ensure_identity_prompt(
                 [Message(role=Role.USER, content=message)],
                 base_identity_prompt,
                 relationship_overlay,
             )
+            max_tokens = _runtime_completion_limit(websocket)
 
             # This WS path streams straight from the engine (no agent /
             # TraceCollector), so record the interaction directly once it
@@ -917,48 +991,34 @@ async def websocket_chat_stream(websocket: WebSocket):
             _ws_started_at = _time.time()
 
             try:
-                # Prefer streaming if the engine supports it
-                stream_fn = getattr(engine, "stream", None)
-                if stream_fn is not None and (
-                    inspect.isasyncgenfunction(stream_fn) or callable(stream_fn)
-                ):
+                # Only the rich stream can prove whether the provider completed
+                # normally.  The legacy text-only stream erases max-token and
+                # transport terminals, so it must not be treated as success.
+                stream_fn = getattr(engine, "stream_full", None)
+                if stream_fn is not None and inspect.isasyncgenfunction(stream_fn):
                     full_content = ""
-                    try:
-                        gen = stream_fn(messages, model=model)
-                        # Handle both async and sync generators
-                        if inspect.isasyncgen(gen):
-                            async for token in gen:
-                                full_content += token
-                                await websocket.send_json(
-                                    {"type": "chunk", "content": token},
-                                )
-                        else:
-                            # Sync generator — iterate in a thread to avoid
-                            # blocking the event loop
-                            for token in gen:
-                                full_content += token
-                                await websocket.send_json(
-                                    {"type": "chunk", "content": token},
-                                )
-                    except TypeError:
-                        # stream() didn't return an iterable; fall back to
-                        # generate(). It makes a blocking upstream call, so run
-                        # it in a worker thread to keep the event loop free.
-                        result = await asyncio.to_thread(
-                            engine.generate, messages, model=model
-                        )
-                        content = (
-                            result.get("content", "")
-                            if isinstance(
-                                result,
-                                dict,
+                    terminal_reason: Optional[str] = None
+                    gen = stream_fn(
+                        messages,
+                        model=model,
+                        max_tokens=max_tokens,
+                    )
+                    async for chunk in gen:
+                        content = chunk.content or ""
+                        if content:
+                            full_content += content
+                            await websocket.send_json(
+                                {"type": "chunk", "content": content},
                             )
-                            else str(result)
-                        )
-                        full_content = content
+                        if chunk.finish_reason is not None:
+                            terminal_reason = _motif_arret(
+                                {"finish_reason": chunk.finish_reason}
+                            )
+                    if terminal_reason != "stop" or not full_content.strip():
                         await websocket.send_json(
-                            {"type": "chunk", "content": content},
+                            {"type": "error", "detail": "Chat response incomplete"},
                         )
+                        continue
                     await websocket.send_json(
                         {"type": "done", "content": full_content},
                     )
@@ -974,10 +1034,13 @@ async def websocket_chat_stream(websocket: WebSocket):
                         ),
                     )
                 else:
-                    # No stream method — single-shot generate. Blocking upstream
+                    # No rich stream — single-shot generate. Blocking upstream
                     # call, so run in a worker thread to keep the event loop free.
                     result = await asyncio.to_thread(
-                        engine.generate, messages, model=model
+                        engine.generate,
+                        messages,
+                        model=model,
+                        max_tokens=max_tokens,
                     )
                     content = (
                         result.get("content", "")
@@ -985,11 +1048,26 @@ async def websocket_chat_stream(websocket: WebSocket):
                             result,
                             dict,
                         )
-                        else str(result)
+                        else ""
                     )
-                    await websocket.send_json(
-                        {"type": "chunk", "content": content},
+                    terminal_reason = _motif_arret(
+                        {
+                            "finish_reason": (
+                                result.get("finish_reason")
+                                if isinstance(result, dict)
+                                else None
+                            )
+                        }
                     )
+                    if content:
+                        await websocket.send_json(
+                            {"type": "chunk", "content": content},
+                        )
+                    if terminal_reason != "stop" or not content.strip():
+                        await websocket.send_json(
+                            {"type": "error", "detail": "Chat response incomplete"},
+                        )
+                        continue
                     await websocket.send_json(
                         {"type": "done", "content": content},
                     )

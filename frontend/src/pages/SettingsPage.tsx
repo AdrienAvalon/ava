@@ -236,6 +236,7 @@ const themeOptions: { value: ThemeMode; label: string; icon: typeof Sun }[] = [
 export function SettingsPage() {
   const settings = useAppStore((s) => s.settings);
   const updateSettings = useAppStore((s) => s.updateSettings);
+  const setMaxTokensOverride = useAppStore((s) => s.setMaxTokensOverride);
   const conversations = useAppStore((s) => s.conversations);
   const serverInfo = useAppStore((s) => s.serverInfo);
   const [healthy, setHealthy] = useState<boolean | null>(null);
@@ -690,16 +691,44 @@ export function SettingsPage() {
                 className="w-32 cursor-pointer accent-[var(--color-accent)]"
               />
             </SettingRow>
-            <SettingRow label="Max tokens" description={`${settings.maxTokens}`}>
-              <input
-                type="range"
-                min="256"
-                max="32768"
-                step="256"
-                value={settings.maxTokens}
-                onChange={(e) => { updateSettings({ maxTokens: parseInt(e.target.value) }); showSaved(); }}
-                className="w-32 cursor-pointer accent-[var(--color-accent)]"
-              />
+            <SettingRow
+              label="Max tokens"
+              description={settings.maxTokensSource === 'server' ? 'Server limit' : `${settings.maxTokens} (custom)`}
+            >
+              <div className="flex items-center gap-3">
+                <select
+                  aria-label="Max token limit source"
+                  value={settings.maxTokensSource}
+                  onChange={(e) => {
+                    setMaxTokensOverride(e.target.value === 'server' ? null : settings.maxTokens);
+                    showSaved();
+                  }}
+                  className="rounded-md px-2 py-1 text-xs"
+                  style={{
+                    color: 'var(--color-text)',
+                    background: 'var(--color-bg-tertiary)',
+                    border: '1px solid var(--color-border)',
+                  }}
+                >
+                  <option value="server">Server limit</option>
+                  <option value="user">Custom limit</option>
+                </select>
+                {settings.maxTokensSource === 'user' && (
+                  <input
+                    aria-label="Custom max tokens"
+                    type="range"
+                    min="256"
+                    max="32768"
+                    step="256"
+                    value={settings.maxTokens}
+                    onChange={(e) => {
+                      setMaxTokensOverride(parseInt(e.target.value));
+                      showSaved();
+                    }}
+                    className="w-32 cursor-pointer accent-[var(--color-accent)]"
+                  />
+                )}
+              </div>
             </SettingRow>
           </Section>
 

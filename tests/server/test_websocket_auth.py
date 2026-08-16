@@ -8,19 +8,25 @@ token themselves in the handshake before accepting the connection.
 from __future__ import annotations
 
 import json
+import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 fastapi = pytest.importorskip("fastapi")
+from ava_extensions.server.principal import OIDC_HEADER, Principal  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from starlette.testclient import TestClient  # noqa: E402
 from starlette.websockets import WebSocketDisconnect  # noqa: E402
 
 from openjarvis.core.events import EventBus, EventType  # noqa: E402
+from openjarvis.engine._stubs import StreamChunk  # noqa: E402
 from openjarvis.server.api_routes import include_all_routes  # noqa: E402
 from openjarvis.server.auth_middleware import websocket_authorized  # noqa: E402
 from openjarvis.server.ws_bridge import create_ws_router  # noqa: E402
+
+EVENT_OWNER = Principal("oidc", "https://issuer.example.invalid", "event-owner")
 
 
 def _ws(query=None, headers=None):
@@ -57,9 +63,18 @@ def _make_app(api_key=""):
         for tok in ["hi"]:
             yield tok
 
+    async def mock_stream_full(messages, *, model="test-model", **kwargs):
+        del messages, model, kwargs
+        yield StreamChunk(content="hi")
+        yield StreamChunk(finish_reason="stop")
+
     engine.stream = mock_stream
+    engine.stream_full = mock_stream_full
     app.state.engine = engine
     app.state.model = "test-model"
+    app.state.config = SimpleNamespace(
+        intelligence=SimpleNamespace(max_tokens=16_384),
+    )
     app.state.api_key = api_key
     include_all_routes(app)
     return app
@@ -95,21 +110,46 @@ class TestAgentEventsAuth:
     def _app(self, api_key=""):
         app = FastAPI()
         app.state.api_key = api_key
+        app.state.agent_manager = MagicMock()
+        app.state.agent_manager.get_agent_for_owner.return_value = {"id": "a"}
         app.include_router(create_ws_router(EventBus()))
         return app
 
-    def test_rejected_without_token_when_key_set(self):
+    def test_rejected_without_token_when_key_set(self, monkeypatch):
+        from ava_extensions.server import principal as principal_module
+
+        monkeypatch.setattr(
+            principal_module,
+            "resolve_request_principal",
+            lambda _headers: EVENT_OWNER,
+        )
         client = TestClient(self._app(api_key="secret"))
         with pytest.raises(WebSocketDisconnect):
-            with client.websocket_connect("/v1/agents/events") as ws:
+            with client.websocket_connect(
+                "/v1/agents/events?agent_id=a",
+                headers={OIDC_HEADER: "verified-by-test-double"},
+            ) as ws:
                 ws.receive_text()
 
-    def test_accepted_with_correct_token(self):
+    def test_accepted_with_correct_token(self, monkeypatch):
+        from ava_extensions.server import principal as principal_module
+
+        monkeypatch.setattr(
+            principal_module,
+            "resolve_request_principal",
+            lambda _headers: EVENT_OWNER,
+        )
         bus = EventBus()
         app = FastAPI()
         app.state.api_key = "secret"
+        app.state.agent_manager = MagicMock()
+        app.state.agent_manager.get_agent_for_owner.return_value = {"id": "a"}
         app.include_router(create_ws_router(bus))
         client = TestClient(app)
-        with client.websocket_connect("/v1/agents/events?token=secret") as ws:
+        with client.websocket_connect(
+            "/v1/agents/events?agent_id=a&token=secret",
+            headers={OIDC_HEADER: "verified-by-test-double"},
+        ) as ws:
+            time.sleep(0.02)
             bus.publish(EventType.AGENT_TICK_START, {"agent_id": "a"})
             assert ws.receive_json()["data"]["agent_id"] == "a"

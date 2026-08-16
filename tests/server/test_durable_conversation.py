@@ -6,6 +6,7 @@ import asyncio
 import concurrent.futures
 import sqlite3
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -17,7 +18,13 @@ from fastapi.testclient import TestClient
 from openjarvis.core.config import JarvisConfig
 from openjarvis.server import routes
 from openjarvis.server.app import create_app
-from openjarvis.server.models import ChatCompletionRequest, ChatMessage
+from openjarvis.server.models import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatMessage,
+    Choice,
+    ChoiceMessage,
+)
 
 TURN_ID = "4d593ddf-cf92-4d85-9d5d-68a961f5827b"
 PRINCIPAL_A = Principal("oidc", "https://issuer.example.invalid", "subject-a")
@@ -135,7 +142,6 @@ def test_retry_apres_restart_rejoue_le_tour_sans_rappeler_le_modele(
     )
     _select(monkeypatch)
     first_engine = _engine("first committed reply")
-    first_engine.generate.return_value["finish_reason"] = "length"
     first_engine.generate.return_value["usage"] = {
         "prompt_tokens": 11,
         "completion_tokens": 7,
@@ -153,12 +159,135 @@ def test_retry_apres_restart_rejoue_le_tour_sans_rappeler_le_modele(
 
     assert replay.status_code == 200
     assert replay.json() == first.json()
-    assert replay.json()["choices"][0]["finish_reason"] == "length"
+    assert replay.json()["choices"][0]["finish_reason"] == "stop"
     assert replay.json()["usage"]["total_tokens"] == 18
     assert second_engine.generate.call_count == 0
     assert [
         row["texte"] for row in conversation_store.lire(PRINCIPAL_A.conversation_key)
     ] == ["synthetic question", "first committed reply"]
+
+
+def test_reponse_incomplete_est_abandonnee_et_ne_devient_jamais_un_replay(
+    tmp_path, monkeypatch
+) -> None:
+    database = tmp_path / "conversations.db"
+    monkeypatch.setattr(conversation_store, "CHEMIN_BASE", database)
+    _select(monkeypatch)
+    engine = _engine("fragment that stops mid-sentence")
+    engine.generate.return_value["finish_reason"] = "length"
+
+    with _client(engine) as client:
+        first = _post(client)
+        replay = _post(client)
+
+    assert first.status_code == 502
+    assert replay.status_code == 410
+    assert engine.generate.call_count == 1
+    entry = conversation_store.lire_statut_tour(
+        PRINCIPAL_A.conversation_key,
+        TURN_ID,
+    )
+    assert entry is not None and entry.state == "abandoned"
+    assert entry.abandon_reason == "incomplete_response"
+    assert conversation_store.lire(PRINCIPAL_A.conversation_key) == []
+    with sqlite3.connect(database) as connection:
+        audit = connection.execute(
+            "SELECT reason, length(assistant_text_sha256) FROM turn_reconciliations"
+        ).fetchone()
+    assert audit == ("incomplete_response", 64)
+
+
+def test_ancien_tour_length_complete_est_quarantaine_et_non_rejouable(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        conversation_store,
+        "CHEMIN_BASE",
+        tmp_path / "conversations.db",
+    )
+    _select(monkeypatch)
+    conversation_store.reserver_tour(
+        PRINCIPAL_A.conversation_key,
+        TURN_ID,
+        "synthetic question",
+        request_sha256=_request_sha256(),
+    )
+    partial = "legacy partial answer cut in the middle of"
+    legacy_response = ChatCompletionResponse(
+        model="test-model",
+        choices=[
+            Choice(
+                message=ChoiceMessage(content=partial),
+                finish_reason="length",
+            )
+        ],
+    )
+    conversation_store.finaliser_tour(
+        PRINCIPAL_A.conversation_key,
+        TURN_ID,
+        "synthetic question",
+        partial,
+        response_json=legacy_response.model_dump_json(),
+    )
+    engine = _engine("must never run")
+
+    with _client(engine) as client:
+        replay = _post(client)
+
+    assert replay.status_code == 410
+    assert replay.json()["detail"] == (
+        "Ava durable turn is incomplete and cannot be replayed"
+    )
+    assert engine.generate.call_count == 0
+    assert conversation_store.lire(PRINCIPAL_A.conversation_key) == []
+
+
+def test_empreinte_durable_lie_le_budget_effectif_apres_complexite(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        conversation_store, "CHEMIN_BASE", tmp_path / "conversations.db"
+    )
+    monkeypatch.setattr(
+        "openjarvis.learning.routing.complexity.score_complexity",
+        lambda _text: SimpleNamespace(
+            score=0.9,
+            tier="complex",
+            suggested_max_tokens=4096,
+        ),
+    )
+    monkeypatch.setattr(
+        "openjarvis.learning.routing.complexity.adjust_tokens_for_model",
+        lambda value, _model: value,
+    )
+    _select(monkeypatch)
+    engine = _engine("complete reply")
+
+    with _client(engine) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={conversation_store.TURN_ID_HEADER: TURN_ID},
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "synthetic complex question"}],
+                "max_tokens": 128,
+            },
+        )
+
+    assert response.status_code == 200
+    assert engine.generate.call_args.kwargs["max_tokens"] == 4096
+    entry = conversation_store.lire_statut_tour(
+        PRINCIPAL_A.conversation_key,
+        TURN_ID,
+    )
+    assert entry is not None
+    effective = ChatCompletionRequest(
+        model="test-model",
+        messages=[ChatMessage(role="user", content="synthetic complex question")],
+        max_tokens=4096,
+    )
+    assert entry.request_sha256 == routes._durable_request_sha256(effective, None)
 
 
 def test_collision_de_question_est_refusee_avant_generation(
@@ -556,17 +685,17 @@ def test_reponse_store_plus_un_abandonne_et_audite_le_tour(
     assert audit == ("assistant_response_too_large", 64, 64)
 
 
-def test_enveloppe_utf8_trop_grande_abandonne_et_audite_le_tour(
+def test_reponse_multioctet_trop_grande_abandonne_et_audite_le_tour(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.setattr(
         conversation_store, "CHEMIN_BASE", tmp_path / "conversations.db"
     )
     _select(monkeypatch)
-    # The character count is valid, but the UTF-8 JSON envelope exceeds the
-    # durable byte limit.  This must become terminal instead of leaving a
-    # permanently pending turn after the model has already answered.
-    reply = "é" * conversation_store.MAX_CAR_TEXTE
+    # The character count is valid, but the assistant UTF-8 payload exceeds
+    # the durable byte limit. This must become terminal instead of reaching
+    # ``finaliser_tour`` as a ValueError and leaving the reservation pending.
+    reply = "é" * (conversation_store.MAX_CAR_TEXTE // 2 + 1)
     engine = _engine(reply)
 
     with _client(engine) as client:
@@ -581,5 +710,89 @@ def test_enveloppe_utf8_trop_grande_abandonne_et_audite_le_tour(
         TURN_ID,
     )
     assert entry is not None and entry.state == "abandoned"
-    assert entry.abandon_reason == "response_envelope_too_large"
+    assert entry.abandon_reason == "assistant_response_too_large"
     assert conversation_store.lire(PRINCIPAL_A.conversation_key) == []
+
+
+def test_reponse_non_encodable_abandonne_le_tour_sans_pending(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        conversation_store, "CHEMIN_BASE", tmp_path / "conversations.db"
+    )
+    _select(monkeypatch)
+    engine = _engine("\ud800")
+
+    with _client(engine) as client:
+        response = _post(client)
+        replay = _post(client)
+
+    assert response.status_code == 502
+    assert replay.status_code == 410
+    assert engine.generate.call_count == 1
+    entry = conversation_store.lire_statut_tour(
+        PRINCIPAL_A.conversation_key,
+        TURN_ID,
+    )
+    assert entry is not None and entry.state == "abandoned"
+    assert entry.abandon_reason == "assistant_response_invalid_utf8"
+
+
+def test_enveloppe_trop_grande_abandonne_le_tour_sans_pending(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        conversation_store, "CHEMIN_BASE", tmp_path / "conversations.db"
+    )
+    _select(monkeypatch)
+    engine = _engine("réponse brève")
+    engine.generate.return_value["tool_calls"] = [
+        {
+            "id": "call_synthetic",
+            "name": "synthetic",
+            "arguments": "x" * conversation_store.MAX_RESPONSE_JSON_BYTES,
+        }
+    ]
+
+    with _client(engine) as client:
+        response = _post(client)
+        replay = _post(client)
+
+    assert response.status_code == 502
+    assert replay.status_code == 410
+    assert engine.generate.call_count == 1
+    entry = conversation_store.lire_statut_tour(
+        PRINCIPAL_A.conversation_key,
+        TURN_ID,
+    )
+    assert entry is not None and entry.state == "abandoned"
+    assert entry.abandon_reason == "response_envelope_too_large"
+
+
+def test_enveloppe_rejetee_par_le_store_abandonne_le_tour_sans_pending(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        conversation_store, "CHEMIN_BASE", tmp_path / "conversations.db"
+    )
+    _select(monkeypatch)
+
+    def reject_envelope(*_args, **_kwargs):
+        raise ValueError("synthetic envelope rejection")
+
+    monkeypatch.setattr(conversation_store, "finaliser_tour", reject_envelope)
+    engine = _engine("réponse non stockable")
+
+    with _client(engine) as client:
+        response = _post(client)
+        replay = _post(client)
+
+    assert response.status_code == 502
+    assert replay.status_code == 410
+    assert engine.generate.call_count == 1
+    entry = conversation_store.lire_statut_tour(
+        PRINCIPAL_A.conversation_key,
+        TURN_ID,
+    )
+    assert entry is not None and entry.state == "abandoned"
+    assert entry.abandon_reason == "response_envelope_invalid"

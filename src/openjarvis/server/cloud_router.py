@@ -16,6 +16,8 @@ import httpx
 
 from openjarvis.core.paths import get_config_dir
 from openjarvis.core.types import Message
+from openjarvis.engine._finish import conservative_finish_reason
+from openjarvis.engine._stubs import StreamChunk
 
 # ---------------------------------------------------------------------------
 # Key / provider detection
@@ -143,7 +145,7 @@ async def _stream_openai(
     max_tokens: int,
     base_url: str = "https://api.openai.com/v1",
     api_key_name: str = "OPENAI_API_KEY",
-) -> AsyncIterator[str]:
+) -> AsyncIterator[StreamChunk]:
     keys = _load_keys()
     api_key = keys.get(api_key_name, "")
     if not api_key:
@@ -174,13 +176,16 @@ async def _stream_openai(
                 data = line[6:].strip()
                 if data == "[DONE]":
                     break
-                try:
-                    chunk = json.loads(data)
-                    delta = chunk["choices"][0]["delta"].get("content") or ""
-                    if delta:
-                        yield delta
-                except Exception:
-                    pass
+                chunk = json.loads(data)
+                choice = chunk["choices"][0]
+                delta = choice.get("delta") or {}
+                content = delta.get("content") or ""
+                finish_reason = choice.get("finish_reason")
+                if content or finish_reason is not None:
+                    yield StreamChunk(
+                        content=content or None,
+                        finish_reason=conservative_finish_reason(finish_reason),
+                    )
 
 
 async def _stream_anthropic(
@@ -188,7 +193,7 @@ async def _stream_anthropic(
     messages: Sequence[Message],
     temperature: float,
     max_tokens: int,
-) -> AsyncIterator[str]:
+) -> AsyncIterator[StreamChunk]:
     keys = _load_keys()
     api_key = keys.get("ANTHROPIC_API_KEY", "")
     if not api_key:
@@ -221,14 +226,18 @@ async def _stream_anthropic(
                 if not line.startswith("data: "):
                     continue
                 data = line[6:].strip()
-                try:
-                    event = json.loads(data)
-                    if event.get("type") == "content_block_delta":
-                        text = event.get("delta", {}).get("text", "")
-                        if text:
-                            yield text
-                except Exception:
-                    pass
+                event = json.loads(data)
+                event_type = event.get("type")
+                if event_type == "content_block_delta":
+                    text = event.get("delta", {}).get("text", "")
+                    if text:
+                        yield StreamChunk(content=text)
+                elif event_type == "message_delta":
+                    stop_reason = event.get("delta", {}).get("stop_reason")
+                    if stop_reason is not None:
+                        yield StreamChunk(
+                            finish_reason=conservative_finish_reason(stop_reason)
+                        )
 
 
 async def _stream_google(
@@ -236,7 +245,7 @@ async def _stream_google(
     messages: Sequence[Message],
     temperature: float,
     max_tokens: int,
-) -> AsyncIterator[str]:
+) -> AsyncIterator[StreamChunk]:
     keys = _load_keys()
     api_key = keys.get("GEMINI_API_KEY") or keys.get("GOOGLE_API_KEY", "")
     if not api_key:
@@ -263,19 +272,18 @@ async def _stream_google(
                 if not line.startswith("data: "):
                     continue
                 data = line[6:].strip()
-                try:
-                    chunk = json.loads(data)
-                    parts = (
-                        chunk.get("candidates", [{}])[0]
-                        .get("content", {})
-                        .get("parts", [])
+                chunk = json.loads(data)
+                candidate = chunk.get("candidates", [{}])[0]
+                parts = candidate.get("content", {}).get("parts", [])
+                for part in parts:
+                    text = part.get("text", "")
+                    if text:
+                        yield StreamChunk(content=text)
+                upstream_reason = candidate.get("finishReason")
+                if upstream_reason is not None:
+                    yield StreamChunk(
+                        finish_reason=conservative_finish_reason(upstream_reason)
                     )
-                    for part in parts:
-                        text = part.get("text", "")
-                        if text:
-                            yield text
-                except Exception:
-                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +301,26 @@ async def stream_local(
     temperature: float = 0.7,
     max_tokens: int = 1024,
 ) -> AsyncIterator[str]:
-    """Stream tokens directly from Ollama, bypassing the engine system."""
+    """Stream only content tokens from the richer direct Ollama stream."""
+
+    async for chunk in stream_local_full(
+        model,
+        messages,
+        temperature,
+        max_tokens,
+    ):
+        if chunk.content:
+            yield chunk.content
+
+
+async def stream_local_full(
+    model: str,
+    messages: Sequence[Message],
+    temperature: float = 0.7,
+    max_tokens: int = 1024,
+) -> AsyncIterator[StreamChunk]:
+    """Stream direct Ollama chunks while preserving its terminal reason."""
+
     payload = {
         "model": model,
         "messages": _to_openai_msgs(messages),
@@ -313,15 +340,17 @@ async def stream_local(
             async for line in resp.aiter_lines():
                 if not line:
                     continue
-                try:
-                    data = json.loads(line)
-                    token = data.get("message", {}).get("content", "")
-                    if token:
-                        yield token
-                    if data.get("done"):
-                        break
-                except Exception:
-                    pass
+                data = json.loads(line)
+                token = data.get("message", {}).get("content", "")
+                if token:
+                    yield StreamChunk(content=token)
+                if data.get("done"):
+                    yield StreamChunk(
+                        finish_reason=conservative_finish_reason(
+                            data.get("done_reason")
+                        )
+                    )
+                    break
 
 
 async def list_local_models() -> list[str]:
@@ -348,20 +377,34 @@ async def stream_cloud(
     temperature: float = 0.7,
     max_tokens: int = 1024,
 ) -> AsyncIterator[str]:
-    """Stream tokens from a cloud provider for the given model."""
+    """Stream only content tokens from the richer direct cloud stream."""
+
+    async for chunk in stream_cloud_full(model, messages, temperature, max_tokens):
+        if chunk.content:
+            yield chunk.content
+
+
+async def stream_cloud_full(
+    model: str,
+    messages: Sequence[Message],
+    temperature: float = 0.7,
+    max_tokens: int = 1024,
+) -> AsyncIterator[StreamChunk]:
+    """Stream direct cloud chunks without erasing provider terminal reasons."""
+
     provider = get_provider(model)
 
     if provider == "openai":
-        async for token in _stream_openai(model, messages, temperature, max_tokens):
-            yield token
+        async for chunk in _stream_openai(model, messages, temperature, max_tokens):
+            yield chunk
 
     elif provider == "anthropic":
-        async for token in _stream_anthropic(model, messages, temperature, max_tokens):
-            yield token
+        async for chunk in _stream_anthropic(model, messages, temperature, max_tokens):
+            yield chunk
 
     elif provider == "google":
-        async for token in _stream_google(model, messages, temperature, max_tokens):
-            yield token
+        async for chunk in _stream_google(model, messages, temperature, max_tokens):
+            yield chunk
 
     elif provider == "openrouter":
         keys = _load_keys()
@@ -370,7 +413,7 @@ async def stream_cloud(
             raise ValueError(
                 "OPENROUTER_API_KEY not set — add it in the Cloud Models tab"
             )
-        async for token in _stream_openai(
+        async for chunk in _stream_openai(
             model,
             messages,
             temperature,
@@ -378,14 +421,14 @@ async def stream_cloud(
             base_url="https://openrouter.ai/api/v1",
             api_key_name="OPENROUTER_API_KEY",
         ):
-            yield token
+            yield chunk
 
     elif provider == "minimax":
         keys = _load_keys()
         api_key = keys.get("MINIMAX_API_KEY", "")
         if not api_key:
             raise ValueError("MINIMAX_API_KEY not set — add it in the Cloud Models tab")
-        async for token in _stream_openai(
+        async for chunk in _stream_openai(
             model,
             messages,
             temperature,
@@ -393,7 +436,7 @@ async def stream_cloud(
             base_url="https://api.minimax.io/v1",
             api_key_name="MINIMAX_API_KEY",
         ):
-            yield token
+            yield chunk
 
     else:
         raise ValueError(f"Unknown cloud provider for model: {model!r}")

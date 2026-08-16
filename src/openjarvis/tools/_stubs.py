@@ -38,6 +38,7 @@ class ToolSpec:
     requires_confirmation: bool = False
     timeout_seconds: float = 30.0
     required_capabilities: List[str] = field(default_factory=list)
+    requires_capability_policy: bool = False
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -109,6 +110,7 @@ class ToolExecutor:
         default_timeout: float = 30.0,
         capability_policy: Optional[Any] = None,
         agent_id: str = "",
+        principal_provenance: Optional[str] = None,
         boundary_guard: Optional[Any] = None,
     ) -> None:
         self._tools: Dict[str, BaseTool] = {t.spec.name: t for t in tools}
@@ -118,7 +120,39 @@ class ToolExecutor:
         self._default_timeout = default_timeout
         self._capability_policy = capability_policy
         self._agent_id = agent_id
+        # Execution/trace identifiers are not authorization identities.  Only
+        # provenance established by an authentication boundary may be used as
+        # the capability-policy subject.
+        self._principal_provenance = (
+            principal_provenance.strip()
+            if isinstance(principal_provenance, str) and principal_provenance.strip()
+            else ""
+        )
         self._boundary_guard = boundary_guard
+
+    def configure_execution_security(
+        self,
+        *,
+        capability_policy: Optional[Any],
+        boundary_guard: Optional[Any],
+        principal_provenance: Optional[str] = None,
+    ) -> None:
+        """Wire policy and egress guards after an agent constructor returns.
+
+        Several ToolUsingAgent subclasses intentionally expose narrower
+        constructors and therefore cannot accept these arguments directly.
+        Keeping this wiring on ToolExecutor avoids constructor fallbacks that
+        silently drop tools or security.  ``principal_provenance`` must come
+        from a verified server boundary; omitted/invalid values clear it.
+        """
+
+        self._capability_policy = capability_policy
+        self._boundary_guard = boundary_guard
+        self._principal_provenance = (
+            principal_provenance.strip()
+            if isinstance(principal_provenance, str) and principal_provenance.strip()
+            else ""
+        )
 
     def execute(self, tool_call: ToolCall) -> ToolResult:
         """Parse arguments, dispatch to tool, measure latency, emit events."""
@@ -153,31 +187,59 @@ class ToolExecutor:
                     success=False,
                 )
 
-        # RBAC capability check
-        if self._capability_policy and tool.spec.required_capabilities:
-            for cap in tool.spec.required_capabilities:
-                if not self._capability_policy.check(
-                    self._agent_id,
-                    cap,
+        # RBAC capability check.  Most upstream tools retain their historical
+        # opt-in policy semantics.  Security-sensitive tools can declare that
+        # a policy is mandatory; those tools fail closed when the policy or a
+        # verified execution subject is absent.  A broken policy check is also
+        # a denial, never an exception that can skip the decision upstream.
+        spec = tool.spec
+        required_capabilities = tuple(spec.required_capabilities)
+        if spec.requires_capability_policy and not required_capabilities:
+            return self._capability_denied(
+                tool_call.name,
+                "<undeclared>",
+                reason="invalid_tool_contract",
+            )
+        if required_capabilities and (
+            self._capability_policy is not None or spec.requires_capability_policy
+        ):
+            if self._capability_policy is None:
+                return self._capability_denied(
                     tool_call.name,
-                ):
-                    if self._bus:
-                        self._bus.publish(
-                            EventType.CAPABILITY_DENIED,
-                            {
-                                "agent_id": self._agent_id,
-                                "capability": cap,
-                                "tool": tool_call.name,
-                            },
+                    required_capabilities[0],
+                    reason="policy_unavailable",
+                )
+            if spec.requires_capability_policy and (not self._principal_provenance):
+                return self._capability_denied(
+                    tool_call.name,
+                    required_capabilities[0],
+                    reason="execution_subject_unavailable",
+                )
+            for cap in required_capabilities:
+                try:
+                    allowed = bool(
+                        self._capability_policy.check(
+                            self._principal_provenance,
+                            cap,
+                            tool_call.name,
                         )
-                    return ToolResult(
-                        tool_name=tool_call.name,
-                        content=(
-                            f"Capability '{cap}' denied for"
-                            f" agent '{self._agent_id}'"
-                            f" on tool '{tool_call.name}'."
-                        ),
-                        success=False,
+                    )
+                except Exception:
+                    logger.error(
+                        "Capability policy failed closed for tool %s",
+                        tool_call.name,
+                        exc_info=True,
+                    )
+                    return self._capability_denied(
+                        tool_call.name,
+                        cap,
+                        reason="policy_error",
+                    )
+                if not allowed:
+                    return self._capability_denied(
+                        tool_call.name,
+                        cap,
+                        reason="capability_denied",
                     )
 
         # Taint checking (sink policy)
@@ -314,6 +376,31 @@ class ToolExecutor:
             )
 
         return result
+
+    def _capability_denied(
+        self,
+        tool_name: str,
+        capability: str,
+        *,
+        reason: str,
+    ) -> ToolResult:
+        """Return and audit one capability denial without exposing identity."""
+
+        if self._bus:
+            self._bus.publish(
+                EventType.CAPABILITY_DENIED,
+                {
+                    "agent_id": self._principal_provenance,
+                    "capability": capability,
+                    "tool": tool_name,
+                    "reason": reason,
+                },
+            )
+        return ToolResult(
+            tool_name=tool_name,
+            content=f"Capability '{capability}' denied for tool '{tool_name}'.",
+            success=False,
+        )
 
     @staticmethod
     def _json_safe_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:

@@ -95,6 +95,45 @@ class TestAskCommand:
         data = json.loads(result.output)
         assert "content" in data
 
+    def test_incomplete_direct_response_exits_nonzero_without_fragment(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        _patch_ask(
+            monkeypatch,
+            tmp_path,
+            engine_result={
+                "content": "private direct fragment",
+                "finish_reason": "length",
+            },
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            ["ask", "--agent", "", "Hello"],
+        )
+
+        assert result.exit_code != 0
+        assert "private direct fragment" not in result.output
+        assert "did not complete" in result.output
+
+    def test_incomplete_direct_json_is_structured_and_nonzero(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        _patch_ask(
+            monkeypatch,
+            tmp_path,
+            engine_result={"content": "private direct fragment"},
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            ["ask", "--agent", "", "--json", "Hello"],
+        )
+
+        assert result.exit_code != 0
+        assert "private direct fragment" not in result.output
+        assert json.loads(result.output)["error"]["type"] == "incomplete_response"
+
     def test_telemetry_recorded(self, monkeypatch, tmp_path: Path) -> None:
         _patch_ask(monkeypatch, tmp_path)
         CliRunner().invoke(cli, ["ask", "Hello"])

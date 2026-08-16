@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from openjarvis.channels._stubs import ChannelMessage
 from openjarvis.core.config import JarvisConfig
 from openjarvis.core.events import EventBus
@@ -67,7 +69,9 @@ class TestWireChannelWithAgent:
     def test_ask_called_and_reply_sent(self, tmp_path):
         system = _make_system(agent_name="simple", tmp_path=tmp_path)
         # Patch ask() so we don't need a real engine/agent
-        system.ask = MagicMock(return_value={"content": "pong"})
+        system.ask = MagicMock(
+            return_value={"content": "pong", "finish_reason": "stop"}
+        )
 
         mock_channel = MagicMock()
         system.wire_channel(mock_channel)
@@ -94,7 +98,7 @@ class TestWireChannelWithAgent:
         assert system.session_store is None
 
         mock_channel = MagicMock()
-        system.ask = MagicMock(return_value={"content": "ok"})
+        system.ask = MagicMock(return_value={"content": "ok", "finish_reason": "stop"})
         system.wire_channel(mock_channel)
 
         handler = mock_channel.on_message.call_args[0][0]
@@ -106,7 +110,7 @@ class TestWireChannelWithAgent:
         system = _make_system(tmp_path=tmp_path)
         existing_store = SessionStore(db_path=tmp_path / "sessions.db")
         system.session_store = existing_store
-        system.ask = MagicMock(return_value={"content": "ok"})
+        system.ask = MagicMock(return_value={"content": "ok", "finish_reason": "stop"})
 
         mock_channel = MagicMock()
         system.wire_channel(mock_channel)
@@ -122,7 +126,9 @@ class TestWireChannelWithEngine:
 
     def test_engine_path_used_when_no_agent(self, tmp_path):
         system = _make_system(agent_name="", tmp_path=tmp_path)
-        system.ask = MagicMock(return_value={"content": "raw reply"})
+        system.ask = MagicMock(
+            return_value={"content": "raw reply", "finish_reason": "stop"}
+        )
 
         mock_channel = MagicMock()
         system.wire_channel(mock_channel)
@@ -153,7 +159,9 @@ class TestWireChannelCanonicalContract:
         channel id as the message reference (#516).
         """
         system = _make_system(tmp_path=tmp_path)
-        system.ask = MagicMock(return_value={"content": "pong"})
+        system.ask = MagicMock(
+            return_value={"content": "pong", "finish_reason": "stop"}
+        )
 
         mock_channel = MagicMock()
         system.wire_channel(mock_channel)
@@ -180,7 +188,9 @@ class TestWireChannelCanonicalContract:
         """Telegram must keep working under the unified contract: destination
         is the chat id (conversation_id), reply ref is the message id."""
         system = _make_system(tmp_path=tmp_path)
-        system.ask = MagicMock(return_value={"content": "pong"})
+        system.ask = MagicMock(
+            return_value={"content": "pong", "finish_reason": "stop"}
+        )
 
         mock_channel = MagicMock()
         system.wire_channel(mock_channel)
@@ -205,7 +215,7 @@ class TestWireChannelCanonicalContract:
         """The fix must not change session isolation keying, which still uses
         ``<channel>:<conversation_id>``."""
         system = _make_system(tmp_path=tmp_path)
-        system.ask = MagicMock(return_value={"content": "ok"})
+        system.ask = MagicMock(return_value={"content": "ok", "finish_reason": "stop"})
 
         mock_channel = MagicMock()
         system.wire_channel(mock_channel)
@@ -232,7 +242,10 @@ class TestWireChannelSessionIsolation:
         system = _make_system(tmp_path=tmp_path)
         replies = {"111": "reply-A", "222": "reply-B"}
         system.ask = MagicMock(
-            side_effect=lambda q, **kw: {"content": replies.get(q, "")}
+            side_effect=lambda q, **kw: {
+                "content": replies.get(q, ""),
+                "finish_reason": "stop",
+            }
         )
 
         mock_channel = MagicMock()
@@ -253,7 +266,9 @@ class TestWireChannelSessionIsolation:
 
     def test_same_chat_accumulates_history(self, tmp_path):
         system = _make_system(tmp_path=tmp_path)
-        system.ask = MagicMock(return_value={"content": "reply"})
+        system.ask = MagicMock(
+            return_value={"content": "reply", "finish_reason": "stop"}
+        )
 
         mock_channel = MagicMock()
         system.wire_channel(mock_channel)
@@ -284,6 +299,33 @@ class TestWireChannelErrorHandling:
         mock_channel.send.assert_called_once()
         sent_content = mock_channel.send.call_args[0][1]
         assert "error" in sent_content.lower()
+
+    @pytest.mark.parametrize(
+        ("content", "finish_reason"),
+        [
+            ("private fragment", "length"),
+            ("private fragment", None),
+            ("", "stop"),
+        ],
+    )
+    def test_incomplete_reply_is_generic_and_not_persisted(
+        self, tmp_path, content, finish_reason
+    ):
+        system = _make_system(tmp_path=tmp_path)
+        system.ask = MagicMock(
+            return_value={"content": content, "finish_reason": finish_reason}
+        )
+        mock_channel = MagicMock()
+        system.wire_channel(mock_channel)
+
+        handler = mock_channel.on_message.call_args[0][0]
+        handler(_make_channel_message(content="question"))
+
+        sent_content = mock_channel.send.call_args[0][1]
+        assert "private fragment" not in sent_content
+        assert "complete response" in sent_content.lower()
+        session = system.session_store.get_or_create("telegram:42")
+        assert session.messages == []
 
 
 class TestChannelToolLoading:

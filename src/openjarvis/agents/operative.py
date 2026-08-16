@@ -11,7 +11,14 @@ import json
 import logging
 from typing import Any, List, Optional
 
-from openjarvis.agents._stubs import AgentContext, AgentResult, ToolUsingAgent
+from openjarvis.agents._stubs import (
+    AgentContext,
+    AgentResult,
+    ToolUsingAgent,
+    is_complete_tool_call_finish_reason,
+    normalize_finish_reason,
+    tool_call_arguments_are_complete,
+)
 from openjarvis.core.events import EventBus
 from openjarvis.core.registry import AgentRegistry
 from openjarvis.core.types import Message, Role, ToolCall, ToolResult
@@ -115,6 +122,8 @@ class OperativeAgent(ToolUsingAgent):
         all_tool_results: list[ToolResult] = []
         turns = 0
         content = ""
+        finish_reason: Optional[str] = None
+        incomplete_tool_call = False
         state_stored_by_tool = False
         total_usage: dict[str, int] = {
             "prompt_tokens": 0,
@@ -133,14 +142,34 @@ class OperativeAgent(ToolUsingAgent):
                 gen_kwargs["tools"] = openai_tools
 
             result = self._generate(messages, **gen_kwargs)
-            usage = result.get("usage", {})
-            for k in total_usage:
-                total_usage[k] += usage.get(k, 0)
             content = result.get("content", "")
             raw_tool_calls = result.get("tool_calls", [])
+            finish_reason = normalize_finish_reason(result.get("finish_reason"))
 
             if not raw_tool_calls:
                 content = self._check_continuation(result, messages)
+                finish_reason = result.get("finish_reason")
+                usage = result.get("usage", {})
+                for key in total_usage:
+                    total_usage[key] += usage.get(key, 0)
+                break
+
+            usage = result.get("usage", {})
+            for key in total_usage:
+                total_usage[key] += usage.get(key, 0)
+            complete_tool_calls = is_complete_tool_call_finish_reason(
+                finish_reason
+            ) and all(
+                isinstance(tc, dict)
+                and isinstance(tc.get("name"), str)
+                and bool(tc["name"].strip())
+                and tool_call_arguments_are_complete(tc.get("arguments"))
+                for tc in raw_tool_calls
+            )
+            if not complete_tool_calls:
+                # A provider exposed tool payload without proving that the
+                # tool-use block itself completed. Never execute partial args.
+                incomplete_tool_call = True
                 break
 
             tool_calls = [
@@ -204,9 +233,11 @@ class OperativeAgent(ToolUsingAgent):
                 )
         else:
             # Max turns exceeded
-            self._save_session(input, content)
-            meta = dict(total_usage)
+            meta: dict[str, Any] = dict(total_usage)
             meta["max_turns_exceeded"] = True
+            meta["finish_reason"] = finish_reason
+            if incomplete_tool_call:
+                meta["incomplete_tool_call"] = True
             return AgentResult(
                 content=content or "Maximum turns reached without a final answer.",
                 tool_results=all_tool_results,
@@ -214,19 +245,21 @@ class OperativeAgent(ToolUsingAgent):
                 metadata=meta,
             )
 
-        # 6. Save session
-        self._save_session(input, content)
-
-        # 7. Auto-persist state if agent didn't do it explicitly
-        if not state_stored_by_tool:
-            self._auto_persist_state(content)
+        if finish_reason == "stop" and not incomplete_tool_call:
+            # Only complete generations may become durable session/state.
+            self._save_session(input, content)
+            if not state_stored_by_tool:
+                self._auto_persist_state(content)
 
         self._emit_turn_end(turns=turns, content_length=len(content))
+        metadata: dict[str, Any] = {**total_usage, "finish_reason": finish_reason}
+        if incomplete_tool_call:
+            metadata["incomplete_tool_call"] = True
         return AgentResult(
             content=content,
             tool_results=all_tool_results,
             turns=turns,
-            metadata=total_usage,
+            metadata=metadata,
         )
 
     def _build_operative_messages(

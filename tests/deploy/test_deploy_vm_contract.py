@@ -766,26 +766,181 @@ def test_runtime_policy_failure_after_switch_rolls_back(tmp_path: Path) -> None:
     assert fixture.restart_count.read_text().strip() == "2"
 
 
-def test_failed_extended_check_after_completed_rollback_reports_remote_state(
+def test_invalid_legacy_previous_blocks_without_pointer_build_or_deadman_mutation(
     tmp_path: Path,
 ) -> None:
     fixture = _make_deployment_fixture(tmp_path)
+    policy_probe = tmp_path / "legacy-policy-probed"
     legacy_python = fixture.legacy / ".venv/bin/python"
     _write_executable(
         legacy_python,
         """#!/usr/bin/env bash
 set -euo pipefail
 if [[ "$*" == *"config.agent.system_prompt_path == ''"* ]]; then
+  touch "$FAKE_LEGACY_POLICY_PROBE"
   exit 94
 fi
 exit 0
 """,
     )
 
-    result = _deploy(fixture, FAKE_RUNTIME_POLICY_FAIL_AT="2")
+    result = _deploy(fixture, FAKE_LEGACY_POLICY_PROBE=str(policy_probe))
 
     candidate = fixture.releases / fixture.commit
     assert result.returncode != 0
+    assert "cible precedente de current hors politique runtime Ava" in result.stderr
+    assert policy_probe.is_file()
+    assert not fixture.current.exists()
+    assert not candidate.exists()
+    assert not fixture.build_log.exists()
+    assert not fixture.restart_count.exists()
+    assert not fixture.deadman_state.exists()
+    assert not (fixture.releases / ".deploy-lock").exists()
+    ssh_log = Path(fixture.environment["FAKE_SSH_LOG"]).read_text()
+    assert "ava-deploy-deadman.py probe" in ssh_log
+    assert "ava-deploy-deadman.py arm" not in ssh_log
+    assert "ln -s --" not in ssh_log
+    assert "mv -Tf --" not in ssh_log
+
+
+def test_invalid_release_previous_blocks_without_candidate_or_deadman_mutation(
+    tmp_path: Path,
+) -> None:
+    fixture = _make_deployment_fixture(tmp_path)
+    previous_sha = "a" * 40
+    assert previous_sha != fixture.commit
+    previous = fixture.releases / previous_sha
+    (previous / ".venv/bin").mkdir(parents=True)
+    previous_jarvis = previous / ".venv/bin/jarvis"
+    _write_executable(previous_jarvis, "#!/bin/sh\nexit 0\n")
+    policy_probe = tmp_path / "release-policy-probed"
+    previous_python = previous / ".venv/bin/python"
+    _write_executable(
+        previous_python,
+        """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *"config.agent.system_prompt_path == ''"* ]]; then
+  touch "$FAKE_RELEASE_POLICY_PROBE"
+  exit 95
+fi
+exit 0
+""",
+    )
+    (previous / "src/openjarvis/server/static").mkdir(parents=True)
+    (previous / "src/openjarvis/server/static/index.html").write_text(
+        "<html>invalid previous policy</html>\n"
+    )
+    (previous / ".ava-ready").write_text(f"{previous_sha}\n")
+    (previous / ".ava-release").write_text(
+        "\n".join(
+            (
+                "format=ava-release-v1",
+                f"git_sha={previous_sha}",
+                f"source_tree_sha256={'1' * 64}",
+                f"rust_tree_sha256={'2' * 64}",
+                f"wheel_sha256={'3' * 64}",
+                "wheel_filename=openjarvis_rust-1.0.0-"
+                "cp312-cp312-manylinux_2_36_x86_64.whl",
+                f"attestation_sha256={'4' * 64}",
+                f"evolutions_sha256={'5' * 64}",
+                "",
+            )
+        )
+    )
+    fixture.current.symlink_to(previous)
+
+    result = _deploy(fixture, FAKE_RELEASE_POLICY_PROBE=str(policy_probe))
+
+    candidate = fixture.releases / fixture.commit
+    assert result.returncode != 0
+    assert "cible precedente de current hors politique runtime Ava" in result.stderr
+    assert policy_probe.is_file()
+    assert fixture.current.resolve() == previous
+    assert not candidate.exists()
+    assert not fixture.build_log.exists()
+    assert not fixture.restart_count.exists()
+    assert not fixture.deadman_state.exists()
+    assert not (fixture.releases / ".deploy-lock").exists()
+    ssh_log = Path(fixture.environment["FAKE_SSH_LOG"]).read_text()
+    assert "ava-deploy-deadman.py probe" in ssh_log
+    assert "ava-deploy-deadman.py arm" not in ssh_log
+    assert f"ln -s -- {candidate}" not in ssh_log
+
+
+def test_previous_policy_drift_before_arm_never_arms_or_switches(
+    tmp_path: Path,
+) -> None:
+    fixture = _make_deployment_fixture(tmp_path)
+    fixture.current.symlink_to(fixture.legacy)
+    policy_count = tmp_path / "previous-policy-count"
+    legacy_python = fixture.legacy / ".venv/bin/python"
+    _write_executable(
+        legacy_python,
+        """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *"config.agent.system_prompt_path == ''"* ]]; then
+  count=0
+  [[ ! -f "$FAKE_PREVIOUS_POLICY_COUNT" ]] \
+    || count=$(cat "$FAKE_PREVIOUS_POLICY_COUNT")
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$FAKE_PREVIOUS_POLICY_COUNT"
+  [[ "$count" -ne 2 ]] || exit 96
+fi
+exit 0
+""",
+    )
+
+    result = _deploy(fixture, FAKE_PREVIOUS_POLICY_COUNT=str(policy_count))
+
+    candidate = fixture.releases / fixture.commit
+    assert result.returncode != 0
+    assert "cible de rollback hors contrat ou politique runtime" in result.stderr
+    assert policy_count.read_text().strip() == "2"
+    assert fixture.current.resolve() == fixture.legacy
+    assert not candidate.exists()
+    assert not fixture.restart_count.exists()
+    assert not fixture.deadman_state.exists()
+    assert not (fixture.releases / ".deploy-lock").exists()
+    ssh_log = Path(fixture.environment["FAKE_SSH_LOG"]).read_text()
+    assert "ava-deploy-deadman.py probe" in ssh_log
+    assert "ava-deploy-deadman.py arm" not in ssh_log
+    assert f"ln -s -- {candidate}" not in ssh_log
+
+
+def test_failed_extended_check_after_completed_rollback_reports_remote_state(
+    tmp_path: Path,
+) -> None:
+    """A previous target may still drift after the final pre-arm validation."""
+
+    fixture = _make_deployment_fixture(tmp_path)
+    fixture.current.symlink_to(fixture.legacy)
+    policy_count = tmp_path / "rollback-policy-count"
+    legacy_python = fixture.legacy / ".venv/bin/python"
+    _write_executable(
+        legacy_python,
+        """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *"config.agent.system_prompt_path == ''"* ]]; then
+  count=0
+  [[ ! -f "$FAKE_ROLLBACK_POLICY_COUNT" ]] \
+    || count=$(cat "$FAKE_ROLLBACK_POLICY_COUNT")
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$FAKE_ROLLBACK_POLICY_COUNT"
+  [[ "$count" -ne 3 ]] || exit 94
+fi
+exit 0
+""",
+    )
+
+    result = _deploy(
+        fixture,
+        FAKE_RUNTIME_POLICY_FAIL_AT="2",
+        FAKE_ROLLBACK_POLICY_COUNT=str(policy_count),
+    )
+
+    candidate = fixture.releases / fixture.commit
+    assert result.returncode != 0
+    assert policy_count.read_text().strip() == "3"
     assert fixture.current.resolve() == fixture.legacy
     assert candidate.is_dir()
     assert not fixture.deadman_state.exists()
@@ -950,6 +1105,14 @@ def test_contract_has_no_in_place_checkout_or_frontend_mutation() -> None:
     assert "config.agent.default_system_prompt == persona.read_text" in source
     assert source.count('validate_runtime_policy "$RELEASE_PATH"') == 2
     assert 'validate_runtime_policy "$expected_target"' in source
+    previous_validation_calls = [
+        index
+        for index in range(len(source))
+        if source.startswith('validate_runtime_policy "$PREVIOUS_TARGET"', index)
+    ]
+    assert len(previous_validation_calls) == 2
+    assert previous_validation_calls[0] < source.index('titre "2/7 Preparation')
+    assert previous_validation_calls[-1] < arm_call
     assert "_lignes_git('', 3) is not None" in source
     assert source.index("EVOLUTIONS_SHA256=") < source.index(
         'titre "1/7 Verrou et bootstrap'

@@ -25,7 +25,11 @@ class _SimpleChatAgent(BaseAgent):
     agent_id = "simple_chat_agent"
 
     def run(self, input, context: AgentContext | None = None, **kwargs):
-        return AgentResult(content="simple ok", turns=1)
+        return AgentResult(
+            content="simple ok",
+            turns=1,
+            metadata={"finish_reason": "stop"},
+        )
 
 
 class _DangerousChatTool(BaseTool):
@@ -54,7 +58,23 @@ class _ToolChatAgent(ToolUsingAgent):
         result = self._executor.execute(
             ToolCall(id="chat", name="dangerous_chat", arguments="{}")
         )
-        return AgentResult(content=result.content, tool_results=[result], turns=1)
+        return AgentResult(
+            content=result.content,
+            tool_results=[result],
+            turns=1,
+            metadata={"finish_reason": "stop"},
+        )
+
+
+class _IncompleteChatAgent(BaseAgent):
+    agent_id = "incomplete_chat_agent"
+
+    def run(self, input, context: AgentContext | None = None, **kwargs):
+        return AgentResult(
+            content="private agent fragment",
+            turns=1,
+            metadata={"finish_reason": "length"},
+        )
 
 
 class TestChatCommand:
@@ -100,7 +120,10 @@ class TestChatAgents:
     def test_simple_agent_does_not_receive_tool_only_kwargs(self) -> None:
         engine = MagicMock()
         engine.engine_id = "mock"
-        engine.generate.return_value = {"content": "engine fallback"}
+        engine.generate.return_value = {
+            "content": "engine fallback",
+            "finish_reason": "stop",
+        }
         config = JarvisConfig()
         config.intelligence.default_model = "test-model"
 
@@ -167,7 +190,10 @@ class TestChatAgents:
 
         engine = MagicMock()
         engine.engine_id = "mock"
-        engine.generate.return_value = {"content": "engine fallback"}
+        engine.generate.return_value = {
+            "content": "engine fallback",
+            "finish_reason": "stop",
+        }
         config = JarvisConfig()
         config.intelligence.default_model = "test-model"
 
@@ -223,3 +249,56 @@ class TestChatAgents:
         assert result.exit_code == 0
         assert "Confirm:" in result.output
         assert "chat executed!" in result.output
+
+    def test_direct_chat_uses_runtime_limit_and_rejects_partial_response(self) -> None:
+        engine = MagicMock()
+        engine.engine_id = "mock"
+        engine.generate.return_value = {
+            "content": "private direct fragment",
+            "finish_reason": "length",
+        }
+        config = JarvisConfig()
+        config.intelligence.default_model = "test-model"
+        config.intelligence.max_tokens = 12345
+
+        with (
+            patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
+            patch("openjarvis.engine.get_engine", return_value=("mock", engine)),
+            patch("openjarvis.intelligence.register_builtin_models"),
+            patch("openjarvis.cli.chat_cmd.publish_completed_exchange") as publish,
+        ):
+            result = CliRunner().invoke(
+                chat,
+                ["--agent", "", "--model", "test-model"],
+                input="hello\n/quit\n",
+            )
+
+        assert result.exit_code == 0
+        assert "private direct fragment" not in result.output
+        assert "did not complete" in result.output
+        assert engine.generate.call_args.kwargs["max_tokens"] == 12345
+        publish.assert_not_called()
+
+    def test_agent_chat_rejects_partial_response_without_publish(self) -> None:
+        engine = MagicMock()
+        engine.engine_id = "mock"
+        config = JarvisConfig()
+        config.intelligence.default_model = "test-model"
+        AgentRegistry.register_value("incomplete_chat_agent", _IncompleteChatAgent)
+
+        with (
+            patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
+            patch("openjarvis.engine.get_engine", return_value=("mock", engine)),
+            patch("openjarvis.intelligence.register_builtin_models"),
+            patch("openjarvis.cli.chat_cmd.publish_completed_exchange") as publish,
+        ):
+            result = CliRunner().invoke(
+                chat,
+                ["--agent", "incomplete_chat_agent", "--model", "test-model"],
+                input="hello\n/quit\n",
+            )
+
+        assert result.exit_code == 0
+        assert "private agent fragment" not in result.output
+        assert "did not complete" in result.output
+        publish.assert_not_called()

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-
 from typing import Dict, Tuple
 
 from openjarvis._rust_bridge import get_rust_module, scan_result_from_json

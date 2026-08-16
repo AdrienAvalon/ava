@@ -291,7 +291,11 @@ class TestCliAskWiring:
                     [Message(role=Role.USER, content=q)],
                     model="test-model",
                 )
-                return AgentResult(content="Agent OK", turns=1)
+                return AgentResult(
+                    content="Agent OK",
+                    turns=1,
+                    metadata={"finish_reason": "stop"},
+                )
 
         AgentRegistry.register_value(
             "test-wiring-agent",

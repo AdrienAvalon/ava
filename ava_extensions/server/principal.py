@@ -39,6 +39,7 @@ _JWKS_CACHE_SECONDS = 300.0
 _JWKS_FORCE_REFRESH_COOLDOWN_SECONDS = 5.0
 _SERVICE_MAX_TTL_SECONDS = 120
 _CLOCK_SKEW_SECONDS = 10
+_SYNTHETIC_SERVICE_SUBJECTS = frozenset({"scheduler:ava-veille"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +122,15 @@ def _clean_key_id(value: Any) -> str | None:
     ):
         return None
     return cleaned
+
+
+def _valid_service_subject(value: str) -> bool:
+    """Accept Matrix principals plus an explicit closed synthetic-service set."""
+
+    return bool(
+        re.fullmatch(r"matrix:@[^:\s]+:[^\s]+", value)
+        or value in _SYNTHETIC_SERVICE_SUBJECTS
+    )
 
 
 def _https_url(value: str) -> bool:
@@ -507,7 +517,7 @@ def verify_service_assertion(
             or subject is None
             or nonce is None
             or len(nonce) < 16
-            or re.fullmatch(r"matrix:@[^:\s]+:[^\s]+", subject) is None
+            or not _valid_service_subject(subject)
         ):
             raise ValueError("assertion identity contract mismatch")
         return Principal(provider="service", issuer=issuer, subject=subject)

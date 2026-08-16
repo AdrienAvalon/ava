@@ -9,6 +9,7 @@ from typing import Any, Dict, List
 from openjarvis.core.registry import EngineRegistry
 from openjarvis.core.types import Message
 from openjarvis.engine._base import InferenceEngine, messages_to_dicts
+from openjarvis.engine._finish import conservative_finish_reason
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,7 @@ class LiteLLMEngine(InferenceEngine):
                 "total_tokens": (usage.total_tokens if usage else 0),
             },
             "model": resp.model,
-            "finish_reason": choice.finish_reason or "stop",
+            "finish_reason": conservative_finish_reason(choice.finish_reason),
         }
 
         # Extract tool_calls in flat format (id, name, arguments)

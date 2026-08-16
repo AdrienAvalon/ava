@@ -19,7 +19,14 @@ import logging
 import re
 from typing import Any, List, Optional
 
-from openjarvis.agents._stubs import AgentContext, AgentResult, ToolUsingAgent
+from openjarvis.agents._stubs import (
+    AgentContext,
+    AgentResult,
+    ToolUsingAgent,
+    is_complete_tool_call_finish_reason,
+    normalize_finish_reason,
+    tool_call_arguments_are_complete,
+)
 from openjarvis.agents.prompt_loader import (
     load_few_shot_exemplars,
     load_system_prompt_override,
@@ -240,6 +247,8 @@ class MonitorOperativeAgent(ToolUsingAgent):
         all_tool_results: list[ToolResult] = []
         turns = 0
         content = ""
+        finish_reason: Optional[str] = None
+        incomplete_tool_call = False
         state_stored_by_tool = False
         total_usage: dict[str, int] = {
             "prompt_tokens": 0,
@@ -255,16 +264,30 @@ class MonitorOperativeAgent(ToolUsingAgent):
                 gen_kwargs["tools"] = openai_tools
 
             result = self._generate(messages, **gen_kwargs)
-            usage = result.get("usage", {})
-            for k in total_usage:
-                total_usage[k] += usage.get(k, 0)
             content = result.get("content", "")
             # Strip think tags so they don't interfere with parsing
             content = self._strip_think_tags(content)
             raw_tool_calls = result.get("tool_calls", [])
+            finish_reason = normalize_finish_reason(result.get("finish_reason"))
 
             # --- Native function-calling path ---
             if raw_tool_calls:
+                usage = result.get("usage", {})
+                for key in total_usage:
+                    total_usage[key] += usage.get(key, 0)
+                complete_tool_calls = is_complete_tool_call_finish_reason(
+                    finish_reason
+                ) and all(
+                    isinstance(tc, dict)
+                    and isinstance(tc.get("name"), str)
+                    and bool(tc["name"].strip())
+                    and tool_call_arguments_are_complete(tc.get("arguments"))
+                    for tc in raw_tool_calls
+                )
+                if not complete_tool_calls:
+                    # Never execute a partial native tool payload.
+                    incomplete_tool_call = True
+                    break
                 tool_calls = [
                     ToolCall(
                         id=tc.get("id", f"call_{i}"),
@@ -284,7 +307,17 @@ class MonitorOperativeAgent(ToolUsingAgent):
                 # --- Text-based fallback ---
                 tool_info = self._extract_tool_call(content)
                 if tool_info:
+                    usage = result.get("usage", {})
+                    for key in total_usage:
+                        total_usage[key] += usage.get(key, 0)
+                    if finish_reason != "stop":
+                        # Text tool protocols are executable only after the
+                        # complete assistant turn has terminated normally.
+                        break
                     action, action_input = tool_info
+                    if not action or not tool_call_arguments_are_complete(action_input):
+                        incomplete_tool_call = True
+                        break
                     messages.append(Message(role=Role.ASSISTANT, content=content))
                     tc = ToolCall(
                         id=f"text_call_{turns}",
@@ -307,6 +340,11 @@ class MonitorOperativeAgent(ToolUsingAgent):
 
                 # No tool calls at all -> check continuation, then final answer
                 content = self._check_continuation(result, messages)
+                content = self._strip_think_tags(content)
+                finish_reason = result.get("finish_reason")
+                usage = result.get("usage", {})
+                for key in total_usage:
+                    total_usage[key] += usage.get(key, 0)
                 break
 
             # Execute each native tool call
@@ -368,29 +406,39 @@ class MonitorOperativeAgent(ToolUsingAgent):
                 self._extract_and_store(tc.name, tool_result.content)
         else:
             # Max turns exceeded
-            self._save_session(input, content)
             msg_dicts = [_message_to_dict(m) for m in messages]
             return self._max_turns_result(
                 all_tool_results,
                 turns,
                 content=content,
-                metadata={**total_usage, "messages": msg_dicts},
+                metadata={
+                    **total_usage,
+                    "finish_reason": finish_reason,
+                    "incomplete_tool_call": incomplete_tool_call,
+                    "messages": msg_dicts,
+                },
             )
 
-        # 6. Save session
-        self._save_session(input, content)
-
-        # 7. Auto-persist state if agent didn't do it explicitly
-        if not state_stored_by_tool:
-            self._auto_persist_state(content)
+        if finish_reason == "stop" and not incomplete_tool_call:
+            # Only complete generations may become durable session/state.
+            self._save_session(input, content)
+            if not state_stored_by_tool:
+                self._auto_persist_state(content)
 
         self._emit_turn_end(turns=turns, content_length=len(content))
         msg_dicts = [_message_to_dict(m) for m in messages]
+        metadata: dict[str, Any] = {
+            **total_usage,
+            "finish_reason": finish_reason,
+            "messages": msg_dicts,
+        }
+        if incomplete_tool_call:
+            metadata["incomplete_tool_call"] = True
         return AgentResult(
             content=content,
             tool_results=all_tool_results,
             turns=turns,
-            metadata={**total_usage, "messages": msg_dicts},
+            metadata=metadata,
         )
 
     # ------------------------------------------------------------------

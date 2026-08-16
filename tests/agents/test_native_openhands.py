@@ -547,13 +547,13 @@ class TestUrlExpansion:
         assert expanded is False
 
     def test_url_detected_returns_true(self, monkeypatch):
-        import httpx
+        from openjarvis.tools.web_search import WebSearchTool
 
-        mock_resp = MagicMock()
-        mock_resp.text = "<html><body>Page content</body></html>"
-        mock_resp.headers = {"content-type": "text/html"}
-        mock_resp.raise_for_status = MagicMock()
-        monkeypatch.setattr(httpx, "get", MagicMock(return_value=mock_resp))
+        monkeypatch.setattr(
+            WebSearchTool,
+            "_fetch_url",
+            MagicMock(return_value="Page content"),
+        )
 
         text, expanded = NativeOpenHandsAgent._expand_urls(
             "Summarize: https://example.com/article"
@@ -563,11 +563,11 @@ class TestUrlExpansion:
         assert "Content from" in text
 
     def test_url_expansion_failure_returns_false(self, monkeypatch):
-        import httpx
+        from openjarvis.tools.web_search import WebSearchTool
 
         monkeypatch.setattr(
-            httpx,
-            "get",
+            WebSearchTool,
+            "_fetch_url",
             MagicMock(side_effect=Exception("Connection error")),
         )
         text, expanded = NativeOpenHandsAgent._expand_urls(
@@ -577,13 +577,13 @@ class TestUrlExpansion:
 
     def test_url_expanded_uses_direct_path(self, monkeypatch):
         """When URL is expanded, agent bypasses tool loop."""
-        import httpx
+        from openjarvis.tools.web_search import WebSearchTool
 
-        mock_resp = MagicMock()
-        mock_resp.text = "<html><body>Article text here</body></html>"
-        mock_resp.headers = {"content-type": "text/html"}
-        mock_resp.raise_for_status = MagicMock()
-        monkeypatch.setattr(httpx, "get", MagicMock(return_value=mock_resp))
+        monkeypatch.setattr(
+            WebSearchTool,
+            "_fetch_url",
+            MagicMock(return_value="Article text here"),
+        )
 
         engine = MagicMock()
         engine.engine_id = "mock"

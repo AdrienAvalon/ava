@@ -38,6 +38,10 @@ const OPTIN_NAME_KEY = 'openjarvis-display-name';
 const OPTIN_EMAIL_KEY = 'openjarvis-email';
 const OPTIN_ANONID_KEY = 'openjarvis-anon-id';
 const OPTIN_SEEN_KEY = 'openjarvis-optin-seen';
+const SETTINGS_VERSION = 2;
+const DEFAULT_MAX_TOKENS = 4096;
+const MIN_MAX_TOKENS = 256;
+const MAX_MAX_TOKENS = 32768;
 
 interface ConversationStore {
   version: 1;
@@ -66,8 +70,10 @@ function saveConversations(store: ConversationStore): void {
 }
 
 export type ThemeMode = 'light' | 'dark' | 'system';
+export type MaxTokensSource = 'server' | 'user';
 
 interface Settings {
+  settingsVersion: typeof SETTINGS_VERSION;
   theme: ThemeMode;
   apiUrl: string;
   // Local server API key (OPENJARVIS_API_KEY). Sent as a Bearer token on
@@ -79,11 +85,13 @@ interface Settings {
   defaultAgent: string;
   temperature: number;
   maxTokens: number;
+  maxTokensSource: MaxTokensSource;
   speechEnabled: boolean;
 }
 
 function loadSettings(): Settings {
   const defaults: Settings = {
+    settingsVersion: SETTINGS_VERSION,
     theme: 'system',
     apiUrl: '',
     apiKey: '',
@@ -91,13 +99,56 @@ function loadSettings(): Settings {
     defaultModel: '',
     defaultAgent: '',
     temperature: 0.7,
-    maxTokens: 4096,
+    maxTokens: DEFAULT_MAX_TOKENS,
+    maxTokensSource: 'server',
     speechEnabled: false,
   };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
     if (!raw) return defaults;
-    return { ...defaults, ...JSON.parse(raw) };
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return defaults;
+
+    const stored = parsed as Record<string, unknown>;
+    const storedMaxTokens = stored.maxTokens;
+    const hasValidMaxTokens =
+      typeof storedMaxTokens === 'number' &&
+      Number.isInteger(storedMaxTokens) &&
+      storedMaxTokens >= MIN_MAX_TOKENS &&
+      storedMaxTokens <= MAX_MAX_TOKENS;
+
+    // v1 had no provenance: every settings save copied the then-default 4096 into
+    // localStorage even when the user changed an unrelated setting. Preserve a legacy
+    // value only when it differs from that implicit default; 4096 itself cannot prove
+    // an override and must not perpetuate the truncating client-side ceiling.
+    const isCurrent = stored.settingsVersion === SETTINGS_VERSION;
+    const isLegacy = stored.settingsVersion === undefined || stored.settingsVersion === 1;
+    const maxTokensSource: MaxTokensSource = isCurrent
+      ? stored.maxTokensSource === 'user' && hasValidMaxTokens
+        ? 'user'
+        : 'server'
+      : isLegacy &&
+          Object.prototype.hasOwnProperty.call(stored, 'maxTokens') &&
+          hasValidMaxTokens &&
+          storedMaxTokens !== DEFAULT_MAX_TOKENS
+        ? 'user'
+        : 'server';
+
+    const normalized = {
+      ...defaults,
+      ...stored,
+      settingsVersion: SETTINGS_VERSION,
+      maxTokens: hasValidMaxTokens ? storedMaxTokens : DEFAULT_MAX_TOKENS,
+      maxTokensSource,
+    } as Settings;
+    if (isLegacy) {
+      try {
+        localStorage.setItem(SETTINGS_KEY, JSON.stringify(normalized));
+      } catch {
+        // Read-only storage must not prevent the settings page from loading.
+      }
+    }
+    return normalized;
   } catch {
     return defaults;
   }
@@ -192,6 +243,7 @@ interface AppState {
 
   // Actions: settings
   updateSettings: (partial: Partial<Settings>) => void;
+  setMaxTokensOverride: (value: number | null) => void;
 
   // Actions: UI
   setCommandPaletteOpen: (open: boolean) => void;
@@ -480,7 +532,28 @@ export const useAppStore = create<AppState>((set, get) => {
     // ── Settings ───────────────────────────────────────────────────
 
     updateSettings: (partial: Partial<Settings>) => {
-      const updated = { ...get().settings, ...partial };
+      const updated: Settings = {
+        ...get().settings,
+        ...partial,
+        settingsVersion: SETTINGS_VERSION,
+      };
+      saveSettings(updated);
+      set({ settings: updated });
+    },
+    setMaxTokensOverride: (value: number | null) => {
+      const current = get().settings;
+      const updated: Settings =
+        value === null
+          ? { ...current, settingsVersion: SETTINGS_VERSION, maxTokensSource: 'server' }
+          : {
+              ...current,
+              settingsVersion: SETTINGS_VERSION,
+              maxTokens: Math.min(
+                MAX_MAX_TOKENS,
+                Math.max(MIN_MAX_TOKENS, Math.round(value)),
+              ),
+              maxTokensSource: 'user',
+            };
       saveSettings(updated);
       set({ settings: updated });
     },

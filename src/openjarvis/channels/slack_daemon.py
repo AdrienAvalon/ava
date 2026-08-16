@@ -15,10 +15,12 @@ from pathlib import Path
 from typing import Any
 
 from openjarvis.core.paths import get_config_dir
+from openjarvis.engine._finish import conservative_finish_reason
 
 logger = logging.getLogger(__name__)
 
 _PID_FILE = str(get_config_dir() / "slack-daemon.pid")
+_SLACK_FAILURE_MESSAGE = "Sorry, I couldn't complete that response. Please try again."
 
 
 def _to_slack_fmt(text: str) -> str:
@@ -37,6 +39,17 @@ def _to_slack_fmt(text: str) -> str:
     # Clean whitespace
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def _completed_slack_reply(result: object) -> str:
+    """Format only a non-empty agent result with a proven stop terminal."""
+
+    content = getattr(result, "content", "")
+    metadata = getattr(result, "metadata", {}) or {}
+    finish_reason = conservative_finish_reason(metadata.get("finish_reason"))
+    if finish_reason == "stop" and isinstance(content, str) and content.strip():
+        return _to_slack_fmt(content)
+    return _SLACK_FAILURE_MESSAGE
 
 
 def run_slack_daemon(
@@ -107,10 +120,10 @@ def run_slack_daemon(
 
         try:
             result = agent.run(text)
-            reply = _to_slack_fmt(result.content or "No results found.")
-        except Exception as exc:
-            reply = f"Error: {exc}"
-            logger.error("Slack daemon error: %s", exc)
+            reply = _completed_slack_reply(result)
+        except Exception:
+            reply = _SLACK_FAILURE_MESSAGE
+            logger.exception("Slack daemon generation failed")
         finally:
             processing.clear()
             stop.set()

@@ -9,7 +9,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
-from openjarvis.agents._stubs import AgentContext, AgentResult, ToolUsingAgent
+from openjarvis.agents._stubs import (
+    AgentContext,
+    AgentResult,
+    BaseAgent,
+    ToolUsingAgent,
+)
 from openjarvis.cli import cli
 from openjarvis.core.types import ToolCall, ToolResult
 from openjarvis.tools._stubs import BaseTool, ToolSpec
@@ -96,6 +101,18 @@ class _ConfirmingAgent(ToolUsingAgent):
             content=result.content,
             tool_results=[result],
             turns=1,
+            metadata={"finish_reason": "stop"},
+        )
+
+
+class _IncompleteAgent(BaseAgent):
+    agent_id = "incomplete_ask_agent"
+
+    def run(self, input, context: AgentContext | None = None, **kwargs):
+        return AgentResult(
+            content="private agent fragment",
+            turns=1,
+            metadata={"finish_reason": "length"},
         )
 
 
@@ -211,6 +228,38 @@ class TestAskAgentOption:
             ["ask", "--agent", "nonexistent", "Hello"],
         )
         assert result.exit_code != 0
+
+    def test_incomplete_agent_response_exits_nonzero_without_fragment(
+        self, runner, mock_setup
+    ):
+        from openjarvis.core.registry import AgentRegistry
+
+        AgentRegistry.register_value("incomplete_ask_agent", _IncompleteAgent)
+
+        result = runner.invoke(
+            cli,
+            ["ask", "--agent", "incomplete_ask_agent", "Hello"],
+        )
+
+        assert result.exit_code != 0
+        assert "private agent fragment" not in result.output
+        assert "did not complete" in result.output
+
+    def test_incomplete_agent_json_is_structured_and_nonzero(self, runner, mock_setup):
+        import json
+
+        from openjarvis.core.registry import AgentRegistry
+
+        AgentRegistry.register_value("incomplete_ask_agent", _IncompleteAgent)
+
+        result = runner.invoke(
+            cli,
+            ["ask", "--agent", "incomplete_ask_agent", "--json", "Hello"],
+        )
+
+        assert result.exit_code != 0
+        assert "private agent fragment" not in result.output
+        assert json.loads(result.output)["error"]["type"] == "incomplete_response"
 
     def test_no_agent_flag_falls_back_to_config_default_agent(self, runner, mock_setup):
         """When --agent is omitted, ``config.agent.default_agent`` is used.

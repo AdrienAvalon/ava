@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { OIDC_AUTHORITY, OIDC_CLIENT_ID } from '../components/auth/oidcIdentity';
 
 // Regression for #266: the frontend must send the local API key as a Bearer
 // token on /v1 + /api requests, or `jarvis serve` with a key configured 401s
@@ -33,11 +34,15 @@ beforeEach(() => {
   globalThis.fetch = fetchMock;
   (globalThis as unknown as { localStorage: MemoryStorage }).localStorage =
     new MemoryStorage();
+  (globalThis as unknown as { sessionStorage: MemoryStorage }).sessionStorage =
+    new MemoryStorage();
 });
 
 afterEach(() => {
   vi.unstubAllEnvs();
   (globalThis as unknown as { localStorage?: MemoryStorage }).localStorage =
+    undefined;
+  (globalThis as unknown as { sessionStorage?: MemoryStorage }).sessionStorage =
     undefined;
 });
 
@@ -86,6 +91,35 @@ describe('authHeaders', () => {
     expect(authHeaders({ 'Content-Type': 'application/json' })).toEqual({
       'Content-Type': 'application/json',
       Authorization: 'Bearer sk-local-123',
+    });
+  });
+});
+
+describe('managed agent identity', () => {
+  it('sends both the daemon key and the exact verified OIDC token', async () => {
+    const oidcKey = `oidc.user:${OIDC_AUTHORITY}:${OIDC_CLIENT_ID}`;
+    sessionStorage.setItem(
+      oidcKey,
+      JSON.stringify({ id_token: 'signed.managed-agent.jwt' }),
+    );
+    localStorage.setItem(
+      SETTINGS_KEY,
+      JSON.stringify({ apiKey: 'sk-local-123' }),
+    );
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ agents: [] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    const { fetchManagedAgents } = await freshApi();
+
+    await expect(fetchManagedAgents()).resolves.toEqual([]);
+    expect(fetchMock).toHaveBeenCalledWith('/v1/managed-agents', {
+      headers: {
+        Authorization: 'Bearer sk-local-123',
+        'X-Ava-Identity': 'signed.managed-agent.jwt',
+      },
     });
   });
 });

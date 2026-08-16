@@ -43,6 +43,11 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
+from ava_extensions.tool_capabilities import (
+    EVOLUTIONS_READ,
+    FILE_READ,
+    NETWORK_FETCH,
+)
 from openjarvis.core.registry import ToolRegistry
 from openjarvis.core.types import ToolResult
 from openjarvis.tools._stubs import BaseTool, ToolSpec
@@ -87,6 +92,10 @@ _TYPES = ("feat", "fix", "perf", "refactor")
 
 _MAX = 20
 _DEFAUT = 8
+# Contrat public de `/api/v1/evolutions`. L'outil demande plus que ce qu'il affiche
+# afin de détecter une troncature, mais un `nombre=20` produisait auparavant
+# `limite=80` et donc un HTTP 422 systématique (le Control Plane borne à 50).
+_CP_LIMITE_MAX = 50
 
 
 def _lignes_release(depuis: str, nombre: int) -> list[str] | None:
@@ -228,7 +237,8 @@ def _cote_infra(fenetre: str, nombre: int) -> list[tuple[str, str, str]] | None:
     except Exception:  # noqa: BLE001
         return None
     jours = _JOURS.get(fenetre, 7)
-    url = f"{CP_BASE}/api/v1/evolutions?jours={jours}&limite={nombre}"
+    limite = min(max(int(nombre), 1), _CP_LIMITE_MAX)
+    url = f"{CP_BASE}/api/v1/evolutions?jours={jours}&limite={limite}"
     req = urllib.request.Request(url, headers={"X-CP-Voice-Token": jeton})
     try:
         with urllib.request.urlopen(req, timeout=12) as rep:  # noqa: S310
@@ -247,7 +257,7 @@ class EvolutionsTool(BaseTool):
     """Ce qui a récemment changé dans le code d'Ava elle-même."""
 
     tool_id = "evolutions"
-    is_local = True
+    is_local = False
 
     @property
     def spec(self) -> ToolSpec:
@@ -280,6 +290,9 @@ class EvolutionsTool(BaseTool):
             category="memoire",
             latency_estimate=0.3,
             timeout_seconds=12.0,
+            required_capabilities=[FILE_READ, NETWORK_FETCH, EVOLUTIONS_READ],
+            requires_capability_policy=True,
+            metadata={"fixed_destination": "avalon-control-plane"},
         )
 
     def execute(self, **params: Any) -> ToolResult:

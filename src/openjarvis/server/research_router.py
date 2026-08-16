@@ -8,7 +8,7 @@ custom SSE event schema back to the client:
 * ``synthesis``       — final answer, emitted in word-window chunks for an
   incremental UX (the agent itself returns the full string in one shot;
   chunking happens in the router so we don't need to rewire the loop)
-* ``done``            — sentinel marking the end of the stream
+* ``done``            — terminal sentinel with ``status=success|error``
 
 Clarify is **disabled for the web session** — the agent's clarify_handler is
 overridden to return a fixed "no clarification available" string so the
@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field
 
 from openjarvis.agents.research_loop import (
     DEFAULT_PLANNER_MODEL,
+    IncompleteResearchResponse,
     ResearchAgent,
 )
 from openjarvis.connectors.embeddings import OllamaEmbedder
@@ -42,6 +43,7 @@ from openjarvis.core.config import DEFAULT_CONFIG_DIR, JarvisConfig, load_config
 from openjarvis.core.types import TelemetryRecord
 from openjarvis.engine._base import InferenceEngine
 from openjarvis.engine._discovery import get_engine
+from openjarvis.server.models import MAX_COMPLETION_TOKENS
 from openjarvis.telemetry.store import TelemetryStore
 
 logger = logging.getLogger(__name__)
@@ -50,6 +52,11 @@ router = APIRouter(prefix="/api", tags=["research"])
 
 _WEB_CLARIFY_RESPONSE = "no clarification available in web session"
 _LEGACY_PLANNER_ENGINE = "ollama"
+_INCOMPLETE_RESPONSE_MESSAGE = (
+    "The research response was incomplete and was not saved. Please retry."
+)
+_RESEARCH_FAILURE_MESSAGE = "Research failed before completion. Please retry."
+_RESEARCH_SETUP_FAILURE_MESSAGE = "Research could not start. Please retry."
 
 # Sentinel placed on the queue when the agent thread terminates.
 _DONE = object()
@@ -94,6 +101,22 @@ def _resolve_planner_config(
         DEFAULT_PLANNER_MODEL,
     )
     return engine_key, model
+
+
+def _resolve_research_completion_limit(config: JarvisConfig) -> int:
+    """Return the bounded, server-owned output budget for Deep Research."""
+
+    configured = config.intelligence.max_tokens
+    if (
+        type(configured) is not int
+        or configured < 1
+        or configured > MAX_COMPLETION_TOKENS
+    ):
+        raise RuntimeError(
+            "Deep Research requires intelligence.max_tokens between "
+            f"1 and {MAX_COMPLETION_TOKENS}."
+        )
+    return configured
 
 
 def _build_planner_engine(
@@ -382,13 +405,15 @@ async def _stream_research(
     active_engine_key: str = "",
     active_model: str = "",
     request_model: str = "",
+    runtime_config: JarvisConfig | None = None,
 ) -> AsyncGenerator[str, None]:
     """Drive ResearchAgent on a worker thread; yield SSE frames as they land.
 
     Three error envelopes — setup, worker, consumer — all funnel into the
-    same two-frame contract: ``{"type": "error", ...}`` followed by
-    ``{"type": "done", "usage": {...}}``. The client can rely on always
-    seeing a ``done`` frame, even when the agent never started.
+    same two-frame contract: ``{"type": "error", ...}`` followed by a
+    ``{"type": "done", "status": "error", ...}`` sentinel. The client can
+    rely on always seeing a ``done`` frame, even when the agent never started,
+    without mistaking that terminal frame for successful synthesis.
     """
     # Phase 1: setup. Failures here (planner engine down, DB locked, etc.)
     # yield error + done and return — nothing has been emitted yet so the
@@ -401,7 +426,7 @@ async def _stream_research(
             # Called from the agent's worker thread; bounce onto the event loop.
             loop.call_soon_threadsafe(queue.put_nowait, event)
 
-        config = load_config()
+        config = runtime_config if runtime_config is not None else load_config()
         engine_key, engine, model = _build_planner_engine(
             config,
             active_engine=active_engine,
@@ -409,6 +434,7 @@ async def _stream_research(
             active_model=active_model,
             request_model=request_model,
         )
+        max_tokens = _resolve_research_completion_limit(config)
 
         # Each request gets its own thin set of connectors. Constructing them
         # is cheap (SQLite open + HTTP keepalive) and avoids state leaks
@@ -425,6 +451,7 @@ async def _stream_research(
             engine=engine,
             search=HybridSearch(store, embedder),
             model=model,
+            max_tokens=max_tokens,
             clarify_handler=lambda question: _WEB_CLARIFY_RESPONSE,
             on_event=on_event,
         )
@@ -433,10 +460,10 @@ async def _stream_research(
         yield _sse(
             {
                 "type": "error",
-                "message": f"Research failed: {type(exc).__name__}: {exc}",
+                "message": _RESEARCH_SETUP_FAILURE_MESSAGE,
             }
         )
-        yield _sse({"type": "done", "usage": {}})
+        yield _sse({"type": "done", "status": "error", "usage": {}})
         return
 
     def _emit_live_sample(power_w: float, energy_j: float, duration_s: float) -> None:
@@ -483,6 +510,16 @@ async def _stream_research(
                 queue.put_nowait,
                 {"type": "_usage", "usage": usage_dict},
             )
+        except IncompleteResearchResponse as exc:
+            logger.warning("research agent returned an incomplete synthesis: %s", exc)
+            try:
+                sampler.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            loop.call_soon_threadsafe(
+                queue.put_nowait,
+                {"type": "error", "message": _INCOMPLETE_RESPONSE_MESSAGE},
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("research agent crashed: %s", exc)
             # Stop the sampler on failure too so we don't leak the polling thread
@@ -493,7 +530,7 @@ async def _stream_research(
                 pass
             loop.call_soon_threadsafe(
                 queue.put_nowait,
-                {"type": "error", "message": f"{type(exc).__name__}: {exc}"},
+                {"type": "error", "message": _RESEARCH_FAILURE_MESSAGE},
             )
         finally:
             loop.call_soon_threadsafe(queue.put_nowait, _DONE)
@@ -503,6 +540,7 @@ async def _stream_research(
     final_answer: Optional[str] = None
     final_usage: Dict[str, int] = {}
     final_sources: List[Dict[str, Any]] = []
+    stream_failed = False
     try:
         while True:
             event = await queue.get()
@@ -522,21 +560,37 @@ async def _stream_research(
             # ``sources`` array is the renumbered, deduped citation list the
             # frontend should render under the final answer.
             if etype == "final_answer":
-                final_answer = event.get("text", "")
+                candidate = event.get("text")
+                if not isinstance(candidate, str) or not candidate.strip():
+                    stream_failed = True
+                    yield _sse({"type": "error", "message": _RESEARCH_FAILURE_MESSAGE})
+                    continue
+                final_answer = candidate
                 final_sources = list(event.get("sources") or [])
-                for piece in _chunk_synthesis(final_answer or ""):
+                for piece in _chunk_synthesis(final_answer):
                     yield _sse({"type": "synthesis", "text": piece})
                 if final_sources:
                     yield _sse({"type": "final_sources", "sources": final_sources})
                 continue
 
+            if etype == "error":
+                stream_failed = True
+
             yield _sse(event)
 
-        # If the agent thread crashed before producing a final answer, the
-        # client still gets the error frame (emitted above) followed by done.
-        # The done frame also carries the deduped sources so a client that
-        # only listens for ``done`` still gets the canonical citation list.
-        yield _sse({"type": "done", "usage": final_usage, "sources": final_sources})
+        if final_answer is None and not stream_failed:
+            stream_failed = True
+            yield _sse({"type": "error", "message": _RESEARCH_FAILURE_MESSAGE})
+
+        status = "error" if stream_failed else "success"
+        yield _sse(
+            {
+                "type": "done",
+                "status": status,
+                "usage": final_usage,
+                "sources": final_sources,
+            }
+        )
     except Exception as exc:  # noqa: BLE001
         # Consumer loop crashed unexpectedly (e.g. JSON serialization fault,
         # logic bug). Surface a clean error frame rather than letting the
@@ -545,10 +599,17 @@ async def _stream_research(
         yield _sse(
             {
                 "type": "error",
-                "message": f"Research failed: {type(exc).__name__}: {exc}",
+                "message": _RESEARCH_FAILURE_MESSAGE,
             }
         )
-        yield _sse({"type": "done", "usage": final_usage, "sources": final_sources})
+        yield _sse(
+            {
+                "type": "done",
+                "status": "error",
+                "usage": final_usage,
+                "sources": final_sources,
+            }
+        )
     finally:
         # The worker may still be cleaning up (rarely) — make sure we don't
         # leak a dangling task. Swallow any straggler exception so a worker
@@ -572,8 +633,8 @@ async def research(req: ResearchRequest, request: Request) -> StreamingResponse:
 
     Response is ``text/event-stream`` with one JSON event per frame. See the
     module docstring for the schema; a final ``{"type": "done"}`` always
-    terminates the stream so clients can detect end-of-response without
-    parsing the underlying ``[DONE]`` sentinel used by OpenAI-style routes.
+    terminates the stream and its ``status`` distinguishes complete synthesis
+    from a failed run without parsing the OpenAI-style ``[DONE]`` sentinel.
     """
     active_engine = getattr(request.app.state, "engine", None)
     active_model = str(getattr(request.app.state, "model", "") or "")
@@ -587,6 +648,7 @@ async def research(req: ResearchRequest, request: Request) -> StreamingResponse:
             active_engine_key=active_engine_key,
             active_model=active_model,
             request_model=req.model or "",
+            runtime_config=getattr(request.app.state, "config", None),
         ),
         media_type="text/event-stream",
         headers={

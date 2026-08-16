@@ -9,6 +9,7 @@ against the stub's recorded calls — they do NOT exercise Apple's real SDK.
 from __future__ import annotations
 
 import importlib
+import json
 import platform
 import sys
 import types
@@ -99,6 +100,7 @@ class TestAppleFmShimSdkMigration:
         assert opt.maximum_response_tokens == 42
         assert rec["respond_calls"][-1]["options"] is opt
         assert resp.json()["choices"][0]["message"]["content"] == "Hello from Apple FM."
+        assert resp.json()["choices"][0]["finish_reason"] == "length"
 
     def test_stream_passes_options_not_max_tokens(self, shim):
         mod, rec = shim
@@ -117,6 +119,12 @@ class TestAppleFmShimSdkMigration:
         # options object passed through; not the legacy max_tokens kwarg.
         assert rec["stream_calls"][-1]["options"] is rec["options"][-1]
         assert "data: [DONE]" in body
+        final_chunks = [
+            json.loads(line[len("data:") :].strip())
+            for line in body.splitlines()
+            if line.startswith("data:") and "[DONE]" not in line
+        ]
+        assert final_chunks[-1]["choices"][0]["finish_reason"] == "length"
 
     def test_stream_emits_incremental_deltas_from_cumulative_snapshots(self, shim):
         """Regression for #378.

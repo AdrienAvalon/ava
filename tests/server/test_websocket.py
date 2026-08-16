@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 fastapi = pytest.importorskip("fastapi")
+from ava_extensions.identity.principal_context import (  # noqa: E402
+    PRINCIPAL_CONTEXT_MARKER,
+    PrincipalContext,
+)
 from ava_extensions.identity.relationship import (  # noqa: E402
     RELATIONSHIP_MARKER,
     RelationshipOverlay,
@@ -19,6 +24,7 @@ from starlette.testclient import TestClient  # noqa: E402
 from starlette.websockets import WebSocketDisconnect  # noqa: E402
 
 from openjarvis.core.types import Role  # noqa: E402
+from openjarvis.engine._stubs import StreamChunk  # noqa: E402
 from openjarvis.server import routes as server_routes  # noqa: E402
 from openjarvis.server.api_routes import include_all_routes  # noqa: E402
 
@@ -34,6 +40,9 @@ def _make_app(engine=None):
         engine = _make_streaming_engine()
     app.state.engine = engine
     app.state.model = "test-model"
+    app.state.config = SimpleNamespace(
+        intelligence=SimpleNamespace(max_tokens=16_384),
+    )
     include_all_routes(app)
     return app
 
@@ -45,13 +54,22 @@ def _make_streaming_engine(tokens=None):
     engine = MagicMock()
     engine.engine_id = "mock"
     engine.captured_messages = []
+    engine.captured_kwargs = []
 
     async def mock_stream(messages, *, model="test-model", **kwargs):
         engine.captured_messages.append(messages)
         for tok in tokens:
             yield tok
 
+    async def mock_stream_full(messages, *, model="test-model", **kwargs):
+        engine.captured_messages.append(messages)
+        engine.captured_kwargs.append({"model": model, **kwargs})
+        for tok in tokens:
+            yield StreamChunk(content=tok)
+        yield StreamChunk(finish_reason="stop")
+
     engine.stream = mock_stream
+    engine.stream_full = mock_stream_full
     engine.generate.return_value = {
         "content": "Hello world",
         "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
@@ -105,6 +123,7 @@ class TestWebSocketStreaming:
             assert chunks == ["Hello", " ", "world"]
             assert done is not None
             assert done["content"] == "Hello world"
+        assert engine.captured_kwargs[-1]["max_tokens"] == 16_384
         messages = engine.captured_messages[-1]
         assert messages[0].role == Role.SYSTEM
         assert "Tu es **Ava**" in messages[0].content
@@ -163,6 +182,50 @@ class TestWebSocketStreaming:
             assert chunks[0] == "Fallback response"
             assert done is not None
             assert done["content"] == "Fallback response"
+        assert engine.generate.call_args.kwargs["max_tokens"] == 16_384
+
+    @pytest.mark.parametrize("terminal", ["length", None, "future_reason"])
+    def test_incomplete_stream_never_emits_done_or_trace(self, terminal):
+        engine = MagicMock()
+        engine.engine_id = "mock"
+
+        async def stream_full(messages, *, model="test-model", **kwargs):
+            del messages, model, kwargs
+            yield StreamChunk(content="partial")
+            if terminal is not None:
+                yield StreamChunk(finish_reason=terminal)
+
+        engine.stream_full = stream_full
+        app = _make_app(engine)
+        app.state.trace_store = MagicMock()
+        client = TestClient(app)
+
+        with client.websocket_connect("/v1/chat/stream") as ws:
+            ws.send_text(json.dumps({"message": "Hi"}))
+            assert ws.receive_json() == {"type": "chunk", "content": "partial"}
+            assert ws.receive_json() == {
+                "type": "error",
+                "detail": "Chat response incomplete",
+            }
+
+        app.state.trace_store.save.assert_not_called()
+
+    def test_incomplete_generate_never_emits_done_or_trace(self):
+        engine = _make_generate_only_engine("partial")
+        engine.generate.return_value["finish_reason"] = "max_tokens"
+        app = _make_app(engine)
+        app.state.trace_store = MagicMock()
+        client = TestClient(app)
+
+        with client.websocket_connect("/v1/chat/stream") as ws:
+            ws.send_text(json.dumps({"message": "Hi"}))
+            assert ws.receive_json() == {"type": "chunk", "content": "partial"}
+            assert ws.receive_json() == {
+                "type": "error",
+                "detail": "Chat response incomplete",
+            }
+
+        app.state.trace_store.save.assert_not_called()
 
     def test_custom_model_in_request(self):
         """The model field from the request should be forwarded to the engine."""
@@ -190,7 +253,7 @@ class TestWebSocketStreaming:
             # Make it look like an async generator to the endpoint
             yield  # pragma: no cover – unreachable, but needed for async gen syntax
 
-        engine.stream = bad_stream
+        engine.stream_full = bad_stream
         app = _make_app(engine=engine)
         client = TestClient(app)
         with client.websocket_connect("/v1/chat/stream") as ws:
@@ -232,6 +295,10 @@ class TestWebSocketStreaming:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         principal = Principal("oidc", "https://issuer.example.invalid", "owner-subject")
+        principal_context = PrincipalContext(
+            display_name="Test Owner",
+            preferred_language="fr-FR",
+        )
         overlay = RelationshipOverlay(
             profile_id="virtual-girlfriend-v1",
             prompt=(
@@ -242,7 +309,7 @@ class TestWebSocketStreaming:
         monkeypatch.setattr(
             server_routes,
             "_relationship_context",
-            lambda _headers: (principal, overlay, True),
+            lambda _headers: (principal, overlay, True, principal_context),
         )
         engine = _make_streaming_engine(tokens=["ok"])
         app = _make_app(engine)
@@ -260,6 +327,9 @@ class TestWebSocketStreaming:
 
         system_prompt = engine.captured_messages[-1][0].content
         assert system_prompt.count(RELATIONSHIP_MARKER) == 1
+        assert system_prompt.count(PRINCIPAL_CONTEXT_MARKER) == 1
+        assert "Test Owner" in system_prompt
+        assert principal.subject not in system_prompt
         trace = app.state.trace_store.save.call_args.args[0]
         assert trace.metadata == {"provenance": principal.provenance}
         assert principal.subject not in trace.metadata["provenance"]

@@ -1,12 +1,13 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { Routes, Route } from 'react-router';
+import { useAuth } from 'react-oidc-context';
 import { Layout } from './components/Layout';
 import { ChatPage } from './pages/ChatPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { GetStartedPage } from './pages/GetStartedPage';
 import { AgentsPage } from './pages/AgentsPage';
-import { DataSourcesPage } from './pages/DataSourcesPage';
+import { DataSourcesPage, dataSourcesPrincipalKey } from './pages/DataSourcesPage';
 import { LogsPage } from './pages/LogsPage';
 import { ImmersivePage } from "./components/immersive/ImmersivePage";
 import { LoginGate } from "./components/auth/LoginGate";
@@ -18,6 +19,16 @@ import { fetchModels, fetchServerInfo, fetchSavings, submitSavings, isTauri } fr
 import { OptInModal } from './components/OptInModal';
 import { UpdateChecker } from './components/Desktop/UpdateChecker';
 import { track, hashId } from './lib/analytics';
+
+function PrincipalScopedDataSourcesPage() {
+  const auth = useAuth();
+  const principalKey = dataSourcesPrincipalKey(
+    auth.user?.profile.iss,
+    auth.user?.profile.sub,
+  );
+  if (!principalKey) return null;
+  return <DataSourcesPage key={principalKey} />;
+}
 
 export default function App() {
   const [setupDone, setSetupDone] = useState(!isTauri());
@@ -192,8 +203,8 @@ export default function App() {
           <Route path="dashboard" element={<DashboardPage />} />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="get-started" element={<GetStartedPage />} />
-          <Route path="data-sources" element={<DataSourcesPage />} />
-          <Route path="agents" element={<AgentsPage />} />
+          <Route path="data-sources" element={<LoginGate><PrincipalScopedDataSourcesPage /></LoginGate>} />
+          <Route path="agents" element={<LoginGate><AgentsPage /></LoginGate>} />
           <Route path="logs" element={<LogsPage />} />
         </Route>
         <Route path="immersive" element={<LoginGate><ImmersivePage /></LoginGate>} />

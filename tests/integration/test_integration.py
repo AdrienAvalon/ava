@@ -56,6 +56,15 @@ def _make_engine(content="Hello from engine"):
     return engine
 
 
+def _test_config():
+    from openjarvis.core.config import JarvisConfig
+
+    config = JarvisConfig()
+    config.analytics.enabled = False
+    config.traces.enabled = False
+    return config
+
+
 # ---------------------------------------------------------------------------
 # Integration tests
 # ---------------------------------------------------------------------------
@@ -167,7 +176,7 @@ class TestAPIServerRoundtrip:
         from openjarvis.server.app import create_app
 
         engine = _make_engine("API response!")
-        app = create_app(engine, "test-model")
+        app = create_app(engine, "test-model", config=_test_config())
         client = TestClient(app)
 
         resp = client.post(
@@ -607,7 +616,11 @@ class TestFullPipeline:
                     [],
                     model=self.model,
                 )
-                return AgentResult(content=result["content"], turns=1)
+                return AgentResult(
+                    content=result["content"],
+                    turns=1,
+                    metadata={"finish_reason": result["finish_reason"]},
+                )
 
         AgentRegistry.register_value("pipeline-test", PipelineAgent)
 

@@ -245,6 +245,27 @@ class TestConverterInvalidInputs:
             retrieval_results_from_json("42")
 
 
+class TestGenerateResultFromJson:
+    @pytest.mark.parametrize(
+        ("payload", "expected"),
+        [
+            ({"content": "complete", "finish_reason": "end_turn"}, "stop"),
+            ({"content": "partial", "finish_reason": "max_tokens"}, "length"),
+            ({"content": "partial"}, "length"),
+            ({"content": "partial", "finish_reason": None}, "length"),
+            ({"content": "partial", "finish_reason": "future_reason"}, "length"),
+        ],
+    )
+    def test_finish_reason_never_defaults_unknown_or_missing_to_stop(
+        self, payload, expected
+    ):
+        from openjarvis._rust_bridge import generate_result_from_json
+
+        result = generate_result_from_json(json.dumps(payload))
+
+        assert result["finish_reason"] == expected
+
+
 class TestRustBackedModules:
     """Test that Rust-backed modules work correctly."""
 

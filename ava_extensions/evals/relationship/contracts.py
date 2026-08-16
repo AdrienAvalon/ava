@@ -37,10 +37,12 @@ GATE_IDS = (
     "isolation",
     "dependency",
     "coercion",
+    "self_promotion",
+    "conversation_echo",
     "tool_escalation",
     "false_memory",
 )
-SECONDARY_METRICS = ("warmth", "continuity", "accuracy")
+SECONDARY_METRICS = ("warmth", "wit", "continuity", "accuracy")
 SPLITS = ("development", "holdout", "adversarial")
 
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -643,14 +645,20 @@ def _validate_case(value: Any, path: str) -> dict[str, Any]:
             f"{path}.conversation: le dernier tour doit venir de l'utilisateur"
         )
 
+    raw_policy = case["policy"]
+    if type(raw_policy) is not dict:
+        raise ContractError(f"{path}.policy: objet requis")
+    policy_with_defaults = dict(raw_policy)
+    policy_with_defaults.setdefault("allowed_exact_echo_turn_indexes", [])
     policy = _object(
-        case["policy"],
+        policy_with_defaults,
         f"{path}.policy",
         {
             "allowed_tools",
             "visible_facts",
             "forbidden_canaries",
             "allowed_memory_claim_ids",
+            "allowed_exact_echo_turn_indexes",
         },
     )
     _string_list(policy["allowed_tools"], f"{path}.policy.allowed_tools")
@@ -679,13 +687,58 @@ def _validate_case(value: Any, path: str) -> dict[str, Any]:
         raise ContractError(
             f"{path}.policy.forbidden_canaries: canari deja visible dans le cas"
         )
+    echo_indexes = _list(
+        policy["allowed_exact_echo_turn_indexes"],
+        f"{path}.policy.allowed_exact_echo_turn_indexes",
+    )
+    if any(type(index) is not int or index < 0 for index in echo_indexes):
+        raise ContractError(
+            f"{path}.policy.allowed_exact_echo_turn_indexes: "
+            "indices entiers positifs requis"
+        )
+    if len(set(echo_indexes)) != len(echo_indexes):
+        raise ContractError(
+            f"{path}.policy.allowed_exact_echo_turn_indexes: indices dupliques"
+        )
+    if any(index >= len(turns) - 1 for index in echo_indexes):
+        raise ContractError(
+            f"{path}.policy.allowed_exact_echo_turn_indexes: "
+            "seul un tour anterieur peut etre autorise"
+        )
+    exact_request_markers = (
+        "cite exactement",
+        "citez exactement",
+        "repete exactement",
+        "répète exactement",
+        "recopie exactement",
+        "citation exacte",
+        "mot pour mot",
+        "verbatim",
+    )
+    if echo_indexes and not any(
+        marker in turns[-1]["content"].casefold() for marker in exact_request_markers
+    ):
+        raise ContractError(
+            f"{path}.policy.allowed_exact_echo_turn_indexes: "
+            "demande explicite de citation exacte requise"
+        )
 
     secondary = _object(
         case["secondary"],
         f"{path}.secondary",
-        {"warmth_any_of", "continuity_all_of", "accuracy_all_of"},
+        {
+            "warmth_any_of",
+            "wit_any_of",
+            "continuity_all_of",
+            "accuracy_all_of",
+        },
     )
-    for key in ("warmth_any_of", "continuity_all_of", "accuracy_all_of"):
+    for key in (
+        "warmth_any_of",
+        "wit_any_of",
+        "continuity_all_of",
+        "accuracy_all_of",
+    ):
         _string_list(secondary[key], f"{path}.secondary.{key}")
     return case
 

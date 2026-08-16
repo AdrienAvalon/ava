@@ -15,6 +15,7 @@ import pytest
 from openjarvis.agents.research_loop import (
     SEARCH_TOOL_SPEC,
     SYSTEM_PROMPT,
+    IncompleteResearchResponse,
     ResearchAgent,
     _hit_url,
     build_sources_for_client,
@@ -48,14 +49,25 @@ class _MockEngine:
         tools: Optional[List[Dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        self.calls.append({"tools": tools, "messages": list(messages)})
+        self.calls.append(
+            {
+                "tools": tools,
+                "messages": list(messages),
+                "max_tokens": max_tokens,
+            }
+        )
         if self._responses:
             return (
                 self._responses.pop(0)
                 if len(self._responses) > 1
                 else self._responses[0]
             )
-        return {"content": "", "tool_calls": [], "usage": {}}
+        return {
+            "content": "",
+            "tool_calls": [],
+            "usage": {},
+            "finish_reason": "stop",
+        }
 
 
 def _search_call(call_id: str, query: str = "anything") -> Dict[str, Any]:
@@ -69,14 +81,16 @@ def _search_call(call_id: str, query: str = "anything") -> Dict[str, Any]:
             }
         ],
         "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        "finish_reason": "tool_calls",
     }
 
 
-def _text_response(text: str) -> Dict[str, Any]:
+def _text_response(text: str, *, finish_reason: str = "stop") -> Dict[str, Any]:
     return {
         "content": text,
         "tool_calls": [],
         "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
+        "finish_reason": finish_reason,
     }
 
 
@@ -130,7 +144,12 @@ def test_forced_synthesis_returns_sentinel_when_model_stays_silent(
         responses=[
             _search_call("call-1"),
             _search_call("call-2"),
-            {"content": "", "tool_calls": [], "usage": {}},  # silent forced call
+            {
+                "content": "",
+                "tool_calls": [],
+                "usage": {},
+                "finish_reason": "stop",
+            },  # silent forced call
         ]
     )
 
@@ -150,6 +169,166 @@ def test_first_turn_text_response_returns_directly(stub_search: MagicMock) -> No
     assert result.tool_calls == []
     # Only one engine call needed.
     assert len(engine.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "finish_reason",
+    [None, "", "length", "max_tokens", "refusal", "content_filter", "unknown"],
+)
+def test_terminal_response_requires_proven_normal_completion(
+    stub_search: MagicMock,
+    finish_reason: str | None,
+) -> None:
+    """Partial, refused, unknown and unlabelled synthesis is never published."""
+
+    response = _text_response("This answer stops in the middle")
+    if finish_reason is None:
+        response.pop("finish_reason")
+    else:
+        response["finish_reason"] = finish_reason
+    engine = _MockEngine(responses=[response])
+    captured: list[dict[str, Any]] = []
+    agent = ResearchAgent(
+        engine,
+        stub_search,
+        model="mock",
+        max_tokens=4096,
+        on_event=captured.append,
+    )
+
+    with pytest.raises(IncompleteResearchResponse):
+        agent.run("hello")
+
+    assert not any(event.get("type") == "final_answer" for event in captured)
+
+
+@pytest.mark.parametrize("finish_reason", ["stop", "end_turn", "stop_sequence"])
+def test_provider_normal_completion_reasons_remain_supported(
+    stub_search: MagicMock,
+    finish_reason: str,
+) -> None:
+    engine = _MockEngine(
+        responses=[_text_response("Complete answer.", finish_reason=finish_reason)]
+    )
+    agent = ResearchAgent(
+        engine,
+        stub_search,
+        model="mock",
+        max_tokens=4096,
+    )
+
+    assert agent.run("hello").answer == "Complete answer."
+
+
+@pytest.mark.parametrize(
+    "finish_reason",
+    ["tool_calls", "tool_use", "function_call", "stop", "end_turn", "stop_sequence"],
+)
+def test_complete_tool_call_reasons_are_intermediate_not_incomplete(
+    stub_search: MagicMock,
+    finish_reason: str,
+) -> None:
+    """A provider tool-call stop reason is valid before the final synthesis."""
+
+    tool_response = _search_call("call-1")
+    tool_response["finish_reason"] = finish_reason
+    engine = _MockEngine(
+        responses=[
+            tool_response,
+            _text_response("Complete after searching."),
+        ]
+    )
+    agent = ResearchAgent(
+        engine,
+        stub_search,
+        model="mock",
+        max_iterations=2,
+        max_tokens=4096,
+    )
+
+    assert agent.run("find it").answer == "Complete after searching."
+
+
+@pytest.mark.parametrize(
+    "finish_reason",
+    [None, "", "length", "max_tokens", "refusal", "content_filter", "unknown"],
+)
+def test_incomplete_tool_call_is_rejected_before_execution(
+    stub_search: MagicMock,
+    finish_reason: str | None,
+) -> None:
+    tool_response = _search_call("call-1")
+    if finish_reason is None:
+        tool_response.pop("finish_reason")
+    else:
+        tool_response["finish_reason"] = finish_reason
+    engine = _MockEngine(responses=[tool_response])
+    agent = ResearchAgent(
+        engine,
+        stub_search,
+        model="mock",
+        max_iterations=2,
+        max_tokens=4096,
+    )
+
+    with pytest.raises(IncompleteResearchResponse):
+        agent.run("find it")
+
+    stub_search.search.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("arguments", "name"),
+    [
+        ('{"query":"partial', "search"),
+        ("[]", "search"),
+        (None, "search"),
+        ('{"query":"valid"}', ""),
+        ('{"query":"valid"}', "unknown"),
+    ],
+)
+def test_invalid_tool_payload_is_rejected_before_execution(
+    stub_search: MagicMock,
+    arguments: Any,
+    name: str,
+) -> None:
+    tool_response = _search_call("call-1")
+    tool_response["tool_calls"][0]["arguments"] = arguments
+    tool_response["tool_calls"][0]["name"] = name
+    agent = ResearchAgent(
+        _MockEngine(responses=[tool_response]),
+        stub_search,
+        model="mock",
+        max_iterations=2,
+        max_tokens=4096,
+    )
+
+    with pytest.raises(IncompleteResearchResponse):
+        agent.run("find it")
+
+    stub_search.search.assert_not_called()
+
+
+def test_forced_final_synthesis_rejects_length(
+    stub_search: MagicMock,
+) -> None:
+    engine = _MockEngine(
+        responses=[
+            _search_call("call-1"),
+            _search_call("call-2"),
+            _text_response("Still truncated", finish_reason="length"),
+        ]
+    )
+    agent = ResearchAgent(
+        engine,
+        stub_search,
+        model="mock",
+        max_iterations=1,
+        max_tokens=4096,
+    )
+
+    with pytest.raises(IncompleteResearchResponse):
+        agent.run("find it")
 
 
 def test_clarify_before_any_search_is_rejected(stub_search: MagicMock) -> None:
@@ -177,6 +356,7 @@ def test_clarify_before_any_search_is_rejected(stub_search: MagicMock) -> None:
                     }
                 ],
                 "usage": {},
+                "finish_reason": "tool_calls",
             },
             _text_response("Final."),
         ]
@@ -320,6 +500,7 @@ def test_search_with_sources_filter_is_passed_through(
                     }
                 ],
                 "usage": {},
+                "finish_reason": "tool_calls",
             },
             _text_response("Here are your recent meetings."),
         ]
@@ -351,6 +532,7 @@ def test_search_sources_coerces_scalar_to_list(stub_search: MagicMock) -> None:
                     }
                 ],
                 "usage": {},
+                "finish_reason": "tool_calls",
             },
             _text_response("done"),
         ]
@@ -588,6 +770,7 @@ def test_final_answer_event_carries_renumbered_sources(
                     }
                 ],
                 "usage": {},
+                "finish_reason": "tool_calls",
             },
             _text_response("First [2], then [1], then [2] again."),
         ]

@@ -1,8 +1,8 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { Send, Square, Paperclip, Search } from 'lucide-react';
 import { toast } from 'sonner';
-import { useAppStore, generateId } from '../../lib/store';
-import { streamChat, streamResearch } from '../../lib/sse';
+import { useAppStore, generateId, type MaxTokensSource } from '../../lib/store';
+import { streamChat, streamResearch, type ChatRequest } from '../../lib/sse';
 import { fetchSavings, getBase } from '../../lib/api';
 import { listConnectors, getSyncStatus } from '../../lib/connectors-api';
 import { MicButton } from './MicButton';
@@ -15,6 +15,22 @@ import type {
   TokenUsage,
   ToolCallInfo,
 } from '../../types';
+
+export function buildChatRequest(
+  model: string,
+  messages: ChatRequest['messages'],
+  temperature: number,
+  maxTokens: number,
+  maxTokensSource: MaxTokensSource,
+): ChatRequest {
+  return {
+    model,
+    messages,
+    stream: true,
+    temperature,
+    ...(maxTokensSource === 'user' ? { max_tokens: maxTokens } : {}),
+  };
+}
 
 // While Deep Research is toggled on, poll connected sources for sync
 // progress so we can surface "Searching over N items — sync in progress"
@@ -86,6 +102,7 @@ export function InputArea() {
   const messages = useAppStore((s) => s.messages);
   const speechEnabled = useAppStore((s) => s.settings.speechEnabled);
   const maxTokens = useAppStore((s) => s.settings.maxTokens);
+  const maxTokensSource = useAppStore((s) => s.settings.maxTokensSource);
   const temperature = useAppStore((s) => s.settings.temperature);
   const createConversation = useAppStore((s) => s.createConversation);
   const addMessage = useAppStore((s) => s.addMessage);
@@ -368,7 +385,7 @@ export function InputArea() {
         }
       } else {
       for await (const sseEvent of streamChat(
-        { model: selectedModel, messages: apiMessages, stream: true, temperature, max_tokens: maxTokens },
+        buildChatRequest(selectedModel, apiMessages, temperature, maxTokens, maxTokensSource),
         controller.signal,
       )) {
         const eventName = sseEvent.event;
@@ -448,12 +465,17 @@ export function InputArea() {
       }
     } catch (err: any) {
       if (err.name === 'AbortError') {
-        // User cancelled or model switch — keep whatever was accumulated
-        if (!accumulatedContent) accumulatedContent = '(Generation stopped)';
+        // A user-cancelled fragment may remain useful, but it must never look like
+        // a completed assistant answer in the persisted transcript.
+        accumulatedContent = accumulatedContent
+          ? `${accumulatedContent}\n\n_(Generation stopped before completion.)_`
+          : '(Generation stopped before completion.)';
       } else {
         const errMsg = err?.message || String(err);
         accumulatedContent =
-          accumulatedContent || `Error: ${errMsg}`;
+          accumulatedContent
+            ? `${accumulatedContent}\n\n**Incomplete response:** ${errMsg}`
+            : `Error: ${errMsg}`;
         useAppStore.getState().addLogEntry({
           timestamp: Date.now(), level: 'error', category: 'chat',
           message: `Stream error: ${errMsg}`,
@@ -539,6 +561,7 @@ export function InputArea() {
     deepResearch,
     temperature,
     maxTokens,
+    maxTokensSource,
   ]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {

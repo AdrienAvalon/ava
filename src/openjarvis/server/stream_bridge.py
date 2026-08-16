@@ -17,6 +17,7 @@ from fastapi.responses import StreamingResponse
 from openjarvis.agents._stubs import AgentContext, BaseAgent
 from openjarvis.core.events import Event, EventBus, EventType
 from openjarvis.engine._base import looks_like_context_length_error
+from openjarvis.engine._finish import conservative_finish_reason
 from openjarvis.server.models import (
     ChatCompletionChunk,
     ChatCompletionRequest,
@@ -36,6 +37,25 @@ _EVENT_MAP = {
 
 # Sentinel signalling that the agent thread has finished
 _DONE = object()
+_EXPOSED_TERMINALS = {"stop", "length", "tool_calls", "content_filter", "error"}
+
+
+def _terminal_reason(value: object) -> str:
+    """Return a client-safe terminal without ever inventing completion."""
+
+    reason = conservative_finish_reason(value)
+    return reason if reason in _EXPOSED_TERMINALS else "length"
+
+
+def _agent_terminal_reason(agent_result: object) -> str:
+    """Derive the fallback terminal proof carried by an AgentResult."""
+
+    metadata = getattr(agent_result, "metadata", None)
+    if not isinstance(metadata, dict):
+        return "length"
+    if metadata.get("max_turns_exceeded") or metadata.get("incomplete_tool_call"):
+        return "length"
+    return _terminal_reason(metadata.get("finish_reason"))
 
 
 def _estimate_prompt_tokens(messages: list) -> int:
@@ -214,7 +234,7 @@ class AgentStreamBridge:
                     choices=[
                         StreamChoice(
                             delta=DeltaMessage(content=error_content),
-                            finish_reason="stop",
+                            finish_reason="error",
                         )
                     ],
                 )
@@ -245,10 +265,12 @@ class AgentStreamBridge:
             content = agent_result.content or ""
             engine = getattr(self._agent, "_engine", None)
             used_real_streaming = False
+            terminal_reason = _agent_terminal_reason(agent_result)
 
             if engine is not None and hasattr(engine, "stream_full") and content:
                 # Re-stream using the engine for real token delivery.
                 # Build the same messages the agent used for its final turn.
+                replay_has_content = False
                 try:
                     from openjarvis.core.types import Message as MsgType
                     from openjarvis.core.types import Role as RoleType
@@ -269,11 +291,13 @@ class AgentStreamBridge:
                             )
                         )
 
+                    replay_terminal: object = None
                     async for sc in engine.stream_full(
                         replay_messages,
                         model=self._model,
                     ):
                         if sc.content:
+                            replay_has_content = True
                             chunk = ChatCompletionChunk(
                                 id=self._chunk_id,
                                 model=self._model,
@@ -284,15 +308,35 @@ class AgentStreamBridge:
                                 ],
                             )
                             yield f"data: {chunk.model_dump_json()}\n\n"
+                        if sc.finish_reason is not None:
+                            replay_terminal = sc.finish_reason
                     used_real_streaming = True
+                    terminal_reason = (
+                        _terminal_reason(replay_terminal)
+                        if replay_has_content
+                        else "length"
+                    )
                 except Exception as stream_exc:
                     import logging as _logging
 
                     _logger = _logging.getLogger("openjarvis.server")
-                    _logger.warning(
-                        "Real streaming failed, falling back to word replay: %s",
-                        stream_exc,
-                    )
+                    if replay_has_content:
+                        # Some bytes are already visible and cannot be rolled
+                        # back. Replaying the agent result would duplicate them;
+                        # claiming success would certify a malformed response.
+                        _logger.warning(
+                            "Real streaming failed after visible content; "
+                            "marking response incomplete: %s",
+                            stream_exc,
+                        )
+                        used_real_streaming = True
+                        terminal_reason = "length"
+                    else:
+                        _logger.warning(
+                            "Real streaming failed before content; "
+                            "falling back to word replay: %s",
+                            stream_exc,
+                        )
 
             # Fallback: word-by-word replay if real streaming was not used
             if not used_real_streaming and content:
@@ -330,7 +374,9 @@ class AgentStreamBridge:
                 choices=[
                     StreamChoice(
                         delta=DeltaMessage(),
-                        finish_reason="stop",
+                        finish_reason=(
+                            terminal_reason if content.strip() else "length"
+                        ),
                     )
                 ],
             )

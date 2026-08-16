@@ -53,7 +53,13 @@ class _FakeSystem:
 
 class TestAskDirectEngineMode:
     def test_direct_engine_returns_content(self):
-        engine = _FakeEngine({"content": "hi there", "usage": {"tokens": 4}})
+        engine = _FakeEngine(
+            {
+                "content": "hi there",
+                "usage": {"tokens": 4},
+                "finish_reason": "end_turn",
+            }
+        )
         system = _FakeSystem(engine=engine)
         orchestrator = QueryOrchestrator(system)
 
@@ -61,6 +67,7 @@ class TestAskDirectEngineMode:
 
         assert result["content"] == "hi there"
         assert result["usage"] == {"tokens": 4}
+        assert result["finish_reason"] == "stop"
         assert result["model"] == "fake-model"
         assert result["engine"] == "fake"
 

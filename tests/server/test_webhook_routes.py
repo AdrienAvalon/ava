@@ -39,10 +39,29 @@ class TestTwilioWebhook:
     def twilio_client(self, twilio_app):
         return TestClient(twilio_app)
 
-    def test_valid_twilio_webhook(self, twilio_client, mock_bridge):
-        with patch(
-            "openjarvis.server.webhook_routes._validate_twilio_signature",
-            return_value=True,
+    def test_twilio_fails_closed_before_global_owner_selection(
+        self,
+        twilio_app,
+        twilio_client,
+        mock_bridge,
+    ):
+        manager = MagicMock()
+        manager.list_agents.return_value = [
+            {"id": "owner-a-agent"},
+            {"id": "owner-b-agent"},
+        ]
+        state_bridge = MagicMock()
+        engine = MagicMock()
+        twilio_app.state.agent_manager = manager
+        twilio_app.state.channel_bridge = state_bridge
+        twilio_app.state.engine = engine
+
+        with (
+            patch(
+                "openjarvis.server.webhook_routes._validate_twilio_signature",
+                return_value=True,
+            ) as validate_signature,
+            patch("openjarvis.server.webhook_routes.asyncio.to_thread") as to_thread,
         ):
             resp = twilio_client.post(
                 "/webhooks/twilio",
@@ -52,14 +71,22 @@ class TestTwilioWebhook:
                     "MessageSid": "SM123",
                 },
             )
-        assert resp.status_code == 200
-        assert "<Response>" in resp.text  # TwiML
 
-    def test_invalid_signature_rejected(self, twilio_client):
+        assert resp.status_code == 503
+        assert resp.text == "Channel unavailable"
+        validate_signature.assert_not_called()
+        to_thread.assert_not_called()
+        manager.list_agents.assert_not_called()
+        manager.list_channel_bindings.assert_not_called()
+        mock_bridge.handle_incoming.assert_not_called()
+        state_bridge.handle_incoming.assert_not_called()
+        assert engine.mock_calls == []
+
+    def test_twilio_rejection_does_not_expose_signature_state(self, twilio_client):
         with patch(
             "openjarvis.server.webhook_routes._validate_twilio_signature",
             return_value=False,
-        ):
+        ) as validate_signature:
             resp = twilio_client.post(
                 "/webhooks/twilio",
                 data={
@@ -68,7 +95,9 @@ class TestTwilioWebhook:
                     "MessageSid": "SM123",
                 },
             )
-        assert resp.status_code == 403
+        assert resp.status_code == 503
+        assert resp.text == "Channel unavailable"
+        validate_signature.assert_not_called()
 
 
 class TestBlueBubblesWebhook:
@@ -216,7 +245,7 @@ class TestWhatsAppWebhook:
 
 
 class TestWebhooksFailClosed:
-    """When a channel's secret/token is unset, webhooks must reject (403)."""
+    """Webhooks reject when channel authentication or owner mapping is absent."""
 
     def _client(self, mock_bridge, **kwargs):
         app = FastAPI()
@@ -229,7 +258,8 @@ class TestWebhooksFailClosed:
             "/webhooks/twilio",
             data={"From": "+15551234567", "Body": "hi", "MessageSid": "SM1"},
         )
-        assert resp.status_code == 403
+        assert resp.status_code == 503
+        assert resp.text == "Channel unavailable"
         mock_bridge.handle_incoming.assert_not_called()
 
     def test_bluebubbles_without_password_rejected(self, mock_bridge):

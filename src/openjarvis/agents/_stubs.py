@@ -8,6 +8,7 @@ base for agents that accept tools.
 
 from __future__ import annotations
 
+import json
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -17,6 +18,90 @@ from openjarvis.core.config import load_config
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.types import Conversation, Message, Role, ToolResult
 from openjarvis.engine._stubs import InferenceEngine
+
+_FINISH_REASON_ALIASES = {
+    # Anthropic non-streaming stop reasons.
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "tool_use": "tool_calls",
+    "function_call": "tool_calls",
+    "max_tokens": "length",
+    "pause_turn": "length",
+    "model_context_window_exceeded": "length",
+    "refusal": "content_filter",
+}
+_STANDARD_USAGE_KEYS = ("prompt_tokens", "completion_tokens", "total_tokens")
+
+
+def normalize_finish_reason(value: Any) -> Optional[str]:
+    """Return one provider-independent terminal reason without inventing one."""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    reason = value.strip().lower()
+    return _FINISH_REASON_ALIASES.get(reason, reason)
+
+
+def is_complete_tool_call_finish_reason(value: Any) -> bool:
+    """Return whether a provider proved its structured tool payload complete."""
+
+    # Google and Ollama non-streaming adapters may return a structured tool
+    # call with their normal STOP terminal rather than OpenAI's TOOL_CALLS.
+    return normalize_finish_reason(value) in {"tool_calls", "stop"}
+
+
+def tool_call_arguments_are_complete(value: Any) -> bool:
+    """Accept only a complete JSON object as function-call arguments."""
+
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        return isinstance(json.loads(value), dict)
+    except (json.JSONDecodeError, TypeError):
+        return False
+
+
+def _standard_usage(usage: Any) -> Dict[str, int]:
+    """Extract non-negative standard counters and derive a missing total."""
+
+    raw = usage if isinstance(usage, dict) else {}
+
+    def _counter(key: str) -> int:
+        value = raw.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+        return 0
+
+    prompt_tokens = _counter("prompt_tokens")
+    completion_tokens = _counter("completion_tokens")
+    if "total_tokens" in raw:
+        total_tokens = _counter("total_tokens")
+    else:
+        total_tokens = prompt_tokens + completion_tokens
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def configure_tool_execution_security(
+    agent: Any,
+    *,
+    capability_policy: Optional[Any],
+    boundary_guard: Optional[Any],
+    principal_provenance: Optional[str] = None,
+) -> None:
+    """Post-wire a tool agent without trusting its class/runtime identifier."""
+
+    executor = getattr(agent, "_executor", None)
+    configure = getattr(executor, "configure_execution_security", None)
+    if callable(configure):
+        configure(
+            capability_policy=capability_policy,
+            boundary_guard=boundary_guard,
+            principal_provenance=principal_provenance,
+        )
 
 
 @dataclass(slots=True)
@@ -282,21 +367,29 @@ class BaseAgent(ABC):
         *,
         max_continuations: int = 2,
     ) -> str:
-        """Re-prompt on ``finish_reason == "length"`` to get complete output.
+        """Re-prompt truncated generations and retain their true terminal state.
 
-        Returns the concatenated content after up to *max_continuations*
-        follow-up generate calls.
+        Anthropic's non-streaming API calls token exhaustion ``max_tokens`` and
+        normal completion ``end_turn``.  Normalize those provider values,
+        concatenate at most *max_continuations* follow-ups, and update ``result``
+        in place with the final reason and cumulative standard token usage.  The
+        mutation lets existing callers keep the historical string return value
+        while still propagating completeness evidence to persistence boundaries.
         """
-        content = result.get("content", "")
-        finish_reason = result.get("finish_reason", "")
+
+        segment = result.get("content", "") or ""
+        content = segment
+        finish_reason = normalize_finish_reason(result.get("finish_reason"))
+        cumulative_usage = _standard_usage(result.get("usage"))
 
         for _ in range(max_continuations):
             if finish_reason != "length":
                 break
-            # Append what we have so far and ask the model to continue
+            # Append only the latest segment. Appending the whole accumulated
+            # response on every pass duplicates earlier text in model context.
             from openjarvis.core.types import Message, Role
 
-            messages.append(Message(role=Role.ASSISTANT, content=content))
+            messages.append(Message(role=Role.ASSISTANT, content=segment))
             messages.append(
                 Message(
                     role=Role.USER,
@@ -304,9 +397,19 @@ class BaseAgent(ABC):
                 ),
             )
             cont = self._generate(messages)
-            continuation = cont.get("content", "")
-            content += continuation
-            finish_reason = cont.get("finish_reason", "")
+            segment = cont.get("content", "") or ""
+            content += segment
+            continuation_usage = _standard_usage(cont.get("usage"))
+            for key in _STANDARD_USAGE_KEYS:
+                cumulative_usage[key] += continuation_usage[key]
+            finish_reason = normalize_finish_reason(cont.get("finish_reason"))
+
+        result["content"] = content
+        result["finish_reason"] = finish_reason
+        original_usage = result.get("usage")
+        merged_usage = dict(original_usage) if isinstance(original_usage, dict) else {}
+        merged_usage.update(cumulative_usage)
+        result["usage"] = merged_usage
 
         return content
 
@@ -360,7 +463,9 @@ class ToolUsingAgent(BaseAgent):
         max_tokens: Optional[int] = None,
         loop_guard_config: Optional[Any] = None,
         capability_policy: Optional[Any] = None,
+        boundary_guard: Optional[Any] = None,
         agent_id: Optional[str] = None,
+        principal_provenance: Optional[str] = None,
         interactive: bool = False,
         confirm_callback: Optional[Any] = None,
         skill_few_shot_examples: Optional[List[str]] = None,
@@ -385,7 +490,9 @@ class ToolUsingAgent(BaseAgent):
             self._tools,
             bus=bus,
             capability_policy=capability_policy,
+            boundary_guard=boundary_guard,
             agent_id=_aid,
+            principal_provenance=principal_provenance,
             interactive=interactive,
             confirm_callback=confirm_callback,
         )
@@ -414,4 +521,13 @@ class ToolUsingAgent(BaseAgent):
             pass
 
 
-__all__ = ["AgentContext", "AgentResult", "BaseAgent", "ToolUsingAgent"]
+__all__ = [
+    "AgentContext",
+    "AgentResult",
+    "BaseAgent",
+    "ToolUsingAgent",
+    "configure_tool_execution_security",
+    "is_complete_tool_call_finish_reason",
+    "normalize_finish_reason",
+    "tool_call_arguments_are_complete",
+]

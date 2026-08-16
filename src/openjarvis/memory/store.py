@@ -13,13 +13,13 @@ import fcntl
 import json
 import logging
 import os
-import unicodedata
 import re
 import threading
 import time
+import unicodedata
 from abc import ABC, abstractmethod
-from dataclasses import asdict, dataclass
 from contextlib import contextmanager
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, List
 

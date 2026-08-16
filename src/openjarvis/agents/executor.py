@@ -6,7 +6,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
-from openjarvis.agents._stubs import AgentResult
+from openjarvis.agents._stubs import AgentResult, normalize_finish_reason
 from openjarvis.agents.errors import (
     AgentTickError,
     EscalateError,
@@ -224,16 +224,25 @@ class AgentExecutor:
             tick_duration = time.time() - tick_start
             claimed_message_id = (claimed_message or {}).get("id")
             terminal_status = "error"
+            terminal_error = error_info
+            if terminal_error is None:
+                terminal_error = self._result_completion_error(result)
             try:
                 terminal_status = self._finalize_tick_state(
                     agent_id,
                     result,
-                    error_info,
+                    terminal_error,
                     tick_duration,
                     claimed_message_id=claimed_message_id,
                 )
             except Exception:
                 logger.exception("Tick finalization failed for agent %s", agent_id)
+
+            if (
+                terminal_status not in {"idle", "budget_exceeded"}
+                and terminal_error is None
+            ):
+                terminal_error = FatalError("managed agent tick finalization failed")
 
             if self._trace_store:
                 trace_query = str(
@@ -245,7 +254,7 @@ class AgentExecutor:
                         agent_id,
                         agent,
                         result,
-                        error_info,
+                        terminal_error,
                         tick_start,
                         tick_duration,
                         trace_steps,
@@ -316,7 +325,10 @@ class AgentExecutor:
         try:
             from openjarvis.server.agent_manager_routes import _managed_runtime_values
 
-            temperature, max_tokens, max_turns = _managed_runtime_values(config)
+            temperature, max_tokens, max_turns = _managed_runtime_values(
+                config,
+                server_config=getattr(self._system, "config", None),
+            )
         except (ImportError, ValueError) as exc:
             raise FatalError(
                 f"Invalid managed-agent runtime configuration: {exc}"
@@ -486,6 +498,18 @@ class AgentExecutor:
                 agent_instance = agent_cls(engine, model, **agent_kwargs)
             except TypeError:
                 agent_instance = agent_cls(engine, model)
+
+        from openjarvis.agents._stubs import configure_tool_execution_security
+
+        configure_tool_execution_security(
+            agent_instance,
+            capability_policy=getattr(self._system, "capability_policy", None),
+            boundary_guard=getattr(self._system, "boundary_guard", None),
+            # Managed-agent ownership is persisted only after the HTTP
+            # boundary derives it from Principal.provenance.  Legacy records
+            # have no owner and therefore receive the empty, ungrantable subject.
+            principal_provenance=agent.get("owner_provenance"),
+        )
 
         # Inject the managed-agent UUID into the agent's ToolExecutor so
         # emitted TOOL_CALL_START/END events carry it; the trace subscriber
@@ -718,22 +742,23 @@ class AgentExecutor:
         """Persist a tick and return the status used by the atomic release."""
         self._set_activity(agent_id, "Finalizing...")
 
+        if error is None:
+            error = self._result_completion_error(result)
+
         # Pair the response and source transition in one SQLite transaction.
         # If this durability barrier fails after model/tool effects, terminally
         # fail the claim rather than allowing the scheduler to replay it.
         if error is None and claimed_message_id is not None:
-            if result is None:
-                error = FatalError("claimed message produced no response")
-            else:
-                try:
-                    self._manager.complete_message_turn(
-                        agent_id,
-                        claimed_message_id,
-                        result.content,
-                    )
-                except Exception as exc:
-                    self._manager.mark_message_failed(claimed_message_id)
-                    error = FatalError(f"could not persist claimed response: {exc}")
+            assert result is not None
+            try:
+                self._manager.complete_message_turn(
+                    agent_id,
+                    claimed_message_id,
+                    result.content,
+                )
+            except Exception as exc:
+                self._manager.mark_message_failed(claimed_message_id)
+                error = FatalError(f"could not persist claimed response: {exc}")
 
         if error is not None and claimed_message_id is not None:
             self._manager.mark_message_failed(claimed_message_id)
@@ -867,6 +892,23 @@ class AgentExecutor:
             )
             return "error"
 
+    @staticmethod
+    def _result_completion_error(result: AgentResult | None) -> FatalError | None:
+        """Return the stable failure used by persistence and trace boundaries."""
+
+        if result is None:
+            return FatalError("managed agent produced no result")
+        finish_reason = normalize_finish_reason(result.metadata.get("finish_reason"))
+        result.metadata["finish_reason"] = finish_reason
+        if (
+            not (result.content or "").strip()
+            or finish_reason != "stop"
+            or bool(result.metadata.get("max_turns_exceeded", False))
+            or bool(result.metadata.get("incomplete_tool_call", False))
+        ):
+            return FatalError("managed agent produced an incomplete response")
+        return None
+
     def _save_trace(
         self,
         agent_id: str,
@@ -899,6 +941,9 @@ class AgentExecutor:
             )
 
         metadata: dict[str, Any] = {}
+        owner_provenance = agent.get("owner_provenance")
+        if isinstance(owner_provenance, str) and owner_provenance:
+            metadata["provenance"] = owner_provenance
         if error is not None:
             metadata["error_detail"] = self._build_error_detail(error)
 

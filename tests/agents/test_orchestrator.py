@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from openjarvis.agents._stubs import AgentContext
 from openjarvis.agents.orchestrator import OrchestratorAgent
 from openjarvis.core.events import EventBus, EventType
@@ -253,6 +255,40 @@ class TestOrchestratorAgent:
         assert len(result.tool_results) == 1
         assert result.tool_results[0].success is False
 
+    @pytest.mark.parametrize("finish_reason", ["length", "max_tokens", None])
+    def test_incomplete_tool_call_terminal_never_executes_tool(self, finish_reason):
+        engine = MagicMock(engine_id="mock")
+        engine.generate.return_value = {
+            "content": "partial",
+            "tool_calls": [
+                {
+                    "id": "partial-call",
+                    "name": "calculator",
+                    "arguments": '{"expression":"2+2"}',
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 3,
+                "total_tokens": 8,
+            },
+            "finish_reason": finish_reason,
+        }
+        agent = OrchestratorAgent(
+            engine,
+            "test-model",
+            tools=[_CalculatorStub()],
+        )
+        agent._executor.execute = MagicMock()
+
+        result = agent.run("Do not run partial args")
+
+        agent._executor.execute.assert_not_called()
+        assert result.tool_results == []
+        assert result.metadata["finish_reason"] == (
+            "length" if finish_reason == "max_tokens" else finish_reason
+        )
+
     def test_temperature_passthrough(self):
         engine = _make_engine_no_tools()
         agent = OrchestratorAgent(engine, "test-model", temperature=0.1)
@@ -266,6 +302,40 @@ class TestOrchestratorAgent:
         agent.run("Hello")
         call_kwargs = engine.generate.call_args[1]
         assert call_kwargs["max_tokens"] == 256
+
+    def test_anthropic_continuation_reports_final_reason_and_cumulative_usage(self):
+        engine = MagicMock(engine_id="mock")
+        engine.generate.side_effect = [
+            {
+                "content": "Première partie",
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 3,
+                    "total_tokens": 10,
+                },
+                "finish_reason": "max_tokens",
+            },
+            {
+                "content": ", puis la fin.",
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 4,
+                    "total_tokens": 15,
+                },
+                "finish_reason": "end_turn",
+            },
+        ]
+        agent = OrchestratorAgent(engine, "test-model")
+
+        result = agent.run("Réponse longue")
+
+        assert result.content == "Première partie, puis la fin."
+        assert result.metadata == {
+            "finish_reason": "stop",
+            "prompt_tokens": 18,
+            "completion_tokens": 7,
+            "total_tokens": 25,
+        }
 
     def test_event_bus_agent_events(self):
         bus = EventBus(record_history=True)
@@ -417,6 +487,48 @@ class TestOrchestratorAgent:
         )
         result = agent.run("What is 2+2?")
         assert result.tool_results[0].latency_seconds >= 0
+
+    def test_stop_terminal_with_structured_tool_call_executes(self):
+        """Google/Ollama may use stop for a complete structured call."""
+
+        engine = _make_engine_with_tool_call()
+        responses = list(engine.generate.side_effect)
+        responses[0]["finish_reason"] = "stop"
+        engine.generate.side_effect = responses
+        agent = OrchestratorAgent(
+            engine,
+            "test-model",
+            tools=[_CalculatorStub()],
+        )
+
+        result = agent.run("What is 2+2?")
+
+        assert result.content == "The answer is 4."
+        assert len(result.tool_results) == 1
+
+    def test_stop_terminal_with_invalid_tool_json_never_executes(self):
+        engine = MagicMock()
+        engine.engine_id = "mock"
+        engine.generate.return_value = {
+            "content": "partial tool payload",
+            "tool_calls": [
+                {
+                    "id": "partial",
+                    "name": "calculator",
+                    "arguments": '{"expression":',
+                }
+            ],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+            "finish_reason": "stop",
+        }
+        agent = OrchestratorAgent(engine, "test-model", tools=[_CalculatorStub()])
+        agent._executor.execute = MagicMock()
+
+        result = agent.run("Do not execute malformed JSON")
+
+        agent._executor.execute.assert_not_called()
+        assert result.metadata["finish_reason"] == "stop"
+        assert result.metadata["incomplete_tool_call"] is True
 
     def test_max_turns_1(self):
         """With max_turns=1 and a tool call, should stop after 1 turn."""

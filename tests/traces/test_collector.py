@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 from openjarvis.agents._stubs import AgentContext, AgentResult, BaseAgent
 from openjarvis.core.events import EventBus, EventType
-from openjarvis.core.types import StepType
+from openjarvis.core.types import StepType, ToolResult
 from openjarvis.traces.collector import TraceCollector
 from openjarvis.traces.store import TraceStore
 
@@ -47,7 +47,11 @@ class _FakeAgent(BaseAgent):
                     "total_tokens": 50,
                 },
             )
-        return AgentResult(content=self._response, turns=1)
+        return AgentResult(
+            content=self._response,
+            turns=1,
+            metadata={"finish_reason": "stop"},
+        )
 
 
 class _ToolAgent(BaseAgent):
@@ -85,7 +89,7 @@ class _ToolAgent(BaseAgent):
         )
         self._bus.publish(EventType.INFERENCE_START, inf)
         self._bus.publish(EventType.INFERENCE_END, {"total_tokens": 20})
-        return AgentResult(content="4", turns=2)
+        return AgentResult(content="4", turns=2, metadata={"finish_reason": "stop"})
 
 
 class TestTraceCollector:
@@ -107,6 +111,96 @@ class TestTraceCollector:
         assert trace.model == "qwen3:8b"
         assert trace.engine == "ollama"
         assert trace.result == "hello"
+        assert trace.outcome == "completed"
+        store.close()
+
+    def test_missing_or_truncated_terminal_is_never_completed(
+        self, tmp_path: Path
+    ) -> None:
+        for suffix, metadata in (
+            ("missing", {}),
+            ("length", {"finish_reason": "length"}),
+        ):
+            store = TraceStore(tmp_path / f"{suffix}.db")
+            agent = _FakeAgent(response="fragment")
+
+            def run_truncated(*args, _metadata=metadata, **kwargs):
+                return AgentResult(
+                    content="fragment",
+                    turns=1,
+                    metadata=_metadata,
+                )
+
+            agent.run = run_truncated
+
+            TraceCollector(agent, store=store).run("question")
+
+            trace = store.list_traces()[0]
+            assert trace.outcome == "incomplete"
+            store.close()
+
+    def test_pre_start_tool_refusal_cannot_be_erased_by_later_successes(
+        self, tmp_path: Path
+    ) -> None:
+        bus = EventBus()
+        store = TraceStore(tmp_path / "pre-start-refusal.db")
+
+        class _RefusedThenSuccessfulAgent(BaseAgent):
+            agent_id = "refused_then_successful"
+
+            def __init__(self) -> None:
+                self._bus = bus
+
+            def run(
+                self,
+                input: str,
+                context: Optional[AgentContext] = None,
+                **kwargs: Any,
+            ) -> AgentResult:
+                del input, context, kwargs
+                successful: list[ToolResult] = []
+                for name in ("lire_doc", "avalon_status", "proposer_plan"):
+                    self._bus.publish(
+                        EventType.TOOL_CALL_START,
+                        {"tool": name, "arguments": {}},
+                    )
+                    self._bus.publish(
+                        EventType.TOOL_CALL_END,
+                        {"tool": name, "success": True, "result": "ok"},
+                    )
+                    successful.append(
+                        ToolResult(tool_name=name, content="ok", success=True)
+                    )
+                return AgentResult(
+                    content="Plan calculé",
+                    tool_results=[
+                        ToolResult(
+                            tool_name="proposer",
+                            content="Capability denied",
+                            success=False,
+                        ),
+                        *successful,
+                    ],
+                    turns=2,
+                    metadata={"finish_reason": "stop"},
+                )
+
+        collector = TraceCollector(
+            _RefusedThenSuccessfulAgent(),
+            store=store,
+            bus=bus,
+        )
+
+        collector.run("inspect")
+
+        trace = store.list_traces()[0]
+        assert trace.outcome == "recovered"
+        assert [
+            step.input["tool"]
+            for step in trace.steps
+            if step.step_type == StepType.TOOL_CALL
+        ] == ["lire_doc", "avalon_status", "proposer_plan"]
+        assert "Capability denied" not in repr(trace)
         store.close()
 
     def test_records_generate_steps(self, tmp_path: Path) -> None:
@@ -346,7 +440,7 @@ class _RichToolAgent(BaseAgent):
                 ToolResult(tool_name="calculator", content="4", success=True),
             ],
             turns=2,
-            metadata={"messages": messages},
+            metadata={"messages": messages, "finish_reason": "stop"},
         )
 
 
@@ -437,7 +531,11 @@ class _AgentOutilCasse:
         self._bus.publish(
             EventType.TOOL_CALL_END, {"tool": "logs", "success": False, "latency": 0.01}
         )
-        return AgentResult(content=self._contenu, turns=1)
+        return AgentResult(
+            content=self._contenu,
+            turns=1,
+            metadata={"finish_reason": "stop"},
+        )
 
 
 def _trace_avec_outil_casse(tmp_path: Path, contenu: str):
@@ -453,8 +551,8 @@ def _trace_avec_outil_casse(tmp_path: Path, contenu: str):
 def test_un_ECHEC_D_OUTIL_SUIVI_D_UNE_REPONSE_est_RECOVERED(tmp_path: Path) -> None:
     """⚠ MON DÉFAUT, écrit le matin même du 2026-08-06. La règle disait « s'il y a un
     échec d'outil, c'est `tool_failure` », SANS regarder si la réponse avait été livrée.
-    Un agent qui se heurte à un outil, se reprend et rend une réponse complète était noté
-    comme un échec, avec `feedback = 0.0`.
+    Un agent qui se heurte à un outil, se reprend et rend une réponse complète était
+    noté comme un échec, avec `feedback = 0.0`.
     ⚠ Mesure sur 210 traces : **19 des 21 `tool_failure` avaient livré une réponse**
     (médiane 978 caractères, jusqu'à 7537). Le taux publié tombait à 89 % quand le réel
     est 98,1 % — et c'est Ava qui lit ce chiffre sur elle-même via `introspection`. Un
@@ -468,9 +566,9 @@ def test_un_ECHEC_D_OUTIL_SUIVI_D_UNE_REPONSE_est_RECOVERED(tmp_path: Path) -> N
 
 
 def test_un_ECHEC_D_OUTIL_SANS_REPONSE_reste_TOOL_FAILURE(tmp_path: Path) -> None:
-    """⚠ LE CONTRE-TEST. Élargir `recovered` à tous les cas masquerait les vrais échecs —
-    on remplacerait un chiffre pessimiste par un chiffre flatteur, ce qui est pire : le
-    premier fait chercher, le second fait dormir."""
+    """⚠ LE CONTRE-TEST. Élargir `recovered` à tous les cas masquerait les vrais
+    échecs — on remplacerait un chiffre pessimiste par un chiffre flatteur, ce qui est
+    pire : le premier fait chercher, le second fait dormir."""
     trace = _trace_avec_outil_casse(tmp_path, "")
     assert trace.outcome == "tool_failure"
     # ⚠ `feedback` reste NULL : la machine ne juge pas la QUALITE. Defaut trouve en lui

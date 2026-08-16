@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { OIDC_AUTHORITY, OIDC_CLIENT_ID } from '../auth/oidcIdentity';
-import { entetesIdentite, jetonOidc, lireConversation } from './memoireServeur';
+import {
+  effacerConversation,
+  entetesIdentite,
+  jetonOidc,
+  lireConversation,
+} from './memoireServeur';
 
 function storage(values: Record<string, string>): Storage {
   const keys = Object.keys(values);
@@ -48,5 +53,29 @@ describe('entetesIdentite', () => {
       headers: { 'X-Ava-Identity': 'forged.jwt.value' },
       signal: expect.any(AbortSignal),
     }));
+  });
+
+  it.each([401, 503])(
+    'refuse d\u2019acquitter un DELETE rejeté avec HTTP %i',
+    async (status) => {
+      vi.stubGlobal('sessionStorage', storage({}));
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status }));
+
+      await expect(effacerConversation()).resolves.toBe(false);
+    },
+  );
+
+  it('acquitte le DELETE uniquement après un succès HTTP', async () => {
+    vi.stubGlobal('sessionStorage', storage({}));
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, status: 200 }));
+
+    await expect(effacerConversation()).resolves.toBe(true);
+  });
+
+  it('refuse aussi l\u2019acquittement quand le DELETE n\u2019atteint pas le serveur', async () => {
+    vi.stubGlobal('sessionStorage', storage({}));
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('offline')));
+
+    await expect(effacerConversation()).resolves.toBe(false);
   });
 });

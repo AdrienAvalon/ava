@@ -54,6 +54,28 @@ class TestLiteLLMEngineGenerate:
         assert result["finish_reason"] == "stop"
         assert result["cost_usd"] == 0.001
 
+    def test_generate_does_not_invent_missing_terminal(self) -> None:
+        fake_usage = SimpleNamespace(
+            prompt_tokens=10, completion_tokens=5, total_tokens=15
+        )
+        fake_choice = SimpleNamespace(
+            message=SimpleNamespace(content="partial", tool_calls=None),
+            finish_reason=None,
+        )
+        fake_resp = SimpleNamespace(
+            choices=[fake_choice], usage=fake_usage, model="gpt-4o"
+        )
+        fake_litellm = mock.MagicMock()
+        fake_litellm.completion.return_value = fake_resp
+        fake_litellm.completion_cost.return_value = 0.001
+
+        with mock.patch.dict("sys.modules", {"litellm": fake_litellm}):
+            result = LiteLLMEngine().generate(
+                [Message(role=Role.USER, content="Hi")], model="gpt-4o"
+            )
+
+        assert result["finish_reason"] is None
+
     def test_generate_with_tools(self) -> None:
         fake_tool_call = SimpleNamespace(
             id="call_123",

@@ -39,6 +39,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ava_extensions.tool_capabilities import FILE_READ, INTROSPECTION_READ
 from openjarvis.core.registry import ToolRegistry
 from openjarvis.core.types import ToolResult
 from openjarvis.tools._stubs import BaseTool, ToolSpec
@@ -233,6 +234,8 @@ class IntrospectionTool(BaseTool):
             category="memoire",
             latency_estimate=0.2,
             timeout_seconds=10.0,
+            required_capabilities=[FILE_READ, INTROSPECTION_READ],
+            requires_capability_policy=True,
         )
 
     def execute(self, **params: Any) -> ToolResult:

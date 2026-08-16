@@ -31,6 +31,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from ava_extensions.tool_capabilities import INFRA_LOGS_READ, NETWORK_FETCH
 from openjarvis.core.registry import ToolRegistry
 from openjarvis.core.types import ToolResult
 from openjarvis.tools._stubs import BaseTool, ToolSpec
@@ -98,7 +99,7 @@ class LogsTool(BaseTool):
     """Les journaux de l'infrastructure, par questions nommees."""
 
     tool_id = "logs"
-    is_local = True
+    is_local = False
 
     @property
     def spec(self) -> ToolSpec:
@@ -138,6 +139,9 @@ class LogsTool(BaseTool):
             category="infra",
             latency_estimate=2.0,
             timeout_seconds=35.0,
+            required_capabilities=[NETWORK_FETCH, INFRA_LOGS_READ],
+            requires_capability_policy=True,
+            metadata={"fixed_destination": "avalon-control-plane"},
         )
 
     def execute(self, **params: Any) -> ToolResult:

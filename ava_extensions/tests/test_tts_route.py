@@ -327,6 +327,21 @@ def test_une_panne_sqlite_du_GET_est_un_503_et_non_un_faux_vide(
     assert response.status_code == 503
 
 
+def test_une_panne_sqlite_du_DELETE_est_un_503_et_non_un_faux_succes(
+    client: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def panne(*_args: Any, **_kwargs: Any) -> int:
+        raise conv.ConversationStorageError("disque indisponible")
+
+    monkeypatch.setattr(conv, "effacer", panne)
+
+    response = client.delete(
+        "/v1/ava/conversation",
+        headers=_entetes("principal-a"),
+    )
+    assert response.status_code == 503
+
+
 def test_une_panne_sqlite_du_tour_est_un_503(
     client: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

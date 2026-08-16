@@ -154,7 +154,7 @@ class TestGemmaCppLifecycle:
         assert result["usage"]["completion_tokens"] > 0
         assert result["usage"]["total_tokens"] > 0
         assert result["model"] == "2b-it"
-        assert result["finish_reason"] == "stop"
+        assert result["finish_reason"] == "length"
 
     @patch("openjarvis.engine.gemma_cpp._import_pygemma")
     def test_generate_warns_on_model_mismatch(self, mock_import) -> None:

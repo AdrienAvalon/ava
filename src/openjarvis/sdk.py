@@ -13,11 +13,23 @@ from openjarvis.core.config import JarvisConfig
 from openjarvis.core.events import EventBus
 from openjarvis.core.types import Message, Role
 from openjarvis.engine._discovery import get_engine
+from openjarvis.engine._finish import conservative_finish_reason
 from openjarvis.system import JarvisSystem, SystemBuilder
 from openjarvis.telemetry.instrumented_engine import InstrumentedEngine
 from openjarvis.telemetry.store import TelemetryStore
 
 logger = logging.getLogger(__name__)
+
+_INCOMPLETE_RESPONSE_MESSAGE = "Response generation did not complete. Please retry."
+
+
+def _require_complete_response(content: Any, finish_reason: Any) -> str:
+    """Return the normalized terminal or reject an unproven response."""
+
+    normalized = conservative_finish_reason(finish_reason)
+    if normalized != "stop" or not isinstance(content, str) or not content.strip():
+        raise RuntimeError(_INCOMPLETE_RESPONSE_MESSAGE)
+    return normalized
 
 
 class MemoryHandle:
@@ -180,6 +192,7 @@ class Jarvis:
         self._telem_store: Optional[TelemetryStore] = None
         self._audit_logger: Any = None
         self._capability_policy: Any = None
+        self._boundary_guard: Any = None
         self.memory = MemoryHandle(self._config)
 
         # Set up telemetry
@@ -228,6 +241,7 @@ class Jarvis:
         engine = sec.engine
         self._audit_logger = sec.audit_logger
         self._capability_policy = sec.capability_policy
+        self._boundary_guard = getattr(sec, "boundary_guard", None)
 
         # Wrap engine with InstrumentedEngine for telemetry + energy
         energy_monitor = None
@@ -306,7 +320,7 @@ class Jarvis:
 
         # Agent mode
         if agent is not None:
-            return self._run_agent(
+            result = self._run_agent(
                 agent,
                 query,
                 model_name,
@@ -316,6 +330,10 @@ class Jarvis:
                 context=context,
                 channel=channel,
             )
+            result["finish_reason"] = _require_complete_response(
+                result.get("content"), result.get("finish_reason")
+            )
+            return result
 
         # Direct engine mode
         messages = [Message(role=Role.USER, content=query)]
@@ -331,10 +349,14 @@ class Jarvis:
             temperature=temperature,
             max_tokens=max_tokens,
         )
+        finish_reason = _require_complete_response(
+            result.get("content"), result.get("finish_reason")
+        )
 
         return {
             "content": result.get("content", ""),
             "usage": result.get("usage", {}),
+            "finish_reason": finish_reason,
             "model": model_name,
             "engine": self._resolved_engine_key,
         }
@@ -369,13 +391,21 @@ class Jarvis:
         if context and self._config.agent.context_from_memory:
             messages = self._inject_context(query, messages)
 
-        async for token in self._engine.stream(
+        parts: List[str] = []
+        finish_reason: Optional[str] = None
+        async for chunk in self._engine.stream_full(
             messages,
             model=model_name,
             temperature=temperature,
             max_tokens=max_tokens,
         ):
-            yield token
+            if chunk.content:
+                parts.append(chunk.content)
+                yield chunk.content
+            if chunk.finish_reason is not None:
+                finish_reason = conservative_finish_reason(chunk.finish_reason)
+
+        _require_complete_response("".join(parts), finish_reason)
 
     async def ask_full_stream(
         self,
@@ -414,19 +444,26 @@ class Jarvis:
 
         parts: List[str] = []
         i = 0
-        async for token in self._engine.stream(
+        finish_reason: Optional[str] = None
+        async for chunk in self._engine.stream_full(
             messages,
             model=model_name,
             temperature=temperature,
             max_tokens=max_tokens,
         ):
-            parts.append(token)
-            yield {"token": token, "index": i}
-            i += 1
+            if chunk.content:
+                parts.append(chunk.content)
+                yield {"token": chunk.content, "index": i}
+                i += 1
+            if chunk.finish_reason is not None:
+                finish_reason = conservative_finish_reason(chunk.finish_reason)
+
+        finish_reason = _require_complete_response("".join(parts), finish_reason)
 
         yield {
             "done": True,
             "content": "".join(parts),
+            "finish_reason": finish_reason,
             "model": model_name,
             "engine": self._resolved_engine_key,
         }
@@ -458,7 +495,10 @@ class Jarvis:
     ) -> Dict[str, Any]:
         """Run an agent and return the result dict."""
         import openjarvis.agents  # noqa: F401
-        from openjarvis.agents._stubs import AgentContext
+        from openjarvis.agents._stubs import (
+            AgentContext,
+            configure_tool_execution_security,
+        )
         from openjarvis.core.registry import AgentRegistry
 
         if not AgentRegistry.contains(agent_name):
@@ -492,9 +532,6 @@ class Jarvis:
             agent_kwargs["tools"] = tool_objects
             agent_kwargs["max_turns"] = self._config.agent.max_turns
 
-        if self._capability_policy is not None:
-            agent_kwargs["capability_policy"] = self._capability_policy
-
         # Inject DigestConfig for morning_digest agent
         if agent_name == "morning_digest" and hasattr(self._config, "digest"):
             dc = self._config.digest
@@ -524,6 +561,13 @@ class Jarvis:
             agent_kwargs["tools"] = digest_tools + list(existing)
 
         agent_obj = agent_cls(self._engine, model_name, **agent_kwargs)
+        configure_tool_execution_security(
+            agent_obj,
+            capability_policy=self._capability_policy,
+            boundary_guard=self._boundary_guard,
+            # The in-process SDK has no verified HTTP/Matrix Principal.
+            principal_provenance=None,
+        )
         ctx = AgentContext()
 
         # Context injection
@@ -554,6 +598,9 @@ class Jarvis:
                 logger.warning("Failed to inject memory context for agent: %s", exc)
 
         result = agent_obj.run(query, context=ctx)
+        metadata = dict(result.metadata or {})
+        finish_reason = conservative_finish_reason(metadata.get("finish_reason"))
+        metadata["finish_reason"] = finish_reason
         return {
             "content": result.content,
             "usage": {},
@@ -566,6 +613,8 @@ class Jarvis:
                 for tr in result.tool_results
             ],
             "turns": result.turns,
+            "metadata": metadata,
+            "finish_reason": finish_reason,
             "model": model_name,
             "engine": self._resolved_engine_key,
         }

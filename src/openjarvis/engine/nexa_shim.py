@@ -91,7 +91,7 @@ def list_models() -> JSONResponse:
     )
 
 
-@app.post("/v1/chat/completions")
+@app.post("/v1/chat/completions", response_model=None)
 async def chat_completions(
     req: ChatRequest,
 ) -> JSONResponse | StreamingResponse:
@@ -126,7 +126,9 @@ async def chat_completions(
                     {
                         "index": 0,
                         "delta": {},
-                        "finish_reason": "stop",
+                        # Nexa's iterator ends without exposing why generation
+                        # ended, so EOF is incomplete evidence, not success.
+                        "finish_reason": "length",
                     }
                 ],
             }
@@ -152,7 +154,7 @@ async def chat_completions(
                 {
                     "index": 0,
                     "message": {"role": "assistant", "content": text},
-                    "finish_reason": "stop",
+                    "finish_reason": "length",
                 }
             ],
             "usage": {

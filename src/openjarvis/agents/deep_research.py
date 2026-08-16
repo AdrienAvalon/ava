@@ -9,7 +9,14 @@ from __future__ import annotations
 
 from typing import Any, List, Optional
 
-from openjarvis.agents._stubs import AgentContext, AgentResult, ToolUsingAgent
+from openjarvis.agents._stubs import (
+    AgentContext,
+    AgentResult,
+    ToolUsingAgent,
+    is_complete_tool_call_finish_reason,
+    normalize_finish_reason,
+    tool_call_arguments_are_complete,
+)
 from openjarvis.agents.prompt_loader import (
     load_few_shot_exemplars,
     load_system_prompt_override,
@@ -33,6 +40,33 @@ def _tc_args(tc: dict) -> str:
     if "function" in tc:
         return tc["function"]["arguments"]
     return tc["arguments"]
+
+
+def _complete_tool_call(tc: Any) -> bool:
+    """Validate the executable subset of either supported call envelope."""
+
+    if not isinstance(tc, dict):
+        return False
+    try:
+        name = _tc_name(tc)
+        arguments = _tc_args(tc)
+    except (KeyError, TypeError):
+        return False
+    return (
+        isinstance(name, str)
+        and bool(name.strip())
+        and tool_call_arguments_are_complete(arguments)
+    )
+
+
+def _accumulate_usage(total: dict[str, Any], usage: Any) -> None:
+    """Add standard non-negative token counters to one run total."""
+
+    raw = usage if isinstance(usage, dict) else {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = raw.get(key, 0)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            total[key] += value
 
 
 def _build_system_prompt() -> str:
@@ -237,7 +271,7 @@ class DeepResearchAgent(ToolUsingAgent):
 
         all_tool_results: list[ToolResult] = []
         turns = 0
-        total_usage: dict[str, int] = {
+        total_usage: dict[str, Any] = {
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
@@ -252,16 +286,15 @@ class DeepResearchAgent(ToolUsingAgent):
             # Pass tools to engine for native function calling
             result = self._generate(messages, tools=tools_openai)
 
-            # Accumulate token usage
-            usage = result.get("usage", {})
-            for k in total_usage:
-                total_usage[k] += usage.get(k, 0)
-
             content = result.get("content", "")
             tool_calls_raw = result.get("tool_calls", [])
 
             # No tool calls -- this is the final answer
             if not tool_calls_raw:
+                content = self._check_continuation(result, messages)
+                _accumulate_usage(total_usage, result.get("usage"))
+                finish_reason = result.get("finish_reason")
+
                 # If content is empty but we have prior tool results,
                 # force one more generation without tools to synthesize
                 if not content.strip() and all_tool_results:
@@ -276,14 +309,34 @@ class DeepResearchAgent(ToolUsingAgent):
                         )
                     )
                     synth = self._generate(messages)
-                    content = synth.get("content", "")
-                    u = synth.get("usage", {})
-                    for k in total_usage:
-                        total_usage[k] += u.get(k, 0)
+                    content = self._check_continuation(synth, messages)
+                    _accumulate_usage(total_usage, synth.get("usage"))
+                    finish_reason = synth.get("finish_reason")
 
                 self._emit_turn_end(turns=turns)
                 sources = self._extract_sources(all_tool_results)
                 total_usage["sources"] = sources
+                total_usage["finish_reason"] = finish_reason
+                return AgentResult(
+                    content=content,
+                    tool_results=all_tool_results,
+                    turns=turns,
+                    metadata=total_usage,
+                )
+
+            # Tool-use generations are complete for their purpose and do not
+            # enter text continuation, but their token use still belongs to
+            # the aggregate for this research run.
+            _accumulate_usage(total_usage, result.get("usage"))
+            finish_reason = normalize_finish_reason(result.get("finish_reason"))
+            complete_tool_calls = is_complete_tool_call_finish_reason(
+                finish_reason
+            ) and all(_complete_tool_call(tc) for tc in tool_calls_raw)
+            if not complete_tool_calls:
+                total_usage["finish_reason"] = finish_reason
+                total_usage["sources"] = self._extract_sources(all_tool_results)
+                total_usage["incomplete_tool_call"] = True
+                self._emit_turn_end(turns=turns, incomplete_tool_call=True)
                 return AgentResult(
                     content=content,
                     tool_results=all_tool_results,
@@ -294,11 +347,11 @@ class DeepResearchAgent(ToolUsingAgent):
             # Append assistant message with tool_calls metadata
             assistant_tool_calls = [
                 ToolCall(
-                    id=tc["id"],
+                    id=tc.get("id", f"call_{i}"),
                     name=_tc_name(tc),
                     arguments=_tc_args(tc),
                 )
-                for tc in tool_calls_raw
+                for i, tc in enumerate(tool_calls_raw)
             ]
             messages.append(
                 Message(
@@ -309,9 +362,9 @@ class DeepResearchAgent(ToolUsingAgent):
             )
 
             # Execute each tool call and append results
-            for tc_raw in tool_calls_raw:
+            for i, tc_raw in enumerate(tool_calls_raw):
                 tc = ToolCall(
-                    id=tc_raw["id"],
+                    id=tc_raw.get("id", f"call_{i}"),
                     name=_tc_name(tc_raw),
                     arguments=_tc_args(tc_raw),
                 )
@@ -360,10 +413,9 @@ class DeepResearchAgent(ToolUsingAgent):
             )
         )
         final = self._generate(messages)
-        final_content = final.get("content", "")
-        usage = final.get("usage", {})
-        for k in total_usage:
-            total_usage[k] += usage.get(k, 0)
+        final_content = self._check_continuation(final, messages)
+        _accumulate_usage(total_usage, final.get("usage"))
+        total_usage["finish_reason"] = final.get("finish_reason")
 
         if final_content:
             sources = self._extract_sources(all_tool_results)

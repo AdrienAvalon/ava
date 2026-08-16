@@ -157,7 +157,7 @@ class TestWireChannelEndToEnd:
             model="test-model",
             agent_name="",
         )
-        system.ask = _MM(return_value={"content": "pong"})
+        system.ask = _MM(return_value={"content": "pong", "finish_reason": "stop"})
 
         channel = DiscordChannel(bot_token="my-bot-token")
         system.wire_channel(channel)

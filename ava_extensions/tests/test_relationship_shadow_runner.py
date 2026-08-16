@@ -25,6 +25,7 @@ from ava_extensions.evals.relationship.evaluator import (
 )
 from ava_extensions.evals.relationship.shadow_runner import (
     ShadowRunError,
+    _encode_service_assertion_key,
     run_shadow,
 )
 
@@ -176,6 +177,17 @@ def _relationship_allowed(case: dict[str, Any]) -> bool:
     )
 
 
+def test_shadow_assertion_key_encodes_trailing_crlf_entropy_as_hex() -> None:
+    entropy = b"\xa5" * 46 + b"\r\n"
+
+    encoded = _encode_service_assertion_key(entropy)
+
+    assert encoded == entropy.hex().encode("ascii")
+    assert len(encoded) == 96
+    assert encoded.endswith(b"0d0a")
+    assert encoded.rstrip(b"\r\n") == encoded
+
+
 def test_shadow_runner_exercises_auth_rollback_and_corpus_without_effects(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -253,8 +265,8 @@ def test_shadow_runner_exercises_auth_rollback_and_corpus_without_effects(
     )
     assert result.bundle_sha256 == sha256_file(output)
     assert result.release_attestation_sha256 == attestation_sha256
-    assert result.case_count == 23
-    assert result.model_call_count == 27
+    assert result.case_count == 33
+    assert result.model_call_count == 37
     assert result.negative_checks == (
         "empty-service-header",
         "malformed-oidc",
@@ -273,7 +285,7 @@ def test_shadow_runner_exercises_auth_rollback_and_corpus_without_effects(
     )
     assert engine.closed is True
     assert engine.outputs == []
-    assert len(engine.calls) == 27
+    assert len(engine.calls) == 37
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
 
     suite = load_suite(MANIFEST)
@@ -586,7 +598,12 @@ def test_completion_model_field_must_match_attested_model() -> None:
         status_code=200,
         json=lambda: {
             "model": "different-model",
-            "choices": [{"message": {"content": "synthetic", "tool_calls": []}}],
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"content": "synthetic", "tool_calls": []},
+                }
+            ],
         },
     )
 
@@ -595,6 +612,144 @@ def test_completion_model_field_must_match_attested_model() -> None:
             response,
             expected_model="synthetic-model-v1",
         )
+
+
+@pytest.mark.parametrize(
+    ("include_finish_reason", "finish_reason"),
+    (
+        (False, None),
+        (True, None),
+        (True, "length"),
+        (True, "content_filter"),
+        (True, "provider-unknown-terminal"),
+    ),
+)
+def test_completion_requires_exact_stop_provider_terminal(
+    include_finish_reason: bool,
+    finish_reason: str | None,
+) -> None:
+    from types import SimpleNamespace
+
+    from ava_extensions.evals.relationship import shadow_runner
+
+    choice: dict[str, Any] = {"message": {"content": "synthetic", "tool_calls": []}}
+    if include_finish_reason:
+        choice["finish_reason"] = finish_reason
+    response = SimpleNamespace(
+        status_code=200,
+        json=lambda: {"model": "synthetic-model-v1", "choices": [choice]},
+    )
+
+    with pytest.raises(ShadowRunError, match="exact stop terminal"):
+        shadow_runner._extract_completion(
+            response,
+            expected_model="synthetic-model-v1",
+        )
+
+
+@pytest.mark.parametrize("content", ("", " ", "\n\t"))
+def test_completion_requires_non_empty_provider_content(content: str) -> None:
+    from types import SimpleNamespace
+
+    from ava_extensions.evals.relationship import shadow_runner
+
+    response = SimpleNamespace(
+        status_code=200,
+        json=lambda: {
+            "model": "synthetic-model-v1",
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"content": content, "tool_calls": []},
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(ShadowRunError, match="invalid response text"):
+        shadow_runner._extract_completion(
+            response,
+            expected_model="synthetic-model-v1",
+        )
+
+
+@pytest.mark.parametrize(
+    ("provider_payload", "expected_error"),
+    (
+        (
+            {
+                "content": "MISSING_TERMINAL_OUTPUT_MUST_STAY_PRIVATE",
+                "model": "synthetic-model-v1",
+                "usage": {},
+            },
+            "exact stop terminal",
+        ),
+        (
+            {
+                "content": "NULL_TERMINAL_OUTPUT_MUST_STAY_PRIVATE",
+                "finish_reason": None,
+                "model": "synthetic-model-v1",
+                "usage": {},
+            },
+            "exact stop terminal",
+        ),
+        (
+            {
+                "content": "TRUNCATED_PROVIDER_OUTPUT_MUST_STAY_PRIVATE",
+                "finish_reason": "length",
+                "model": "synthetic-model-v1",
+                "usage": {},
+            },
+            "exact stop terminal",
+        ),
+        (
+            {
+                "content": "FILTERED_PROVIDER_OUTPUT_MUST_STAY_PRIVATE",
+                "finish_reason": "content_filter",
+                "model": "synthetic-model-v1",
+                "usage": {},
+            },
+            "exact stop terminal",
+        ),
+        (
+            {
+                "content": "UNKNOWN_TERMINAL_OUTPUT_MUST_STAY_PRIVATE",
+                "finish_reason": "provider-unknown-terminal",
+                "model": "synthetic-model-v1",
+                "usage": {},
+            },
+            "exact stop terminal",
+        ),
+        (
+            {
+                "content": " \n\t",
+                "finish_reason": "stop",
+                "model": "synthetic-model-v1",
+                "usage": {},
+            },
+            "empty response content",
+        ),
+    ),
+)
+def test_invalid_provider_completion_is_never_published(
+    tmp_path: Path,
+    provider_payload: dict[str, Any],
+    expected_error: str,
+) -> None:
+    engine = FakeEngine([provider_payload])
+    output_directory = _private_output_directory(tmp_path)
+    attestation_path, attestation_sha256 = _release_attestation(tmp_path)
+
+    with pytest.raises(ShadowRunError, match=expected_error):
+        run_shadow(
+            engine_factory=lambda: engine,
+            output_directory=output_directory,
+            release_attestation_path=attestation_path,
+            release_attestation_sha256=attestation_sha256,
+        )
+
+    assert len(engine.calls) == 1
+    assert list(output_directory.iterdir()) == []
 
 
 def test_engine_result_model_must_match_before_http_response(
@@ -648,8 +803,8 @@ def test_configured_anthropic_path_catalogs_attested_new_model(
         execution_mode="configured-anthropic",
     )
 
-    assert result.case_count == 23
-    assert result.model_call_count == 27
+    assert result.case_count == 33
+    assert result.model_call_count == 37
     assert engine.closed is True
 
 
@@ -721,10 +876,10 @@ def test_configured_anthropic_path_uses_real_cloud_engine_adapter(
         execution_mode="configured-anthropic",
     )
 
-    assert result.model_call_count == 27
+    assert result.model_call_count == 37
     assert client.closed is True
     assert client.messages.outputs == []
-    assert len(client.messages.calls) == 27
+    assert len(client.messages.calls) == 37
     assert all(call["model"] == "claude-sonnet-5" for call in client.messages.calls)
     assert all("tools" not in call for call in client.messages.calls)
 
@@ -794,10 +949,12 @@ def _deployed_release_fixture(tmp_path: Path) -> tuple[Path, Path, bytes]:
     manifest = (
         "format=ava-release-v1\n"
         f"git_sha={git_sha}\n"
-        f"rust_tree_sha256={'1' * 64}\n"
-        f"wheel_sha256={'2' * 64}\n"
-        "wheel_filename=openjarvis_rust-0.1.0-cp312-abi3-manylinux.whl\n"
-        f"evolutions_sha256={'3' * 64}\n"
+        f"source_tree_sha256={'1' * 64}\n"
+        f"rust_tree_sha256={'2' * 64}\n"
+        f"wheel_sha256={'3' * 64}\n"
+        "wheel_filename=openjarvis_rust-0.1.0-cp312-cp312-manylinux_2_36_x86_64.whl\n"
+        f"attestation_sha256={'4' * 64}\n"
+        f"evolutions_sha256={'5' * 64}\n"
     ).encode()
     (release / ".ava-release").write_bytes(manifest)
     module_path = release / "ava_extensions" / "evals" / "relationship"
@@ -870,6 +1027,31 @@ def test_release_attestation_is_derived_from_deployed_release_and_config(
     )
     assert repeated.output_path == output_path
     assert repeated.sha256 == metadata["sha256"]
+
+
+@pytest.mark.parametrize(
+    ("field", "valid_digest"),
+    (
+        ("source_tree_sha256", "1" * 64),
+        ("attestation_sha256", "4" * 64),
+    ),
+)
+def test_release_attestation_rejects_invalid_deployment_manifest_digest(
+    tmp_path: Path,
+    field: str,
+    valid_digest: str,
+) -> None:
+    from ava_extensions.evals.relationship import release_attestation
+
+    _release, _module_file, manifest = _deployed_release_fixture(tmp_path)
+    invalid_manifest = manifest.replace(
+        f"{field}={valid_digest}".encode(),
+        f"{field}=not-a-sha256".encode(),
+    )
+    assert invalid_manifest != manifest
+
+    with pytest.raises(ValueError, match="empreinte du manifeste de release invalide"):
+        release_attestation._parse_release_manifest(invalid_manifest)
 
 
 def test_release_attestation_refuses_generator_outside_target_release(

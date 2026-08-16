@@ -48,7 +48,7 @@ class TestExecutorBasic:
         event_bus.subscribe(EventType.AGENT_TICK_START, lambda e: events.append(e))
         event_bus.subscribe(EventType.AGENT_TICK_END, lambda e: events.append(e))
 
-        rv = AgentResult(content="result text")
+        rv = AgentResult(content="result text", metadata={"finish_reason": "stop"})
         with patch.object(executor, "_invoke_agent", return_value=rv):
             executor.execute_tick(agent["id"])
 
@@ -59,7 +59,7 @@ class TestExecutorBasic:
     def test_execute_tick_updates_run_stats(self, executor, manager):
         agent = manager.create_agent(name="test", agent_type="monitor_operative")
 
-        rv = AgentResult(content="result text")
+        rv = AgentResult(content="result text", metadata={"finish_reason": "stop"})
         with patch.object(executor, "_invoke_agent", return_value=rv):
             executor.execute_tick(agent["id"])
 
@@ -80,7 +80,7 @@ class TestExecutorBasic:
 
         manager.start_tick = track_start
 
-        rv = AgentResult(content="result")
+        rv = AgentResult(content="result", metadata={"finish_reason": "stop"})
         with patch.object(executor, "_invoke_agent", return_value=rv):
             executor.execute_tick(agent["id"])
 
@@ -109,7 +109,7 @@ class TestExecutorBasic:
             call_count += 1
             if call_count < 3:
                 raise RetryableError("rate limit")
-            return AgentResult(content="success")
+            return AgentResult(content="success", metadata={"finish_reason": "stop"})
 
         with patch.object(executor, "_invoke_agent", side_effect=flaky_invoke):
             with patch("openjarvis.agents.executor.retry_delay", return_value=0):
@@ -139,7 +139,10 @@ class TestExecutorBasic:
         with patch.object(
             executor,
             "_invoke_agent",
-            return_value=AgentResult(content="first answer"),
+            return_value=AgentResult(
+                content="first answer",
+                metadata={"finish_reason": "stop"},
+            ),
         ):
             executor.execute_tick(agent["id"])
 
@@ -166,12 +169,71 @@ class TestExecutorBasic:
         assert by_id[first["id"]]["status"] == "failed"
         assert by_id[second["id"]]["status"] == "pending"
 
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            {"finish_reason": "length"},
+            {"finish_reason": "max_tokens"},
+            {},
+            {"finish_reason": "stop", "max_turns_exceeded": True},
+            {"finish_reason": "stop", "incomplete_tool_call": True},
+        ],
+    )
+    def test_incomplete_result_fails_claim_without_assistant_reply(
+        self, executor, manager, metadata
+    ):
+        agent = manager.create_agent(name="incomplete", agent_type="orchestrator")
+        source = manager.send_message(agent["id"], "question")
+
+        with patch.object(
+            executor,
+            "_invoke_agent",
+            return_value=AgentResult(content="PARTIAL_OUTPUT", metadata=metadata),
+        ):
+            executor.execute_tick(agent["id"])
+
+        messages = manager.list_messages(agent["id"])
+        assert len(messages) == 1
+        assert messages[0]["id"] == source["id"]
+        assert messages[0]["status"] == "failed"
+        updated = manager.get_agent(agent["id"])
+        assert updated["status"] == "error"
+        assert updated["total_runs"] == 0
+
+    def test_anthropic_end_turn_is_normalized_before_claim_commit(
+        self, executor, manager
+    ):
+        agent = manager.create_agent(name="complete", agent_type="orchestrator")
+        source = manager.send_message(agent["id"], "question")
+
+        with patch.object(
+            executor,
+            "_invoke_agent",
+            return_value=AgentResult(
+                content="COMPLETE_OUTPUT",
+                metadata={"finish_reason": "end_turn"},
+            ),
+        ):
+            executor.execute_tick(agent["id"])
+
+        messages = manager.list_messages(agent["id"])
+        assert len(messages) == 2
+        stored_source = next(
+            message for message in messages if message["id"] == source["id"]
+        )
+        answer = next(
+            message for message in messages if message["direction"] == "agent_to_user"
+        )
+        assert stored_source["status"] == "delivered"
+        assert answer["content"] == "COMPLETE_OUTPUT"
+        assert manager.get_agent(agent["id"])["status"] == "idle"
+
     def test_execute_tick_concurrency_guard(self, executor, manager):
         agent = manager.create_agent(name="test", agent_type="monitor_operative")
         manager.start_tick(agent["id"])  # Simulate already running
 
         # Second tick should handle the ValueError from start_tick
-        rv = AgentResult(content="result")
+        rv = AgentResult(content="result", metadata={"finish_reason": "stop"})
         with patch.object(executor, "_invoke_agent", return_value=rv):
             executor.execute_tick(agent["id"])
 
@@ -193,7 +255,7 @@ def test_finalize_tick_reads_agent_result_metadata(tmp_path):
 
     result = AgentResult(
         content="done",
-        metadata={"tokens_used": 500, "cost": 0.05},
+        metadata={"finish_reason": "stop", "tokens_used": 500, "cost": 0.05},
     )
     executor._finalize_tick(
         agent["id"], result, error=None, duration=1.0, tick_token=tick_token
@@ -226,7 +288,10 @@ def test_http_tick_uses_common_identity_without_private_agent_state(
         def run(self, input_text, context=None):
             captured["input"] = input_text
             captured["context"] = context
-            return AgentResult(content="public answer")
+            return AgentResult(
+                content="public answer",
+                metadata={"finish_reason": "stop"},
+            )
 
     monkeypatch.setattr(AgentRegistry, "get", lambda _key: CapturingAgent)
     engine = object()
@@ -279,6 +344,55 @@ def test_http_tick_uses_common_identity_without_private_agent_state(
     trace = trace_store.save.call_args.args[0]
     assert trace.query == "question"
     assert "PRIVATE_LEGACY_CANARY" not in trace.query
+
+
+def test_background_tick_inherits_server_max_tokens_without_agent_override(
+    manager, event_bus, monkeypatch
+):
+    from openjarvis.agents import AgentRegistry
+    from openjarvis.agents.executor import AgentExecutor
+
+    captured = {}
+
+    class CapturingAgent:
+        accepts_tools = False
+
+        def __init__(self, _engine, _model, **kwargs):
+            captured["kwargs"] = kwargs
+
+        def run(self, _input_text, context=None):
+            del context
+            return AgentResult(
+                content="complete",
+                metadata={"finish_reason": "stop"},
+            )
+
+    monkeypatch.setattr(AgentRegistry, "get", lambda _key: CapturingAgent)
+    server_config = SimpleNamespace(
+        intelligence=SimpleNamespace(max_tokens=16_384),
+        agent=SimpleNamespace(context_from_memory=False),
+    )
+    executor = AgentExecutor(manager=manager, event_bus=event_bus)
+    executor.set_system(
+        SimpleNamespace(
+            engine=object(),
+            model="fallback-model",
+            config=server_config,
+            http_boundary=True,
+            memory_backend=None,
+        )
+    )
+    agent = manager.create_agent(
+        name="inherits-server-limit",
+        agent_type="capture",
+        config={"temperature": 0.25, "max_turns": 4},
+    )
+
+    result = executor._invoke_agent(agent)
+
+    assert result.content == "complete"
+    assert captured["kwargs"]["max_tokens"] == 16_384
+    assert "max_tokens" not in manager.get_agent(agent["id"])["config"]
 
 
 def test_claim_failure_releases_tick_as_error(manager, event_bus, monkeypatch):

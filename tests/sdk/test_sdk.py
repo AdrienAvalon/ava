@@ -8,6 +8,7 @@ import pytest
 
 import openjarvis
 from openjarvis.core.config import JarvisConfig
+from openjarvis.engine._stubs import StreamChunk
 from openjarvis.sdk import Jarvis, MemoryHandle
 
 
@@ -85,7 +86,11 @@ class TestJarvisAsk:
                 pass
 
             def run(self, input, context=None, **kwargs):
-                return AgentResult(content="Agent response", turns=1)
+                return AgentResult(
+                    content="Agent response",
+                    turns=1,
+                    metadata={"finish_reason": "stop"},
+                )
 
         AgentRegistry.register_value("mock-agent", MockAgent)
 
@@ -111,6 +116,26 @@ class TestJarvisAsk:
             assert "content" in result
             assert "usage" in result
             assert result["content"] == "Full response"
+            j.close()
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            {"content": "partial", "finish_reason": "length"},
+            {"content": "partial"},
+            {"content": "", "finish_reason": "stop"},
+        ],
+    )
+    def test_ask_and_ask_full_reject_unproven_responses(self, response):
+        engine = _make_engine()
+        engine.generate.return_value = response
+
+        with patch("openjarvis.sdk.get_engine", return_value=("mock", engine)):
+            j = Jarvis(config=JarvisConfig(), model="test-model")
+            with pytest.raises(RuntimeError, match="did not complete"):
+                j.ask_full("Hello")
+            with pytest.raises(RuntimeError, match="did not complete"):
+                j.ask("Hello")
             j.close()
 
 
@@ -220,11 +245,12 @@ class TestJarvisStreaming:
     async def test_ask_stream_yields_tokens(self):
         engine = _make_engine()
 
-        async def mock_stream(*args, **kwargs):
+        async def mock_stream_full(*args, **kwargs):
             for token in ["Hello", " ", "world"]:
-                yield token
+                yield StreamChunk(content=token)
+            yield StreamChunk(finish_reason="stop")
 
-        engine.stream = mock_stream
+        engine.stream_full = mock_stream_full
 
         with patch("openjarvis.sdk.get_engine", return_value=("mock", engine)):
             j = Jarvis(config=JarvisConfig(), model="test-model")
@@ -238,11 +264,12 @@ class TestJarvisStreaming:
     async def test_ask_full_stream_yields_dicts(self):
         engine = _make_engine()
 
-        async def mock_stream(*args, **kwargs):
+        async def mock_stream_full(*args, **kwargs):
             for token in ["Hello", " ", "world"]:
-                yield token
+                yield StreamChunk(content=token)
+            yield StreamChunk(finish_reason="stop")
 
-        engine.stream = mock_stream
+        engine.stream_full = mock_stream_full
 
         with patch("openjarvis.sdk.get_engine", return_value=("mock", engine)):
             j = Jarvis(config=JarvisConfig(), model="test-model")
@@ -259,6 +286,7 @@ class TestJarvisStreaming:
             final = chunks[-1]
             assert final["done"] is True
             assert final["content"] == "Hello world"
+            assert final["finish_reason"] == "stop"
             assert final["model"] == "test-model"
             assert final["engine"] == "mock"
             j.close()
@@ -268,12 +296,12 @@ class TestJarvisStreaming:
         engine = _make_engine()
         call_log: list = []
 
-        async def mock_stream(*args, **kwargs):
+        async def mock_stream_full(*args, **kwargs):
             call_log.append(kwargs)
-            for token in ["ok"]:
-                yield token
+            yield StreamChunk(content="ok")
+            yield StreamChunk(finish_reason="stop")
 
-        engine.stream = mock_stream
+        engine.stream_full = mock_stream_full
 
         with patch("openjarvis.sdk.get_engine", return_value=("mock", engine)):
             j = Jarvis(config=JarvisConfig())
@@ -282,6 +310,41 @@ class TestJarvisStreaming:
                 tokens.append(token)
             assert tokens == ["ok"]
             assert call_log[0]["model"] == "custom-model"
+            j.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("content", "finish_reason"),
+        [("partial", "length"), ("partial", None), ("", "stop")],
+    )
+    async def test_streams_never_signal_done_without_complete_content(
+        self, content, finish_reason
+    ):
+        engine = _make_engine()
+
+        async def mock_stream_full(*args, **kwargs):
+            if content:
+                yield StreamChunk(content=content)
+            if finish_reason is not None:
+                yield StreamChunk(finish_reason=finish_reason)
+
+        engine.stream_full = mock_stream_full
+
+        with patch("openjarvis.sdk.get_engine", return_value=("mock", engine)):
+            j = Jarvis(config=JarvisConfig(), model="test-model")
+
+            tokens = []
+            with pytest.raises(RuntimeError, match="did not complete"):
+                async for token in j.ask_stream("Hi"):
+                    tokens.append(token)
+            assert tokens == ([content] if content else [])
+
+            chunks = []
+            with pytest.raises(RuntimeError, match="did not complete"):
+                async for chunk in j.ask_full_stream("Hi"):
+                    chunks.append(chunk)
+            assert chunks == ([{"token": content, "index": 0}] if content else [])
+            assert not any(chunk.get("done") for chunk in chunks)
             j.close()
 
 

@@ -33,7 +33,17 @@ def _make_engine(engine_id="mock", models=None):
         for token in ["Hello", " ", "world"]:
             yield token
 
+    async def mock_stream_full(
+        messages, *, model, temperature=0.7, max_tokens=1024, **kw
+    ):
+        from openjarvis.engine._stubs import StreamChunk
+
+        for token in ["Hello", " ", "world"]:
+            yield StreamChunk(content=token)
+        yield StreamChunk(finish_reason="stop")
+
     engine.stream = mock_stream
+    engine.stream_full = mock_stream_full
     return engine
 
 
@@ -44,8 +54,19 @@ def _make_ollama_engine(models=None):
     return engine
 
 
-def _app(engine, engine_name="mock"):
-    return create_app(engine, "test-model", engine_name=engine_name)
+def _app(engine, engine_name="mock", agent=None):
+    from openjarvis.core.config import JarvisConfig
+
+    config = JarvisConfig()
+    config.analytics.enabled = False
+    config.traces.enabled = False
+    return create_app(
+        engine,
+        "test-model",
+        agent=agent,
+        engine_name=engine_name,
+        config=config,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -154,12 +175,14 @@ class TestStreamingResilience:
         """Backend errors must never be relabelled stop or leak details."""
         engine = _make_engine()
 
-        async def failing_stream(messages, *, model, **kw):
-            yield "partial"
+        async def failing_stream_full(messages, *, model, **kw):
+            from openjarvis.engine._stubs import StreamChunk
+
+            yield StreamChunk(content="partial")
             raise RuntimeError("model not found")
 
-        engine.stream = failing_stream
-        app = create_app(engine, "test-model")
+        engine.stream_full = failing_stream_full
+        app = _app(engine)
         client = TestClient(app)
 
         resp = client.post(
@@ -182,12 +205,14 @@ class TestStreamingResilience:
     def test_empty_stream_is_an_explicit_terminal_error(self):
         engine = _make_engine()
 
-        async def empty_stream(messages, *, model, **kw):
+        async def empty_stream_full(messages, *, model, **kw):
             if False:
-                yield "unreachable"
+                from openjarvis.engine._stubs import StreamChunk
 
-        engine.stream = empty_stream
-        response = TestClient(create_app(engine, "test-model")).post(
+                yield StreamChunk(content="unreachable")
+
+        engine.stream_full = empty_stream_full
+        response = TestClient(_app(engine)).post(
             "/v1/chat/completions",
             json={
                 "model": "test-model",
@@ -204,7 +229,7 @@ class TestStreamingResilience:
     def test_stream_tokens_arrive(self):
         """Verify tokens stream through correctly (not batched)."""
         engine = _make_engine()
-        app = create_app(engine, "test-model")
+        app = _app(engine)
         client = TestClient(app)
 
         resp = client.post(
@@ -229,7 +254,7 @@ class TestStreamingResilience:
         assert tokens == ["Hello", " ", "world"]
 
     def test_stream_without_agent_uses_direct_engine(self):
-        """When no tools in request, streaming should use engine.stream directly
+        """When no tools in request, streaming should use engine.stream_full directly
         even if an agent is configured (for real token-by-token output)."""
         from openjarvis.agents._stubs import AgentResult
 
@@ -241,7 +266,7 @@ class TestStreamingResilience:
             turns=1,
         )
 
-        app = create_app(engine, "test-model", agent=agent)
+        app = _app(engine, agent=agent)
         client = TestClient(app)
 
         resp = client.post(

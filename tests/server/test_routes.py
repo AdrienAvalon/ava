@@ -42,16 +42,32 @@ def _make_engine(content="Hello from server", models=None):
         for token in ["Hello", " ", "world"]:
             yield token
 
+    async def mock_stream_full(
+        messages,
+        *,
+        model,
+        temperature=0.7,
+        max_tokens=1024,
+        **kwargs,
+    ):
+        from openjarvis.engine._stubs import StreamChunk
+
+        for token in ["Hello", " ", "world"]:
+            yield StreamChunk(content=token)
+        yield StreamChunk(finish_reason="stop")
+
     engine.stream = mock_stream
+    engine.stream_full = mock_stream_full
     return engine
 
 
-def _make_agent(content="Hello from agent"):
+def _make_agent(content="Hello from agent", *, finish_reason="stop"):
     from openjarvis.agents._stubs import AgentResult
 
     agent = MagicMock()
     agent.agent_id = "mock"
-    agent.run.return_value = AgentResult(content=content, turns=1)
+    metadata = {} if finish_reason is None else {"finish_reason": finish_reason}
+    agent.run.return_value = AgentResult(content=content, turns=1, metadata=metadata)
     return agent
 
 
@@ -247,6 +263,20 @@ class TestChatCompletions:
         assert data["object"] == "chat.completion"
         assert data["choices"][0]["message"]["content"] == "Hello from server"
 
+    def test_omitted_model_uses_the_daemon_runtime_model(self):
+        engine = _make_engine()
+        client = TestClient(
+            create_app(engine, "server-selected-model", config=_test_config())
+        )
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "Hello"}]},
+        )
+
+        assert response.status_code == 200
+        assert engine.generate.call_args.kwargs["model"] == "server-selected-model"
+
     def test_completion_has_usage(self, client):
         resp = client.post(
             "/v1/chat/completions",
@@ -297,6 +327,100 @@ class TestChatCompletions:
         assert response.status_code == 200
         assert engine.generate.call_args.kwargs["max_tokens"] == MAX_COMPLETION_TOKENS
 
+    def test_client_first_party_sans_limite_herite_des_16384_du_serveur(self):
+        engine = _make_engine()
+        config = _test_config()
+        config.intelligence.max_tokens = 16_384
+        client = TestClient(create_app(engine, "test-model", config=config))
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Bonjour"}],
+            },
+        )
+
+        assert response.status_code == 200
+        assert engine.generate.call_args.kwargs["max_tokens"] == 16_384
+
+    @pytest.mark.parametrize("configured", [None, 0, True, 32_769])
+    def test_limite_runtime_absente_ou_invalide_echoue_fermee(self, configured):
+        engine = _make_engine()
+        config = _test_config()
+        config.intelligence.max_tokens = configured
+        client = TestClient(create_app(engine, "test-model", config=config))
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "Bonjour"}]},
+        )
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Ava runtime completion limit unavailable"
+        assert not engine.generate.called
+
+    def test_configuration_runtime_absente_echoue_fermee(self):
+        engine = _make_engine()
+        app = create_app(engine, "test-model", config=_test_config())
+        app.state.config = None
+        client = TestClient(app)
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "Bonjour"}]},
+        )
+
+        assert response.status_code == 503
+        assert not engine.generate.called
+
+    def test_limite_explicite_ne_depend_pas_de_la_config_runtime(self):
+        engine = _make_engine()
+        config = _test_config()
+        config.intelligence.max_tokens = None
+        client = TestClient(create_app(engine, "test-model", config=config))
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Bonjour"}],
+                "max_tokens": 2048,
+            },
+        )
+
+        assert response.status_code == 200
+        assert engine.generate.call_args.kwargs["max_tokens"] == 2048
+
+    def test_agent_sans_limite_herite_aussi_du_serveur(self):
+        from openjarvis.agents.simple import SimpleAgent
+
+        engine = _make_engine(content="complete agent reply")
+        config = _test_config()
+        config.intelligence.max_tokens = 16_384
+        agent = SimpleAgent(
+            engine,
+            "configured-model",
+            temperature=0.7,
+            max_tokens=1024,
+        )
+        client = TestClient(
+            create_app(
+                engine,
+                "configured-model",
+                agent=agent,
+                config=config,
+            )
+        )
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Bonjour"}],
+            },
+        )
+
+        assert response.status_code == 200
+        assert engine.generate.call_args.kwargs["max_tokens"] == 16_384
+
     def test_max_tokens_refuse_la_limite_plus_un(self):
         from openjarvis.server.models import MAX_COMPLETION_TOKENS
 
@@ -313,6 +437,26 @@ class TestChatCompletions:
 
         assert response.status_code == 422
         assert not engine.generate.called
+
+    @pytest.mark.parametrize(
+        ("upstream_reason", "api_reason"),
+        [
+            ("end_turn", "stop"),
+            ("stop_sequence", "stop"),
+            ("max_tokens", "length"),
+            ("pause_turn", "length"),
+            ("model_context_window_exceeded", "length"),
+            ("refusal", "content_filter"),
+            ("future_sdk_reason", "length"),
+            ("", "length"),
+        ],
+    )
+    def test_agent_finish_reason_unknown_ne_devient_jamais_stop(
+        self, upstream_reason, api_reason
+    ):
+        from openjarvis.server.routes import _motif_arret
+
+        assert _motif_arret({"finish_reason": upstream_reason}) == api_reason
 
     def test_agent_respecte_temperature_et_plafond_de_la_requete(self):
         from openjarvis.agents.simple import SimpleAgent
@@ -800,6 +944,33 @@ class TestChatCompletions:
                     content += delta_content
         assert content == "Hello world"
 
+    def test_plain_stream_length_ne_devient_jamais_un_succes(self):
+        from openjarvis.engine._stubs import StreamChunk
+
+        engine = _make_engine()
+
+        async def incomplete_stream_full(messages, *, model, **kwargs):
+            yield StreamChunk(content="partial response")
+            yield StreamChunk(finish_reason="length")
+
+        engine.stream_full = incomplete_stream_full
+        response = TestClient(
+            create_app(engine, "test-model", config=_test_config())
+        ).post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "question"}],
+                "stream": True,
+            },
+        )
+
+        assert response.status_code == 200
+        assert "partial response" in response.text
+        assert "no complete response" in response.text
+        assert '"finish_reason":"stop"' not in response.text
+        assert "data: [DONE]" in response.text
+
     def test_streaming_with_tools_emits_tool_calls_and_bypasses_agent(self):
         """Regression for the streaming analog of #414.
 
@@ -950,6 +1121,22 @@ class TestChatCompletions:
         )
         data = resp.json()
         assert data["choices"][0]["finish_reason"] == "stop"
+
+    def test_direct_missing_or_unknown_finish_reason_ne_devient_pas_stop(self):
+        for upstream_reason in (None, "future_sdk_reason"):
+            engine = _make_engine()
+            engine.generate.return_value["finish_reason"] = upstream_reason
+            response = TestClient(
+                create_app(engine, "test-model", config=_test_config())
+            ).post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            )
+            assert response.status_code == 200
+            assert response.json()["choices"][0]["finish_reason"] == "length"
 
 
 # ---------------------------------------------------------------------------
@@ -1311,6 +1498,38 @@ class TestTraceRecording:
         trace = store.list_traces(limit=1)[0]
         assert trace.query == "What is 2+2?"
         assert trace.result == "traced reply"
+        assert trace.outcome == "completed"
+
+    @pytest.mark.parametrize("finish_reason", [None, "length"])
+    def test_incomplete_agent_response_is_never_traced_as_completed(
+        self, tmp_path, finish_reason
+    ):
+        from openjarvis.core.events import EventBus
+
+        engine = _make_engine()
+        agent = _make_agent(content="partial reply", finish_reason=finish_reason)
+        app = create_app(
+            engine,
+            "test-model",
+            agent=agent,
+            bus=EventBus(record_history=False),
+            config=_traces_enabled_config(tmp_path),
+        )
+        store = app.state.trace_store
+        assert store is not None
+
+        response = TestClient(app).post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "unfinished"}],
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["choices"][0]["finish_reason"] == "length"
+        trace = store.list_traces(limit=1)[0]
+        assert trace.outcome == "incomplete"
 
     def test_streaming_completion_creates_trace(self, tmp_path, monkeypatch):
         """A streamed completion (no agent) records the assembled response."""

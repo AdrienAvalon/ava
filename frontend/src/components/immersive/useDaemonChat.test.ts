@@ -24,9 +24,29 @@ import {
   createHydrationGate,
   demanderChatDurable,
   extractNewSentences,
+  splitTTSChunks,
   TURN_ID_HEADER,
   type Message,
 } from './useDaemonChat';
+
+
+describe('splitTTSChunks — contrat de taille du TTS', () => {
+  it('borne une phrase sans ponctuation sans perdre de texte', () => {
+    const original = Array.from({ length: 140 }, (_, index) => `mot${index}`).join(' ');
+    const chunks = splitTTSChunks(original, 100);
+
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.every((chunk) => chunk.length <= 100)).toBe(true);
+    expect(chunks.join(' ')).toBe(original);
+  });
+
+  it('coupe aussi un token plus long que la limite', () => {
+    const chunks = splitTTSChunks('x'.repeat(1200), 500);
+
+    expect(chunks.map((chunk) => chunk.length)).toEqual([500, 500, 200]);
+    expect(chunks.join('')).toBe('x'.repeat(1200));
+  });
+});
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -131,13 +151,20 @@ describe('createHydrationGate — ordre historique puis envoi', () => {
   });
 });
 
-function chatResponse(status: number, content = '', retryAfter?: string): Response {
+function chatResponse(
+  status: number,
+  content = '',
+  retryAfter?: string,
+  model = 'server-model',
+  finishReason = 'stop',
+): Response {
   return {
     ok: status >= 200 && status < 300,
     status,
     headers: new Headers(retryAfter ? { 'Retry-After': retryAfter } : {}),
     json: async () => ({
-      choices: [{ message: { role: 'assistant', content } }],
+      model,
+      choices: [{ message: { role: 'assistant', content }, finish_reason: finishReason }],
     }),
   } as Response;
 }
@@ -167,6 +194,28 @@ describe('demanderChatDurable — retry HTTP idempotent', () => {
     expect(first.headers).toMatchObject({ [TURN_ID_HEADER]: turnId });
     expect(second.headers).toMatchObject({ [TURN_ID_HEADER]: turnId });
     expect(second.body).toBe(first.body);
+    const requestBody = JSON.parse(String(first.body));
+    expect(requestBody).not.toHaveProperty('model');
+    expect(requestBody).not.toHaveProperty('max_tokens');
+  });
+
+  it('affiche seulement le modèle effectivement rendu par le serveur', async () => {
+    const onRuntimeModel = vi.fn();
+    const fetchImpl = vi.fn().mockResolvedValue(
+      chatResponse(200, 'réponse', undefined, 'configured-model'),
+    );
+
+    await demanderChatDurable({
+      messages,
+      turnId,
+      signal: new AbortController().signal,
+      fetchImpl,
+      retryDelaysMs: [],
+      waitImpl,
+      onRuntimeModel,
+    });
+
+    expect(onRuntimeModel).toHaveBeenCalledWith('configured-model');
   });
 
   it('réessaie un 503 transitoire', async () => {
@@ -234,6 +283,21 @@ describe('demanderChatDurable — retry HTTP idempotent', () => {
       waitImpl,
     })).resolves.toBe('réponse complète');
     expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('ne consacre jamais un fragment terminé par length', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(
+      chatResponse(200, 'réponse coupée au milieu', undefined, 'server-model', 'length'),
+    );
+
+    await expect(demanderChatDurable({
+      messages,
+      turnId,
+      signal: new AbortController().signal,
+      fetchImpl,
+      retryDelaysMs: [],
+      waitImpl,
+    })).rejects.toThrow('réponse durable incomplète');
   });
 });
 

@@ -25,93 +25,17 @@ logger = logging.getLogger(__name__)
 
 
 def _restore_sendblue_bindings(app: FastAPI) -> None:
-    """Restore SendBlue channel bindings from the database on startup.
+    """Never project principal-owned bindings into a global SendBlue runtime.
 
-    If a SendBlue binding was created via the Messaging tab and the server
-    restarts, this ensures the ChannelBridge + DeepResearchAgent are wired
-    up so incoming webhooks continue to work.
+    Managed channel rows are scoped indirectly through their owning agent, but
+    the webhook bridge on ``app.state`` has no owner mapping.  Restoring an
+    arbitrary row would expose one principal's channel process-wide.  This
+    startup hook therefore remains deliberately inert until runtime isolation
+    and deterministic owner selection exist.
     """
-    try:
-        mgr = getattr(app.state, "agent_manager", None)
-        if mgr is None:
-            return
 
-        # Check all agents for sendblue bindings
-        for agent in mgr.list_agents():
-            agent_id = agent.get("id", agent.get("agent_id", ""))
-            bindings = mgr.list_channel_bindings(agent_id)
-            for b in bindings:
-                if b.get("channel_type") != "sendblue":
-                    continue
-                config = b.get("config", {})
-                api_key_id = config.get("api_key_id", "")
-                api_secret_key = config.get("api_secret_key", "")
-                from_number = config.get("from_number", "")
-                if not api_key_id or not api_secret_key:
-                    continue
-
-                from openjarvis.channels.sendblue import SendBlueChannel
-
-                sb = SendBlueChannel(
-                    api_key_id=api_key_id,
-                    api_secret_key=api_secret_key,
-                    from_number=from_number,
-                )
-                sb.connect()
-                app.state.sendblue_channel = sb
-
-                # Create ChannelBridge if none exists
-                bridge = getattr(app.state, "channel_bridge", None)
-                if bridge and hasattr(bridge, "_channels"):
-                    bridge._channels["sendblue"] = sb
-                else:
-                    from openjarvis.server.channel_bridge import ChannelBridge
-                    from openjarvis.server.session_store import SessionStore
-
-                    session_store = SessionStore()
-                    engine = getattr(app.state, "engine", None)
-                    dr_agent = None
-                    if engine:
-                        from openjarvis.server.agent_manager_routes import (
-                            _build_deep_research_tools,
-                        )
-
-                        tools = _build_deep_research_tools(engine=engine, model="")
-                        if tools:
-                            from openjarvis.agents.deep_research import (
-                                DeepResearchAgent,
-                            )
-
-                            model_name = getattr(app.state, "model", "") or getattr(
-                                engine, "_model", ""
-                            )
-                            dr_agent = DeepResearchAgent(
-                                engine=engine,
-                                model=model_name,
-                                tools=tools,
-                            )
-
-                    bus = getattr(app.state, "bus", None)
-                    if bus is None:
-                        from openjarvis.core.events import EventBus
-
-                        bus = EventBus()
-
-                    app.state.channel_bridge = ChannelBridge(
-                        channels={"sendblue": sb},
-                        session_store=session_store,
-                        bus=bus,
-                        agent_manager=mgr,
-                        deep_research_agent=dr_agent,
-                    )
-
-                logger.info(
-                    "Restored SendBlue channel binding: %s",
-                    from_number,
-                )
-                return  # Only need one SendBlue binding
-    except Exception as exc:
-        logger.debug("SendBlue binding restore skipped: %s", exc)
+    if getattr(app.state, "agent_manager", None) is not None:
+        logger.info("Managed SendBlue binding restore is disabled")
 
 
 # No-cache headers applied to static file responses

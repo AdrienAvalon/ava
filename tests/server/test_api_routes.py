@@ -1,5 +1,6 @@
 """Tests for extended API routes."""
 
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -9,7 +10,7 @@ from ava_extensions.server.principal import Principal  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from openjarvis.core.types import Trace  # noqa: E402
+from openjarvis.core.types import StepType, Trace, TraceStep  # noqa: E402
 from openjarvis.server.api_routes import include_all_routes  # noqa: E402
 from openjarvis.traces.store import TraceStore  # noqa: E402
 
@@ -26,24 +27,48 @@ def _make_app():
 
 
 class TestAgentRoutes:
-    def test_list_agents(self):
-        client = TestClient(_make_app())
-        resp = client.get("/v1/agents")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "registered" in data
-        assert "running" in data
+    @pytest.mark.parametrize(
+        ("method", "path", "payload"),
+        [
+            ("GET", "/v1/agents", None),
+            ("POST", "/v1/agents", {"agent_type": "simple"}),
+            ("POST", "/v1/agents", {}),
+            ("DELETE", "/v1/agents/private-canary", None),
+            (
+                "POST",
+                "/v1/agents/private-canary/message",
+                {"message": "overwrite-private-canary"},
+            ),
+            ("POST", "/v1/agents/private-canary/message", {}),
+        ],
+    )
+    def test_legacy_http_is_quarantined_without_read_or_mutation(
+        self, method, path, payload
+    ):
+        from openjarvis.tools.agent_tools import _SPAWNED_AGENTS
 
-    def test_create_agent(self):
+        previous = deepcopy(_SPAWNED_AGENTS)
+        canary = {
+            "agent_type": "simple",
+            "status": "running",
+            "private_state": "PRIVATE-AGENT-CANARY",
+        }
+        _SPAWNED_AGENTS.clear()
+        _SPAWNED_AGENTS["private-canary"] = deepcopy(canary)
+        before = deepcopy(_SPAWNED_AGENTS)
         client = TestClient(_make_app())
-        resp = client.post("/v1/agents", json={"agent_type": "simple"})
-        # May succeed or fail depending on agent_tools availability
-        assert resp.status_code in (200, 501)
+        try:
+            response = client.request(method, path, json=payload)
 
-    def test_kill_nonexistent(self):
-        client = TestClient(_make_app())
-        resp = client.delete("/v1/agents/nonexistent")
-        assert resp.status_code in (404, 501)
+            assert response.status_code == 410
+            assert response.json()["detail"].startswith(
+                "Legacy shared agent HTTP API is quarantined"
+            )
+            assert "PRIVATE-AGENT-CANARY" not in response.text
+            assert _SPAWNED_AGENTS == before
+        finally:
+            _SPAWNED_AGENTS.clear()
+            _SPAWNED_AGENTS.update(previous)
 
 
 class TestMemoryRoutes:
@@ -263,6 +288,188 @@ class TestTraceRoutes:
             ).status_code
             == 401
         )
+        store.close()
+
+    def test_tool_execution_proof_is_scoped_bounded_and_content_free(
+        self, monkeypatch, tmp_path
+    ):
+        client, store = self._client(monkeypatch, tmp_path)
+        canaries = {
+            "argument": "PRIVATE_ARGUMENT_CANARY",
+            "result": "PRIVATE_RESULT_CANARY",
+            "metadata": "PRIVATE_METADATA_CANARY",
+        }
+        store.save(
+            Trace(
+                trace_id="trace-proof",
+                query="PRIVATE_QUERY_CANARY",
+                result="PRIVATE_REPLY_CANARY",
+                outcome="completed",
+                metadata={"provenance": self.OWNER.provenance},
+                steps=[
+                    TraceStep(
+                        step_type=StepType.TOOL_CALL,
+                        timestamp=1.0,
+                        input={"tool": "lire_doc", "arguments": canaries},
+                        output={"success": True, "result": canaries["result"]},
+                        metadata=canaries,
+                    ),
+                    TraceStep(
+                        step_type=StepType.TOOL_CALL,
+                        timestamp=2.0,
+                        input={"tool": "proposer_plan", "arguments": canaries},
+                        output={"success": True, "result": canaries["result"]},
+                        metadata=canaries,
+                    ),
+                    TraceStep(
+                        step_type=StepType.TOOL_CALL,
+                        timestamp=3.0,
+                        input={"tool": "lire_doc", "arguments": canaries},
+                        output={"success": False, "result": canaries["result"]},
+                        metadata=canaries,
+                    ),
+                ],
+            )
+        )
+        path = "/v1/traces/trace-proof/tool-execution-proof"
+
+        response = client.get(path, headers={"X-Test-Principal": "owner"})
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "schema": "ava.tool-execution-proof/v1",
+            "trace_id": "trace-proof",
+            "complete": False,
+            "call_count": 3,
+            "calls": [
+                {
+                    "tool": "lire_doc",
+                    "count": 2,
+                    "successes": 1,
+                    "failures": 1,
+                },
+                {
+                    "tool": "proposer_plan",
+                    "count": 1,
+                    "successes": 1,
+                    "failures": 0,
+                },
+            ],
+        }
+        assert not any(value in response.text for value in canaries.values())
+        assert "PRIVATE_QUERY_CANARY" not in response.text
+        assert "PRIVATE_REPLY_CANARY" not in response.text
+        assert client.get(path).status_code == 401
+        assert (
+            client.get(path, headers={"X-Test-Principal": "guest"}).status_code == 404
+        )
+        store.close()
+
+    @pytest.mark.parametrize(
+        ("tool", "success"),
+        [
+            ("bad tool", True),
+            ("safe_tool", "yes"),
+        ],
+    )
+    def test_tool_execution_proof_rejects_malformed_steps_without_leakage(
+        self, monkeypatch, tmp_path, tool, success
+    ):
+        client, store = self._client(monkeypatch, tmp_path)
+        store.save(
+            Trace(
+                trace_id="trace-corrupt",
+                result="PRIVATE_REPLY_CANARY",
+                outcome="completed",
+                metadata={"provenance": self.OWNER.provenance},
+                steps=[
+                    TraceStep(
+                        step_type=StepType.TOOL_CALL,
+                        timestamp=1.0,
+                        input={"tool": tool, "arguments": "PRIVATE_ARGUMENT_CANARY"},
+                        output={"success": success, "result": "PRIVATE_RESULT_CANARY"},
+                    )
+                ],
+            )
+        )
+
+        response = client.get(
+            "/v1/traces/trace-corrupt/tool-execution-proof",
+            headers={"X-Test-Principal": "owner"},
+        )
+
+        assert response.status_code == 409
+        assert response.json() == {"detail": "Trace proof unavailable"}
+        assert "PRIVATE" not in response.text
+        store.close()
+
+    @pytest.mark.parametrize(
+        ("names", "expected_status"),
+        [
+            (["tool"] * 64, 200),
+            (["tool"] * 65, 409),
+            ([f"tool_{index}" for index in range(16)], 200),
+            ([f"tool_{index}" for index in range(17)], 409),
+        ],
+    )
+    def test_tool_execution_proof_fails_closed_at_call_and_name_bounds(
+        self, monkeypatch, tmp_path, names, expected_status
+    ):
+        client, store = self._client(monkeypatch, tmp_path)
+        store.save(
+            Trace(
+                trace_id="trace-bounds",
+                result="complete",
+                outcome="completed",
+                metadata={"provenance": self.OWNER.provenance},
+                steps=[
+                    TraceStep(
+                        step_type=StepType.TOOL_CALL,
+                        timestamp=float(index),
+                        input={"tool": name},
+                        output={"success": True},
+                    )
+                    for index, name in enumerate(names)
+                ],
+            )
+        )
+
+        response = client.get(
+            "/v1/traces/trace-bounds/tool-execution-proof",
+            headers={"X-Test-Principal": "owner"},
+        )
+
+        assert response.status_code == expected_status
+        if expected_status == 200:
+            assert response.json()["call_count"] == len(names)
+        else:
+            assert response.json() == {"detail": "Trace proof unavailable"}
+        store.close()
+
+    def test_tool_execution_proof_rejects_an_oversized_non_tool_trace(
+        self, monkeypatch, tmp_path
+    ):
+        client, store = self._client(monkeypatch, tmp_path)
+        store.save(
+            Trace(
+                trace_id="trace-too-many-steps",
+                result="complete",
+                outcome="completed",
+                metadata={"provenance": self.OWNER.provenance},
+                steps=[
+                    TraceStep(step_type=StepType.GENERATE, timestamp=float(index))
+                    for index in range(257)
+                ],
+            )
+        )
+
+        response = client.get(
+            "/v1/traces/trace-too-many-steps/tool-execution-proof",
+            headers={"X-Test-Principal": "owner"},
+        )
+
+        assert response.status_code == 409
+        assert response.json() == {"detail": "Trace proof unavailable"}
         store.close()
 
     def test_list_and_stats_are_scoped_to_principal(self, monkeypatch, tmp_path):

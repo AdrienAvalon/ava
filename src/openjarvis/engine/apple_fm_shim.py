@@ -168,7 +168,9 @@ async def chat_completions(
                     {
                         "index": 0,
                         "delta": {},
-                        "finish_reason": "stop",
+                        # The SDK exposes text snapshots but no terminal cause.
+                        # EOF alone cannot prove a natural model stop.
+                        "finish_reason": "length",
                     }
                 ],
             }
@@ -192,7 +194,7 @@ async def chat_completions(
                 {
                     "index": 0,
                     "message": {"role": "assistant", "content": text},
-                    "finish_reason": "stop",
+                    "finish_reason": "length",
                 }
             ],
             "usage": {

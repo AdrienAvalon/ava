@@ -343,6 +343,46 @@ async def test_stream_full_anthropic_finish_reason():
     assert result2[0].finish_reason == "stop"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("upstream_reason", "api_reason"),
+    [
+        ("stop_sequence", "stop"),
+        ("max_tokens", "length"),
+        ("pause_turn", "length"),
+        ("model_context_window_exceeded", "length"),
+        ("refusal", "content_filter"),
+        ("future_sdk_reason", "length"),
+    ],
+)
+async def test_stream_full_anthropic_ne_consacre_pas_les_fins_incompletes(
+    upstream_reason: str,
+    api_reason: str,
+) -> None:
+    message_delta = MagicMock()
+    message_delta.stop_reason = upstream_reason
+    stream = MagicMock()
+    stream.__enter__ = MagicMock(
+        return_value=iter([_anthropic_event("message_delta", delta=message_delta)])
+    )
+    stream.__exit__ = MagicMock(return_value=False)
+    anthropic = MagicMock()
+    anthropic.messages.stream.return_value = stream
+    engine = _make_cloud_engine(anthropic_client=anthropic)
+
+    chunks = [
+        chunk
+        async for chunk in engine._stream_full_anthropic(
+            [Message(role=Role.USER, content="test")],
+            model="claude-sonnet-4-20250514",
+            temperature=0.7,
+            max_tokens=100,
+        )
+    ]
+
+    assert [chunk.finish_reason for chunk in chunks] == [api_reason]
+
+
 # ---------------------------------------------------------------------------
 # _prepare_anthropic_messages tests
 # ---------------------------------------------------------------------------

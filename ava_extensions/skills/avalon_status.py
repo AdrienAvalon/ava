@@ -12,6 +12,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from ava_extensions.tool_capabilities import INFRA_OBSERVE, NETWORK_FETCH
 from openjarvis.core.registry import ToolRegistry
 from openjarvis.core.types import ToolResult
 from openjarvis.tools._stubs import BaseTool, ToolSpec
@@ -378,7 +379,7 @@ class AvalonStatusTool(BaseTool):
     """Interroge le Control Plane v2 et résume létat global de linfra."""
 
     tool_id = "avalon_status"
-    is_local = True
+    is_local = False
 
     @property
     def spec(self) -> ToolSpec:
@@ -415,6 +416,9 @@ class AvalonStatusTool(BaseTool):
             category="infra",
             latency_estimate=1.0,
             timeout_seconds=10.0,
+            required_capabilities=[NETWORK_FETCH, INFRA_OBSERVE],
+            requires_capability_policy=True,
+            metadata={"fixed_destination": "avalon-control-plane"},
         )
 
     def execute(self, **params: Any) -> ToolResult:

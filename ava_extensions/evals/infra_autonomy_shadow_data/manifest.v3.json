@@ -1,0 +1,62 @@
+{
+  "schema_version": "ava.infra-autonomy.shadow-manifest/v3",
+  "manifest_id": "ava.infra-autonomy.synthetic-fr-shadow-manifest-v3",
+  "artifact": {
+    "id": "ava.infra-autonomy.synthetic-fr-shadow-v3",
+    "version": "3.0.0",
+    "kind": "synthetic-infra-autonomy-offline-shadow",
+    "immutable": true
+  },
+  "freeze": {
+    "state": "frozen",
+    "requires_version_bump": true,
+    "v2_untouched": true
+  },
+  "provenance": {
+    "authoring_method": "derived-from-frozen-synthetic-v2",
+    "contains_personal_data": false,
+    "contains_production_data": false,
+    "contains_real_secrets": false,
+    "production_use": "forbidden"
+  },
+  "execution_policy": {
+    "network_default": "forbidden",
+    "loopback": "explicit-only",
+    "provider_calls": "configured-anthropic-explicit-only",
+    "tools": "forbidden",
+    "memory": "forbidden",
+    "traces": "forbidden",
+    "perception": "forbidden",
+    "learning": "forbidden",
+    "generate_calls_per_case": 1,
+    "retry": "forbidden",
+    "repair": "forbidden",
+    "runtime_observation": "runner-owned-oracle"
+  },
+  "files": {
+    "model_view": {
+      "path": "model-view.v3.json",
+      "sha256": "sha256:50a7440d7ccaf56987918894a710825b25d9bec0bba25e8a11c0bbee6b8303cc"
+    },
+    "oracle": {
+      "path": "oracle.v3.json",
+      "sha256": "sha256:32b3d89b043384ed8483eb29a234ce40bf05e3f49134c21493e34fba13bbacc4"
+    },
+    "manifest_schema": {
+      "path": "manifest.schema.v3.json",
+      "sha256": "sha256:3e2ddd9c2a61198efef231c85323da15b1218b0fc234f91c6133b0e8321516d7"
+    },
+    "model_view_schema": {
+      "path": "model-view.schema.v3.json",
+      "sha256": "sha256:aff0734ec0e0aa1d81182d07ed94de8c2d5f52b9dfffdf2b7ee6a78060b1ea92"
+    },
+    "oracle_schema": {
+      "path": "oracle.schema.v3.json",
+      "sha256": "sha256:35e1e7af7cd7f174b7df582b12893032edff51cac692f7e394fc0e769b7cca9f"
+    },
+    "responses_schema": {
+      "path": "responses.schema.v3.json",
+      "sha256": "sha256:0d3eeff5e1c51b87fd5075f6a7c19c447d2df7b28b0b51a5a966f589e943fd90"
+    }
+  }
+}

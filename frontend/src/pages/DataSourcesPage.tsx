@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { motion } from 'motion/react';
-import { useAppStore } from '../lib/store';
+import type { CachedConnector } from '../lib/store';
 import {
   fetchManagedAgents,
   fetchAgentChannels,
@@ -595,8 +595,7 @@ function SyncStatusDisplay({
 }
 
 function DataSourcesSection() {
-  const cachedConnectors = useAppStore((s) => s.cachedConnectors);
-  const setCachedConnectors = useAppStore((s) => s.setCachedConnectors);
+  const [cachedConnectors, setCachedConnectors] = useState<CachedConnector[] | null>(null);
   const connectors = cachedConnectors ?? [];
   const isFirstLoad = cachedConnectors === null;
   const [syncStatuses, setSyncStatuses] = useState<Record<string, SyncStatus>>({});
@@ -1961,16 +1960,70 @@ function MemorySection() {
 // Main page
 // ---------------------------------------------------------------------------
 
+export type ManagedAgentLoadState = 'loading' | 'ready' | 'unauthorized' | 'error';
+
+export function dataSourcesPrincipalKey(issuer: unknown, subject: unknown): string | null {
+  if (
+    typeof issuer !== 'string'
+    || !issuer.trim()
+    || typeof subject !== 'string'
+    || !subject.trim()
+  ) return null;
+  return `${issuer.trim()}:${subject.trim()}`;
+}
+
+export function managedAgentLoadStateForError(error: unknown): ManagedAgentLoadState {
+  if (
+    error instanceof Error
+    && /(^|\D)401(\D|$)/.test(error.message)
+  ) {
+    return 'unauthorized';
+  }
+  return 'error';
+}
+
+export function shouldAutoCreateManagedAgent({
+  activeTab,
+  hasAgent,
+  creatingAgent,
+  loadState,
+  creationAttempted,
+}: {
+  activeTab: 'sources' | 'messaging' | 'memory';
+  hasAgent: boolean;
+  creatingAgent: boolean;
+  loadState: ManagedAgentLoadState;
+  creationAttempted: boolean;
+}): boolean {
+  return activeTab === 'messaging'
+    && !hasAgent
+    && !creatingAgent
+    && loadState === 'ready'
+    && !creationAttempted;
+}
+
 export function DataSourcesPage() {
   const [agents, setAgents] = useState<ManagedAgent[]>([]);
   const [activeTab, setActiveTab] = useState<'sources' | 'messaging' | 'memory'>('sources');
   const [creatingAgent, setCreatingAgent] = useState(false);
+  const [agentLoadState, setAgentLoadState] = useState<ManagedAgentLoadState>('loading');
+  const creationAttempted = useRef(false);
 
-  const loadAgents = useCallback(() => {
-    fetchManagedAgents().then(setAgents).catch(() => {});
+  useEffect(() => {
+    let current = true;
+    void fetchManagedAgents()
+      .then((loadedAgents) => {
+        if (!current) return;
+        setAgents(loadedAgents);
+        setAgentLoadState('ready');
+      })
+      .catch((error: unknown) => {
+        if (!current) return;
+        setAgents([]);
+        setAgentLoadState(managedAgentLoadStateForError(error));
+      });
+    return () => { current = false; };
   }, []);
-
-  useEffect(() => { loadAgents(); }, [loadAgents]);
 
   // Pick the first agent for messaging channel bindings.
   // If none exists and user opens Messaging tab, auto-create a default one.
@@ -1978,6 +2031,8 @@ export function DataSourcesPage() {
 
   const ensureAgent = useCallback(async (): Promise<string | null> => {
     if (firstAgent) return firstAgent.id;
+    if (agentLoadState !== 'ready' || creationAttempted.current) return null;
+    creationAttempted.current = true;
     setCreatingAgent(true);
     try {
       const agent = await createManagedAgent({
@@ -1986,19 +2041,26 @@ export function DataSourcesPage() {
       });
       setAgents((prev) => [...prev, agent]);
       return agent.id;
-    } catch {
+    } catch (error: unknown) {
+      setAgentLoadState(managedAgentLoadStateForError(error));
       return null;
     } finally {
       setCreatingAgent(false);
     }
-  }, [firstAgent]);
+  }, [agentLoadState, firstAgent]);
 
   // Auto-create agent when switching to messaging tab
   useEffect(() => {
-    if (activeTab === 'messaging' && !firstAgent && !creatingAgent) {
-      ensureAgent();
+    if (shouldAutoCreateManagedAgent({
+      activeTab,
+      hasAgent: Boolean(firstAgent),
+      creatingAgent,
+      loadState: agentLoadState,
+      creationAttempted: creationAttempted.current,
+    })) {
+      void ensureAgent();
     }
-  }, [activeTab, firstAgent, creatingAgent, ensureAgent]);
+  }, [activeTab, agentLoadState, firstAgent, creatingAgent, ensureAgent]);
 
   const tabs = [
     { id: 'sources' as const, label: 'Data Sources', icon: Database },
@@ -2057,6 +2119,14 @@ export function DataSourcesPage() {
             <div className="flex items-center gap-3 p-4 text-sm" style={{ color: 'var(--color-text-secondary)' }}>
               <Loader2 size={16} className="animate-spin" style={{ color: 'var(--color-accent)' }} />
               Setting up your assistant...
+            </div>
+          ) : agentLoadState === 'unauthorized' ? (
+            <div className="p-4 text-sm" style={{ color: 'var(--color-error)' }}>
+              Authentication expired. Sign in again before configuring messaging channels.
+            </div>
+          ) : agentLoadState === 'error' ? (
+            <div className="p-4 text-sm" style={{ color: 'var(--color-error)' }}>
+              Unable to load managed agents.
             </div>
           ) : null
         )}

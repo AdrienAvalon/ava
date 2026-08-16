@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ava:infra-autonomy:shadow-oracle:v3",
+  "title": "Oracle runner-owned du shadow d'autonomie infrastructure Ava v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "artifact_id", "version", "frozen", "source", "runtime_observation_owner", "cases"],
+  "properties": {
+    "schema_version": {"const": "ava.infra-autonomy.shadow-oracle/v3"},
+    "artifact_id": {"type": "string", "minLength": 1},
+    "version": {"const": "3.0.0"},
+    "frozen": {"const": true},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evaluation_manifest", "evaluation_manifest_sha256", "corpus_sha256", "runtime_fixture_sha256"],
+      "properties": {
+        "evaluation_manifest": {"const": "../infra_autonomy/data/manifest.v2.json"},
+        "evaluation_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "corpus_sha256": {"$ref": "#/$defs/sha256"},
+        "runtime_fixture_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "runtime_observation_owner": {"const": "runner"},
+    "cases": {"type": "array", "minItems": 1, "items": {"type": "object"}}
+  },
+  "$defs": {"sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}}
+}

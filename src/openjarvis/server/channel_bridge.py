@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any, Dict, List, Optional
 
 from openjarvis.channels._stubs import BaseChannel, ChannelStatus
-from openjarvis.core.events import EventBus, EventType
+from openjarvis.core.events import Event, EventBus, EventType
+from openjarvis.engine._finish import conservative_finish_reason
 from openjarvis.server.session_store import SessionStore
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_LENGTH = 4000
 _SMS_MAX_LENGTH = 1600
+_MANAGED_AGENT_COMMANDS_UNAVAILABLE = (
+    "Managed-agent commands are unavailable on messaging channels until "
+    "a verified principal mapping is configured."
+)
+_CHAT_FAILURE_MESSAGE = (
+    "Sorry, I couldn't complete that response. Please try again in a moment."
+)
 
 _HELP_TEXT = """\
 Available commands:
@@ -28,13 +35,16 @@ Available commands:
 /help — show this message\
 """
 
-# Events the bridge subscribes to for notifications
-_NOTIFICATION_EVENTS = [
-    EventType.AGENT_TICK_END,
-    EventType.AGENT_TICK_ERROR,
-    EventType.AGENT_BUDGET_EXCEEDED,
-    EventType.SCHEDULER_TASK_END,
-]
+# Managed-agent and scheduler events carry private prompts, summaries, results
+# and errors, but channel sessions do not yet have a verified channel-to-owner
+# mapping. Keep both the subscription list and the callback itself fail-closed
+# so a future accidental subscription cannot create a cross-principal broadcast.
+_UNSCOPED_NOTIFICATION_EVENTS = frozenset(
+    event_type for event_type in EventType if event_type.name.startswith("AGENT_")
+) | {EventType.SCHEDULER_TASK_END}
+
+# No event is eligible until notifications can be routed to a verified owner.
+_NOTIFICATION_EVENTS: tuple[EventType, ...] = ()
 
 
 class ChannelBridge:
@@ -59,7 +69,6 @@ class ChannelBridge:
         self._system = system
         self._agent_manager = agent_manager
         self._deep_research_agent = deep_research_agent
-        self._notification_timestamps: Dict[str, float] = {}
         self._subscribe_notifications()
 
     # --------------------------------------------------------------
@@ -163,12 +172,10 @@ class ChannelBridge:
             return self._handle_sessions(sender_id)
 
         if cmd == "/agents":
-            return self._handle_agents_list()
+            return _MANAGED_AGENT_COMMANDS_UNAVAILABLE
 
-        if cmd == "/agent" and len(parts) >= 2:
-            agent_id = parts[1]
-            rest = parts[2] if len(parts) > 2 else "status"
-            return self._handle_agent_command(agent_id, rest)
+        if cmd == "/agent":
+            return _MANAGED_AGENT_COMMANDS_UNAVAILABLE
 
         # Unknown command — fall through to chat
         return None
@@ -180,40 +187,6 @@ class ChannelBridge:
             self._session_store.clear_pending_response(sender_id, channel_type)
             return pending
         return "No pending response."
-
-    def _handle_agents_list(self) -> str:
-        if not self._agent_manager:
-            return "No agent manager configured."
-        agents = self._agent_manager.list_agents()
-        if not agents:
-            return "No agents currently running."
-        lines = []
-        for a in agents:
-            name = a.get("name", a.get("agent_id", "unknown"))
-            status = a.get("status", "unknown")
-            lines.append(f"  {name} — {status}")
-        return "Running agents:\n" + "\n".join(lines)
-
-    def _handle_agent_command(self, agent_id: str, action: str) -> str:
-        if not self._agent_manager:
-            return "No agent manager configured."
-        action_lower = action.strip().lower()
-        if action_lower == "status":
-            state = self._agent_manager.get_agent(agent_id)
-            if state is None:
-                return f"Agent '{agent_id}' not found."
-            name = state.get("name", agent_id)
-            status = state.get("status", "unknown")
-            return f"Agent '{name}': {status}"
-        if action_lower == "pause":
-            self._agent_manager.pause_agent(agent_id)
-            return f"Agent '{agent_id}' paused."
-        if action_lower == "resume":
-            self._agent_manager.resume_agent(agent_id)
-            return f"Agent '{agent_id}' resumed."
-        # Treat as a message to the agent
-        result = self._agent_manager.send_message(agent_id, action)
-        return str(result) if result else f"Message sent to agent '{agent_id}'."
 
     # --------------------------------------------------------------
     # Chat handling
@@ -239,13 +212,11 @@ class ChannelBridge:
         channel_type: str,
         max_length: int,
     ) -> str:
-        self._session_store.append_message(sender_id, channel_type, "user", content)
-
         # Build context from conversation history
         session = self._session_store.get_or_create(sender_id, channel_type)
         history = session.get("conversation_history", [])
         context_lines = []
-        for msg in history[:-1]:  # exclude the message we just appended
+        for msg in history:
             context_lines.append(f"{msg['role']}: {msg['content']}")
         context_str = "\n".join(context_lines)
 
@@ -259,36 +230,37 @@ class ChannelBridge:
         if self._deep_research_agent is not None:
             try:
                 result = self._deep_research_agent.run(content)
-                response_text = result.content or "No results found."
-            except Exception as exc:
-                logger.error("DeepResearch agent failed: %s", exc)
-                response_text = f"Research error: {exc}"
+                response_text = getattr(result, "content", "")
+                metadata = getattr(result, "metadata", {}) or {}
+                finish_reason = conservative_finish_reason(
+                    metadata.get("finish_reason")
+                )
+            except Exception:
+                logger.exception("DeepResearch agent failed")
+                return _CHAT_FAILURE_MESSAGE
         elif self._system is not None:
             try:
                 result = self._system.ask(query)
-                response_text = result.get("content", str(result))
+                response_text = result.get("content", "")
+                finish_reason = conservative_finish_reason(result.get("finish_reason"))
             except Exception:
                 logger.exception("Error in JarvisSystem.ask()")
-                error_msg = (
-                    "Sorry, I couldn't process that right now. Try again in a moment."
-                )
-                self._session_store.append_message(
-                    sender_id, channel_type, "assistant", error_msg
-                )
-                return error_msg
+                return _CHAT_FAILURE_MESSAGE
         else:
-            error_msg = (
-                "Sorry, I couldn't process that right now. Try again in a moment."
-            )
-            self._session_store.append_message(
-                sender_id, channel_type, "assistant", error_msg
-            )
-            return error_msg
+            return _CHAT_FAILURE_MESSAGE
+
+        if (
+            finish_reason != "stop"
+            or not isinstance(response_text, str)
+            or not response_text.strip()
+        ):
+            return _CHAT_FAILURE_MESSAGE
 
         # Format and possibly truncate
         formatted = self._format_response(
             sender_id, channel_type, response_text, max_length
         )
+        self._session_store.append_message(sender_id, channel_type, "user", content)
         self._session_store.append_message(
             sender_id, channel_type, "assistant", response_text
         )
@@ -318,62 +290,10 @@ class ChannelBridge:
         for event_type in _NOTIFICATION_EVENTS:
             self._bus.subscribe(event_type, self._on_notification_event)
 
-    def _on_notification_event(self, event) -> None:  # noqa: ANN001
-        event_key = str(event.event_type)
-        now = time.time()
-
-        # Rate limit: max 1 per event type per 5 minutes
-        last = self._notification_timestamps.get(event_key, 0)
-        if now - last < 300:
+    def _on_notification_event(self, event: Event) -> None:
+        if event.event_type in _UNSCOPED_NOTIFICATION_EVENTS:
             return
-        self._notification_timestamps[event_key] = now
-
-        message = self._format_notification(event)
-        if not message:
-            return
-
-        targets = self._session_store.get_notification_targets()
-        for target in targets:
-            pref_channel = target["preferred_notification_channel"]
-            sender_id = target["sender_id"]
-            self._send_notification(pref_channel, sender_id, message)
-
-    def _format_notification(  # noqa: ANN201
-        self,
-        event,  # noqa: ANN001
-    ) -> Optional[str]:
-        data = event.data or {}
-        name = data.get("agent_name", data.get("name", "unknown"))
-
-        if event.event_type == EventType.AGENT_TICK_END:
-            summary = data.get("summary", data.get("result", ""))
-            return f"Agent '{name}' finished: {summary}" if summary else None
-        if event.event_type == EventType.AGENT_TICK_ERROR:
-            error = data.get("error", "unknown error")
-            return f"Agent '{name}' error: {error}"
-        if event.event_type == EventType.AGENT_BUDGET_EXCEEDED:
-            return f"Agent '{name}' hit budget limit."
-        if event.event_type == EventType.SCHEDULER_TASK_END:
-            if data.get("success", True):
-                return f"Scheduled task '{name}' completed."
-            error = data.get("error", "unknown error")
-            return f"Scheduled task '{name}' failed: {error}"
-        return None
-
-    def _send_notification(
-        self,
-        channel_type: str,
-        sender_id: str,
-        message: str,
-    ) -> None:
-        ch = self._channels.get(channel_type)
-        if ch is None:
-            logger.warning(
-                "No adapter for notification channel %s",
-                channel_type,
-            )
-            return
-        try:
-            ch.send(sender_id, message)
-        except Exception:
-            logger.exception("Failed to send notification to %s", channel_type)
+        logger.debug(
+            "Ignoring notification event %s without a verified owner mapping",
+            event.event_type,
+        )

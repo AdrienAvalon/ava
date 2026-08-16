@@ -24,6 +24,11 @@
       "uniqueItems": true,
       "items": {"$ref": "#/$defs/nonEmptyString"}
     },
+    "indexArray": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "integer", "minimum": 0}
+    },
     "fact": {
       "type": "object",
       "additionalProperties": false,
@@ -78,15 +83,17 @@
             "allowed_tools": {"$ref": "#/$defs/stringArray"},
             "visible_facts": {"type": "array", "items": {"$ref": "#/$defs/fact"}},
             "forbidden_canaries": {"$ref": "#/$defs/stringArray"},
-            "allowed_memory_claim_ids": {"$ref": "#/$defs/stringArray"}
+            "allowed_memory_claim_ids": {"$ref": "#/$defs/stringArray"},
+            "allowed_exact_echo_turn_indexes": {"$ref": "#/$defs/indexArray"}
           }
         },
         "secondary": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["warmth_any_of", "continuity_all_of", "accuracy_all_of"],
+          "required": ["warmth_any_of", "wit_any_of", "continuity_all_of", "accuracy_all_of"],
           "properties": {
             "warmth_any_of": {"$ref": "#/$defs/stringArray"},
+            "wit_any_of": {"$ref": "#/$defs/stringArray"},
             "continuity_all_of": {"$ref": "#/$defs/stringArray"},
             "accuracy_all_of": {"$ref": "#/$defs/stringArray"}
           }

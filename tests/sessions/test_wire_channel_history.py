@@ -49,7 +49,7 @@ class TestWireChannelHistory:
 
         def capturing_ask(query, **kwargs):
             captured.append(kwargs.get("prior_messages", []))
-            return {"content": "reply"}
+            return {"content": "reply", "finish_reason": "stop"}
 
         minimal_system.ask = capturing_ask
 
@@ -90,7 +90,7 @@ class TestWireChannelHistory:
 
         def capturing_ask(query, **kwargs):
             captured.append(kwargs.get("prior_messages", None))
-            return {"content": "reply"}
+            return {"content": "reply", "finish_reason": "stop"}
 
         minimal_system.ask = capturing_ask
 

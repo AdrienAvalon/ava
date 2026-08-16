@@ -242,6 +242,53 @@ jobs:
                   raise
           PY
 
+  core:
+    name: Coeur OpenJarvis modifie par Ava
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # L'import du paquet ne doit jamais lancer le collecteur de perception dans
+      # un runner CI. Ce job couvre le coeur complet, pas un daemon actif.
+      AVA_PERCEPTION: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer Python et uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Installer Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Synchroniser l'environnement complet
+        run: |
+          uv python install
+          uv sync --extra dev --extra framework-comparison --extra server --extra inference-cloud
+
+      - name: Construire l'extension Rust requise par le coeur
+        run: uv run maturin develop --manifest-path rust/crates/openjarvis-python/Cargo.toml
+
+      # `ci.yml` ne s'execute que sur `main`, alors que le fork vit sur
+      # `ava-main`. Des dizaines de fichiers sous src/openjarvis/ resteraient donc
+      # sans barriere durable si ava-ci se limitait aux extensions.
+      - name: Suite coeur hors integrations externes
+        run: >-
+          uv run pytest tests/ -n auto -q --tb=short
+          -m "not live and not cloud and not hub"
+
+      - name: Ruff coeur et tests
+        # Le fork porte de longs commentaires de preuve déjà suivis. E501 reste donc
+        # informatif, tandis que toutes les autres règles (imports, noms, erreurs de
+        # syntaxe et pyflakes compris) bloquent durablement la branche Ava.
+        run: uv run ruff check src/ tests/ --ignore E501
+
+      - name: Longueur des lignes coeur (informatif)
+        run: uv run ruff check src/ tests/ --select E501 || true
+
+      - name: Formatage coeur et tests
+        run: uv run ruff format --check src/ tests/
+
   frontend:
     name: Frontend (types + build)
     runs-on: ubuntu-latest

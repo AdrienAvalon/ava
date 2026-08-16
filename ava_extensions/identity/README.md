@@ -34,7 +34,9 @@ Control Plane :
 
 L'assertion CP est un JWT HS256 de durée maximale 120 secondes avec exactement
 `iss`, `aud`, `sub`, `iat`, `nbf`, `exp` et `jti`. Son `sub` Matrix a la forme
-`matrix:<sender>`. La clé est lue dans un fichier runtime régulier, non suivi
+`matrix:<sender>`. La seule autorité synthétique admise est
+`scheduler:ava-veille`, utilisée par la veille plan-only et jamais liée au profil
+relationnel. Toute autre grammaire de service est refusée. La clé est lue dans un fichier runtime régulier, non suivi
 par lien symbolique, appartenant à l'UID du processus, owner-only et d'au moins
 32 octets ; elle n'est jamais placée dans l'environnement ou le dépôt.
 
@@ -68,6 +70,22 @@ Une politique absente, révoquée, ambiguë, invalide ou trop permissive désact
 l'overlay. Une credential présente mais invalide produit un HTTP 401. L'absence
 complète de credential et un principal vérifié mais non lié conservent la persona
 commune, sans révéler le profil privé.
+
+## Contexte d'adresse vérifié
+
+`AVA_PRINCIPAL_CONTEXT_FILE` désigne un second registre, distinct de la politique
+relationnelle et des capacités. Il associe seulement un principal déjà vérifié à
+un `display_name` et une `preferred_language`. Cela permet à Ava de tutoyer et de
+nommer naturellement son interlocuteur même si l'overlay privé est rollbacké,
+sans transformer un nom en mémoire, relation ou autorisation.
+
+Le document v1 contient exactement `version` et `bindings`; chaque binding porte
+exactement `provider`, `issuer`, `subject`, `display_name` et
+`preferred_language`. En production, le fichier est régulier, sans lien dur ou
+symbolique, `root:avalon 0640`, borné à 64 Kio et épinglé par le descripteur
+systemd root-owned chargé après le `.env`. Une configuration annoncée mais
+absente, ambiguë ou invalide bloque la requête avant le modèle. Les identifiants
+OIDC et Matrix bruts ne sont jamais injectés dans le prompt.
 
 ## Frontière mémoire
 

@@ -13,8 +13,10 @@ class MockEngine:
     def __init__(self, responses: List[Dict[str, Any]]):
         self._responses = list(responses)
         self._call_count = 0
+        self.calls = []
 
     def generate(self, messages, **kwargs):
+        self.calls.append((list(messages), dict(kwargs)))
         if self._call_count < len(self._responses):
             resp = self._responses[self._call_count]
         else:
@@ -90,6 +92,7 @@ class TestContinuation:
         result_dict = agent._generate(messages)
         content = agent._check_continuation(result_dict, messages, max_continuations=2)
         assert content == "ABC"  # A + B + C, but not D
+        assert result_dict["finish_reason"] == "length"
 
     def test_empty_finish_reason(self):
         engine = MockEngine(
@@ -100,3 +103,61 @@ class TestContinuation:
         agent = ContinuationAgent(engine, "test-model")
         result = agent.run("Hi")
         assert result.content == "Done"
+
+    def test_anthropic_reasons_and_usage_are_normalized_and_accumulated(self):
+        engine = MockEngine(
+            [
+                {
+                    "content": "Partie 1",
+                    "finish_reason": "max_tokens",
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 4,
+                        "total_tokens": 14,
+                    },
+                },
+                {
+                    "content": " puis partie 2.",
+                    "finish_reason": "end_turn",
+                    "usage": {
+                        "prompt_tokens": 12,
+                        "completion_tokens": 5,
+                        "total_tokens": 17,
+                    },
+                },
+            ]
+        )
+        agent = ContinuationAgent(engine, "test-model")
+        messages = agent._build_messages("Continue")
+        response = agent._generate(messages)
+
+        content = agent._check_continuation(response, messages)
+
+        assert content == "Partie 1 puis partie 2."
+        assert response["finish_reason"] == "stop"
+        assert response["usage"] == {
+            "prompt_tokens": 22,
+            "completion_tokens": 9,
+            "total_tokens": 31,
+        }
+        assert len(engine.calls) == 2
+
+    def test_multiple_continuations_append_only_the_latest_segment(self):
+        engine = MockEngine(
+            [
+                {"content": "A", "finish_reason": "max_tokens"},
+                {"content": "B", "finish_reason": "max_tokens"},
+                {"content": "C", "finish_reason": "end_turn"},
+            ]
+        )
+        agent = ContinuationAgent(engine, "test-model")
+        messages = agent._build_messages("Hi")
+        response = agent._generate(messages)
+
+        assert agent._check_continuation(response, messages) == "ABC"
+        assistant_contents = [
+            message.content
+            for message in messages
+            if getattr(message, "role", None).value == "assistant"
+        ]
+        assert assistant_contents == ["A", "B"]

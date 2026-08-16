@@ -35,12 +35,12 @@ import datetime
 import logging
 from typing import Any
 
+from ava_extensions.perception import memoire_perception as memoire
+from ava_extensions.perception.qualification import Niveau
+from ava_extensions.tool_capabilities import FILE_READ, JOURNAL_READ
 from openjarvis.core.registry import ToolRegistry
 from openjarvis.core.types import ToolResult
 from openjarvis.tools._stubs import BaseTool, ToolSpec
-
-from ava_extensions.perception import memoire_perception as memoire
-from ava_extensions.perception.qualification import Niveau
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +133,8 @@ class JournalTool(BaseTool):
             category="memoire",
             latency_estimate=0.1,
             timeout_seconds=5.0,
+            required_capabilities=[FILE_READ, JOURNAL_READ],
+            requires_capability_policy=True,
         )
 
     def execute(self, **params: Any) -> ToolResult:

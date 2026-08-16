@@ -318,7 +318,23 @@ def test_assertion_cp_refuse_signature_audience_expiration_et_ttl(
     )
 
 
-def test_assertion_cp_refuse_nbf_future_sub_non_matrix_et_cle_permissive(
+def test_assertion_cp_accepte_le_scheduler_explicitement_borne(
+    assertion_contract,
+) -> None:
+    key, config = assertion_contract
+    now = int(time.time())
+    token = _service_token(key, now=now, subject="scheduler:ava-veille")
+
+    assert auth.verify_service_assertion(
+        token, config=config, now=now
+    ) == auth.Principal(
+        provider="service",
+        issuer="avalon-control-plane",
+        subject="scheduler:ava-veille",
+    )
+
+
+def test_assertion_cp_refuse_nbf_sujet_hors_grammaire_et_cle_permissive(
     assertion_contract,
 ) -> None:
     key, config = assertion_contract
@@ -337,6 +353,20 @@ def test_assertion_cp_refuse_nbf_future_sub_non_matrix_et_cle_permissive(
         )
         is None
     )
+    for subject in (
+        "scheduler:ava-chat",
+        "scheduler:ava-veille:admin",
+        "scheduler:*",
+        "matrix:owner",
+    ):
+        assert (
+            auth.verify_service_assertion(
+                _service_token(key, now=now, subject=subject),
+                config=config,
+                now=now,
+            )
+            is None
+        )
     config.key_file.chmod(0o644)
     assert (
         auth.verify_service_assertion(

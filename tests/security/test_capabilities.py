@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from openjarvis.security.capabilities import (
     DEFAULT_TOOL_CAPABILITIES,
     Capability,
@@ -92,6 +96,16 @@ class TestCapabilityPolicy:
         policy = CapabilityPolicy()
         assert policy.list_grants("unknown") == []
 
+    def test_empty_agent_can_never_be_granted(self):
+        policy = CapabilityPolicy()
+
+        with pytest.raises(ValueError, match="agent_id"):
+            policy.grant("", "file:read")
+        with pytest.raises(ValueError, match="agent_id"):
+            policy.deny("   ", "file:read")
+
+        assert policy.check("", "file:read") is False
+
     def test_save_and_load(self, tmp_path):
         path = tmp_path / "policy.json"
         policy = CapabilityPolicy()
@@ -107,6 +121,149 @@ class TestCapabilityPolicy:
         policy = CapabilityPolicy(policy_path="/nonexistent/path.json")
         # Should not raise, just have no policies
         assert policy.check("agent1", "file:read")
+
+    def test_missing_runtime_policy_is_empty_and_default_deny(self, tmp_path):
+        policy = CapabilityPolicy(
+            policy_path=str(tmp_path / "absent.json"),
+            default_deny=True,
+        )
+
+        assert policy.list_agents() == []
+        assert policy.check("owner", "file:read", "file_read") is False
+
+    def test_missing_policy_reload_clears_old_grants(self, tmp_path):
+        policy = CapabilityPolicy(default_deny=True)
+        policy.grant("owner", "file:read", "file_read")
+
+        policy._load_file(tmp_path / "absent.json")
+
+        assert policy.list_agents() == []
+        assert policy.check("owner", "file:read", "file_read") is False
+
+    @pytest.mark.parametrize(
+        "document",
+        [
+            {"agents": [], "extra": True},
+            {
+                "agents": [
+                    {
+                        "agent_id": "owner",
+                        "grants": [],
+                        "deny": [],
+                        "extra": True,
+                    }
+                ]
+            },
+            {
+                "agents": [
+                    {"agent_id": "owner", "grants": [], "deny": []},
+                    {"agent_id": "owner", "grants": [], "deny": []},
+                ]
+            },
+            {
+                "agents": [
+                    {
+                        "agent_id": "owner",
+                        "grants": [{"pattern": "file_read"}],
+                        "deny": [],
+                    }
+                ]
+            },
+            {
+                "agents": [
+                    {
+                        "agent_id": "owner",
+                        "grants": [],
+                    }
+                ]
+            },
+            {
+                "agents": [
+                    {
+                        "agent_id": "owner",
+                        "grants": [
+                            {"capability": "file:read", "pattern": "file_read"},
+                            {"capability": "file:read", "pattern": "file_read"},
+                        ],
+                        "deny": [],
+                    }
+                ]
+            },
+            {
+                "agents": [
+                    {
+                        "agent_id": "owner",
+                        "grants": [],
+                        "deny": ["file:read", "file:read"],
+                    }
+                ]
+            },
+            {
+                "agents": [
+                    {
+                        "agent_id": "owner",
+                        "grants": [{"capability": "file:read", "pattern": "file_read"}],
+                        "deny": ["file:read"],
+                    }
+                ]
+            },
+        ],
+    )
+    def test_strict_policy_rejects_extra_duplicate_and_overlap(
+        self, tmp_path, document
+    ):
+        path = tmp_path / "policy.json"
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+        with pytest.raises(ValueError):
+            CapabilityPolicy(policy_path=str(path), default_deny=True)
+
+    def test_strict_policy_rejects_duplicate_json_keys(self, tmp_path):
+        path = tmp_path / "policy.json"
+        path.write_text('{"agents": [], "agents": []}', encoding="utf-8")
+
+        with pytest.raises(ValueError, match="duplicate"):
+            CapabilityPolicy(policy_path=str(path), default_deny=True)
+
+    def test_strict_policy_rejects_symlink(self, tmp_path):
+        target = tmp_path / "target.json"
+        target.write_text('{"agents": []}', encoding="utf-8")
+        link = tmp_path / "policy.json"
+        link.symlink_to(target)
+
+        with pytest.raises(ValueError, match="cannot be opened"):
+            CapabilityPolicy(policy_path=str(link), default_deny=True)
+
+    def test_invalid_policy_does_not_install_a_valid_prefix(self, tmp_path):
+        policy = CapabilityPolicy(default_deny=True)
+        policy.grant("existing", "file:read", "file_read")
+        path = tmp_path / "policy.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "agents": [
+                        {
+                            "agent_id": "owner",
+                            "grants": [
+                                {
+                                    "capability": "file:read",
+                                    "pattern": "file_read",
+                                },
+                                {"capability": ""},
+                            ],
+                            "deny": [],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError):
+            policy._load_file(path)
+
+        assert policy.check("owner", "file:read", "file_read") is False
+        assert policy.check("existing", "file:read", "file_read") is True
 
     def test_default_tool_capabilities(self):
         assert "file:read" in DEFAULT_TOOL_CAPABILITIES.get("file_read", [])

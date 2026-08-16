@@ -97,6 +97,47 @@ def test_agent_produces_result(mock_engine, store):
     assert result.tool_results == []
 
 
+def test_agent_continues_anthropic_max_tokens_and_accumulates_usage(mock_engine, store):
+    first = _make_engine_response("Rapport partiel")
+    first["finish_reason"] = "max_tokens"
+    last = _make_engine_response(" puis conclusion.")
+    last["finish_reason"] = "end_turn"
+    mock_engine.generate.side_effect = [first, last]
+    agent = DeepResearchAgent(
+        mock_engine,
+        "test-model",
+        tools=[KnowledgeSearchTool(store=store)],
+    )
+
+    result = agent.run("Fais un rapport complet")
+
+    assert result.content == "Rapport partiel puis conclusion."
+    assert result.metadata["finish_reason"] == "stop"
+    assert result.metadata["prompt_tokens"] == 100
+    assert result.metadata["completion_tokens"] == 100
+    assert result.metadata["total_tokens"] == 200
+
+
+def test_agent_propagates_exhausted_continuation_as_length(mock_engine, store):
+    responses = []
+    for text in ("A", "B", "C"):
+        response = _make_engine_response(text)
+        response["finish_reason"] = "max_tokens"
+        responses.append(response)
+    mock_engine.generate.side_effect = responses
+    agent = DeepResearchAgent(
+        mock_engine,
+        "test-model",
+        tools=[KnowledgeSearchTool(store=store)],
+    )
+
+    result = agent.run("Réponse très longue")
+
+    assert result.content == "ABC"
+    assert result.metadata["finish_reason"] == "length"
+    assert result.metadata["total_tokens"] == 300
+
+
 def test_agent_uses_knowledge_search(mock_engine, store):
     """Engine returns tool_call first, then final answer; verify tool was called."""
     tool_call_response = _make_engine_response(
@@ -126,6 +167,140 @@ def test_agent_uses_knowledge_search(mock_engine, store):
     assert result.tool_results[0].tool_name == "knowledge_search"
     assert result.tool_results[0].success is True
     assert "migration" in result.content.lower() or "Kubernetes" in result.content
+
+
+def test_stop_terminal_with_structured_tool_call_executes(mock_engine, store):
+    tool_call_response = _make_engine_response(
+        "",
+        tool_calls=[
+            {
+                "id": "call_stop",
+                "type": "function",
+                "function": {
+                    "name": "knowledge_search",
+                    "arguments": json.dumps({"query": "Kubernetes migration"}),
+                },
+            }
+        ],
+    )
+    tool_call_response["finish_reason"] = "stop"
+    mock_engine.generate.side_effect = [
+        tool_call_response,
+        _make_engine_response("Recherche terminée."),
+    ]
+    agent = DeepResearchAgent(
+        mock_engine,
+        "test-model",
+        tools=[KnowledgeSearchTool(store=store)],
+    )
+
+    result = agent.run("Recherche")
+
+    assert len(result.tool_results) == 1
+    assert result.metadata["finish_reason"] == "stop"
+
+
+def test_stop_terminal_with_invalid_tool_json_never_executes(mock_engine, store):
+    response = _make_engine_response(
+        "partial",
+        tool_calls=[
+            {
+                "id": "partial-call",
+                "type": "function",
+                "function": {
+                    "name": "knowledge_search",
+                    "arguments": '{"query":',
+                },
+            }
+        ],
+    )
+    response["finish_reason"] = "stop"
+    mock_engine.generate.return_value = response
+    agent = DeepResearchAgent(
+        mock_engine,
+        "test-model",
+        tools=[KnowledgeSearchTool(store=store)],
+    )
+    agent._executor.execute = MagicMock()
+
+    result = agent.run("Do not execute malformed JSON")
+
+    agent._executor.execute.assert_not_called()
+    assert result.metadata["finish_reason"] == "stop"
+    assert result.metadata["incomplete_tool_call"] is True
+
+
+@pytest.mark.parametrize("finish_reason", ["length", "max_tokens", None])
+def test_incomplete_tool_call_terminal_never_executes_tool(
+    mock_engine, store, finish_reason
+):
+    response = _make_engine_response(
+        "partial",
+        tool_calls=[
+            {
+                "id": "partial-call",
+                "type": "function",
+                "function": {
+                    "name": "knowledge_search",
+                    "arguments": json.dumps({"query": "partial"}),
+                },
+            }
+        ],
+    )
+    response["finish_reason"] = finish_reason
+    mock_engine.generate.return_value = response
+    agent = DeepResearchAgent(
+        mock_engine,
+        "test-model",
+        tools=[KnowledgeSearchTool(store=store)],
+    )
+    agent._executor.execute = MagicMock()
+
+    result = agent.run("Do not run partial args")
+
+    agent._executor.execute.assert_not_called()
+    assert result.tool_results == []
+    assert result.metadata["finish_reason"] == (
+        "length" if finish_reason == "max_tokens" else finish_reason
+    )
+
+
+def test_forced_synthesis_continues_and_reports_its_terminal_reason(mock_engine, store):
+    tool_call_response = _make_engine_response(
+        "",
+        tool_calls=[
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "knowledge_search",
+                    "arguments": json.dumps({"query": "Kubernetes migration"}),
+                },
+            }
+        ],
+    )
+    empty_final = _make_engine_response("")
+    synth_start = _make_engine_response("Synthèse")
+    synth_start["finish_reason"] = "max_tokens"
+    synth_end = _make_engine_response(" complète.")
+    synth_end["finish_reason"] = "end_turn"
+    mock_engine.generate.side_effect = [
+        tool_call_response,
+        empty_final,
+        synth_start,
+        synth_end,
+    ]
+    agent = DeepResearchAgent(
+        mock_engine,
+        "test-model",
+        tools=[KnowledgeSearchTool(store=store)],
+    )
+
+    result = agent.run("Synthétise la migration")
+
+    assert result.content == "Synthèse complète."
+    assert result.metadata["finish_reason"] == "stop"
+    assert result.metadata["total_tokens"] == 400
 
 
 def test_agent_respects_max_turns(mock_engine, store):

@@ -106,7 +106,13 @@ export type ResearchEvent =
       energy_j: number;
       duration_s: number;
     }
-  | { type: 'done'; usage?: TokenUsage }
+  | { type: 'final_sources'; sources: ResearchSource[] }
+  | {
+      type: 'done';
+      status: 'success' | 'error';
+      usage?: TokenUsage;
+      sources?: ResearchSource[];
+    }
   | { type: 'error'; message: string };
 
 export interface LiveEnergyMetrics {

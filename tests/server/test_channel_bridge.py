@@ -16,7 +16,7 @@ from openjarvis.channels._stubs import (
     ChannelHandler,
     ChannelStatus,
 )
-from openjarvis.core.events import EventBus
+from openjarvis.core.events import EventBus, EventType
 from openjarvis.server.channel_bridge import ChannelBridge
 from openjarvis.server.session_store import SessionStore
 
@@ -74,7 +74,10 @@ def bus():
 @pytest.fixture
 def mock_system():
     system = MagicMock()
-    system.ask.return_value = {"content": "Hello from Jarvis!"}
+    system.ask.return_value = {
+        "content": "Hello from Jarvis!",
+        "finish_reason": "stop",
+    }
     return system
 
 
@@ -131,9 +134,33 @@ class TestCommandParsing:
 
     def test_agents_command(self, bridge):
         bridge._agent_manager = MagicMock()
-        bridge._agent_manager.list_agents.return_value = []
         reply = bridge.handle_incoming("user1", "/agents", "fake")
-        assert "no" in reply.lower() or "agent" in reply.lower()
+        assert "verified principal mapping" in reply.lower()
+        bridge._agent_manager.list_agents.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "/agent",
+            "/agent agent-a",
+            "/agent agent-a status",
+            "/agent agent-a pause",
+            "/agent agent-a resume",
+            "/agent agent-a do something",
+        ],
+    )
+    def test_agent_commands_fail_closed_without_verified_principal(
+        self, bridge, command
+    ):
+        bridge._agent_manager = MagicMock()
+
+        reply = bridge.handle_incoming("user1", command, "fake")
+
+        assert "verified principal mapping" in reply.lower()
+        bridge._agent_manager.get_agent.assert_not_called()
+        bridge._agent_manager.pause_agent.assert_not_called()
+        bridge._agent_manager.resume_agent.assert_not_called()
+        bridge._agent_manager.send_message.assert_not_called()
 
     def test_unknown_command_falls_through_to_chat(self, bridge, mock_system):
         bridge.handle_incoming("user1", "/unknown_cmd", "fake")
@@ -168,10 +195,36 @@ class TestChatRouting:
         reply = bridge.handle_incoming("user1", "hello", "fake")
         assert "sorry" in reply.lower() or "couldn't" in reply.lower()
 
+    @pytest.mark.parametrize(
+        ("content", "finish_reason"),
+        [
+            ("private fragment", "length"),
+            ("private fragment", None),
+            ("", "stop"),
+        ],
+    )
+    def test_incomplete_system_response_is_not_persisted(
+        self, bridge, store, mock_system, content, finish_reason
+    ):
+        mock_system.ask.return_value = {
+            "content": content,
+            "finish_reason": finish_reason,
+        }
+
+        reply = bridge.handle_incoming("user1", "question", "fake")
+
+        assert "private fragment" not in reply
+        assert "complete" in reply.lower()
+        session = store.get_or_create("user1", "fake")
+        assert session["conversation_history"] == []
+
 
 class TestResponseFormatting:
     def test_truncates_long_sms_response(self, bridge, mock_system):
-        mock_system.ask.return_value = {"content": "x" * 2000}
+        mock_system.ask.return_value = {
+            "content": "x" * 2000,
+            "finish_reason": "stop",
+        }
         reply = bridge.handle_incoming(
             "user1",
             "tell me a story",
@@ -182,7 +235,40 @@ class TestResponseFormatting:
         assert "/more" in reply
 
     def test_short_response_not_truncated(self, bridge, mock_system):
-        mock_system.ask.return_value = {"content": "short answer"}
+        mock_system.ask.return_value = {
+            "content": "short answer",
+            "finish_reason": "stop",
+        }
         reply = bridge.handle_incoming("user1", "hi", "fake")
         assert reply == "short answer"
         assert "/more" not in reply
+
+
+class TestNotifications:
+    def test_managed_agent_canary_is_never_broadcast(self, bridge, bus, store):
+        store.get_or_create("other-principal", "fake")
+        store.set_notification_preference("other-principal", "fake", "fake")
+        fake = bridge._channels["fake"]
+        canary = "PRIVATE-CANARY-principal-a"
+
+        for event_type in (
+            EventType.AGENT_TICK_END,
+            EventType.AGENT_TICK_ERROR,
+            EventType.AGENT_BUDGET_EXCEEDED,
+            EventType.SCHEDULER_TASK_END,
+        ):
+            event = bus.publish(
+                event_type,
+                {
+                    "agent_name": canary,
+                    "name": canary,
+                    "summary": canary,
+                    "result": canary,
+                    "error": canary,
+                },
+            )
+            # Defense in depth: even a future accidental subscription must not
+            # make the callback broadcast a managed-agent event.
+            bridge._on_notification_event(event)
+
+        assert fake.sent == []

@@ -16,7 +16,14 @@ import concurrent.futures
 import re
 from typing import Any, List, Optional
 
-from openjarvis.agents._stubs import AgentContext, AgentResult, ToolUsingAgent
+from openjarvis.agents._stubs import (
+    AgentContext,
+    AgentResult,
+    ToolUsingAgent,
+    is_complete_tool_call_finish_reason,
+    normalize_finish_reason,
+    tool_call_arguments_are_complete,
+)
 from openjarvis.core.events import EventBus
 from openjarvis.core.registry import AgentRegistry
 from openjarvis.core.types import Message, Role, ToolCall, ToolResult
@@ -83,21 +90,26 @@ class OrchestratorAgent(ToolUsingAgent):
         **kwargs: Any,
     ) -> AgentResult:
         # ⚠ LE GARDE-FOU ANTI-BOUCLE DOIT REPARTIR DE ZÉRO À CHAQUE REQUÊTE.
-        #   Il vit sur l'instance d'agent, elle-même partagée par tout le service : sans cette
-        #   remise à zéro, ses compteurs s'accumulent sur la VIE DU PROCESSUS. Une conversation
-        #   NEUVE hérite alors des compteurs de la précédente, et un outil déjà sollicité se
+        #   Il vit sur l'instance d'agent, elle-même partagée par tout le service :
+        #   sans cette remise à zéro, ses compteurs s'accumulent sur la VIE DU
+        #   PROCESSUS. Une conversation NEUVE hérite alors des compteurs de la
+        #   précédente, et un outil déjà sollicité se
         #   retrouve refusé dès son premier appel.
-        # ⚠ CE DÉFAUT A ÉTÉ « CORRIGÉ » LE 2026-08-06 DANS native_react.py — QUI N'EST PAS
+        # ⚠ CE DÉFAUT A ÉTÉ « CORRIGÉ » LE 2026-08-06 DANS native_react.py —
+        #   QUI N'EST PAS
         #   L'AGENT QUI TOURNE. La configuration dit default_agent = "orchestrator" : le
         #   correctif était donc du CODE MORT, et le défaut intact.
         #   Mesure : deux questions identiques posées à 16 s d'intervalle. La première
-        #   interroge proxmox/backups/pbs/nas correctement ; la seconde voit TOUS ses appels à
+        #   interroge proxmox/backups/pbs/nas correctement ; la seconde voit TOUS
+        #   ses appels à
         #   avalon_status refusés et erre sur huit domaines sans rapport pour, selon ses
-        #   propres mots, « casser la détection ». Une boucle est un phénomène INTERNE À UNE
+        #   propres mots, « casser la détection ». Une boucle est un phénomène
+        #   INTERNE À UNE
         #   TÂCHE : relire le même document demain est légitime, dix fois dans la même
         #   réponse ne l'est pas.
-        # ⚠ C'EST ICI ET PAS DANS LES DEUX BRANCHES : `run` aiguille vers `_run_structured`
-        #   ou `_run_function_calling`. Poser la remise à zéro dans chacune la dupliquerait
+        # ⚠ C'EST ICI ET PAS DANS LES DEUX BRANCHES : `run` aiguille vers
+        #   `_run_structured` ou `_run_function_calling`. Poser la remise à zéro
+        #   dans chacune la dupliquerait
         #   et laisserait le prochain mode ajouté sans protection.
         if self._loop_guard:
             self._loop_guard.reinitialiser()
@@ -131,6 +143,9 @@ class OrchestratorAgent(ToolUsingAgent):
 
         all_tool_results: list[ToolResult] = []
         turns = 0
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+        finish_reason: Optional[str] = None
 
         for _turn in range(self._max_turns):
             turns += 1
@@ -139,9 +154,19 @@ class OrchestratorAgent(ToolUsingAgent):
                 messages = self._loop_guard.compress_context(messages)
 
             result = self._generate(messages)
-            content = result.get("content", "")
+            content = self._check_continuation(result, messages)
+            finish_reason = result.get("finish_reason")
+            usage = result.get("usage", {})
+            total_prompt_tokens += usage.get("prompt_tokens", 0)
+            total_completion_tokens += usage.get("completion_tokens", 0)
 
             parsed = self._parse_structured_response(content)
+            metadata = {
+                "finish_reason": finish_reason,
+                "prompt_tokens": total_prompt_tokens,
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": total_prompt_tokens + total_completion_tokens,
+            }
 
             # FINAL_ANSWER -> done
             if parsed["final_answer"]:
@@ -150,10 +175,22 @@ class OrchestratorAgent(ToolUsingAgent):
                     content=parsed["final_answer"],
                     tool_results=all_tool_results,
                     turns=turns,
+                    metadata=metadata,
                 )
 
             # TOOL -> execute
             if parsed["tool"]:
+                if not is_complete_tool_call_finish_reason(finish_reason) or not (
+                    tool_call_arguments_are_complete(parsed["input"] or "{}")
+                ):
+                    metadata["incomplete_tool_call"] = True
+                    self._emit_turn_end(turns=turns, incomplete_tool_call=True)
+                    return AgentResult(
+                        content=content,
+                        tool_results=all_tool_results,
+                        turns=turns,
+                        metadata=metadata,
+                    )
                 messages.append(Message(role=Role.ASSISTANT, content=content))
 
                 tool_call = ToolCall(
@@ -174,10 +211,20 @@ class OrchestratorAgent(ToolUsingAgent):
                 content=content,
                 tool_results=all_tool_results,
                 turns=turns,
+                metadata=metadata,
             )
 
         # Max turns exceeded
-        return self._max_turns_result(all_tool_results, turns)
+        return self._max_turns_result(
+            all_tool_results,
+            turns,
+            metadata={
+                "finish_reason": finish_reason,
+                "prompt_tokens": total_prompt_tokens,
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": total_prompt_tokens + total_completion_tokens,
+            },
+        )
 
     @staticmethod
     def _parse_structured_response(text: str) -> dict:
@@ -256,17 +303,18 @@ class OrchestratorAgent(ToolUsingAgent):
 
             result = self._generate(messages, **gen_kwargs)
 
-            # Accumulate token usage
-            usage = result.get("usage", {})
-            total_prompt_tokens += usage.get("prompt_tokens", 0)
-            total_completion_tokens += usage.get("completion_tokens", 0)
-
             content = result.get("content", "")
             raw_tool_calls = result.get("tool_calls", [])
 
             # No tool calls -> check continuation, then final answer
             if not raw_tool_calls:
                 content = self._check_continuation(result, messages)
+                # ``_check_continuation`` replaces result usage with the
+                # cumulative counters and its finish reason with the actual
+                # terminal reason from the last generation.
+                usage = result.get("usage", {})
+                total_prompt_tokens += usage.get("prompt_tokens", 0)
+                total_completion_tokens += usage.get("completion_tokens", 0)
                 content = self._strip_think_tags(content)
                 self._emit_turn_end(turns=turns, content_length=len(content))
                 return AgentResult(
@@ -277,13 +325,50 @@ class OrchestratorAgent(ToolUsingAgent):
                         # ⚠ LE MOTIF D'ARRET DU MODELE DOIT REMONTER JUSQU'A L'APPELANT.
                         #   Sans lui, une reponse coupee par `max_tokens` arrive avec
                         #   `finish_reason: "stop"` — donc indistinguable d'une reponse
-                        #   complete. Vecu le 2026-08-06 : 75 caracteres de texte visible
+                        #   complete. Vecu le 2026-08-06 : 75 caracteres de texte
+                        #   visible
                         #   sur une reponse de 4096 jetons entierement mangee par le
                         #   raisonnement etendu, annoncee comme terminee normalement.
                         "finish_reason": result.get("finish_reason"),
                         "prompt_tokens": total_prompt_tokens,
                         "completion_tokens": total_completion_tokens,
                         "total_tokens": total_prompt_tokens + total_completion_tokens,
+                    },
+                )
+
+            # Tool-use generations do not enter continuation, so account for
+            # their usage directly before executing the requested calls.
+            usage = result.get("usage", {})
+            total_prompt_tokens += usage.get("prompt_tokens", 0)
+            total_completion_tokens += usage.get("completion_tokens", 0)
+
+            finish_reason = normalize_finish_reason(result.get("finish_reason"))
+            complete_tool_calls = is_complete_tool_call_finish_reason(
+                finish_reason
+            ) and all(
+                isinstance(tc, dict)
+                and isinstance(tc.get("name"), str)
+                and bool(tc["name"].strip())
+                and tool_call_arguments_are_complete(tc.get("arguments"))
+                for tc in raw_tool_calls
+            )
+            if not complete_tool_calls:
+                content = self._strip_think_tags(content)
+                self._emit_turn_end(
+                    turns=turns,
+                    content_length=len(content),
+                    incomplete_tool_call=True,
+                )
+                return AgentResult(
+                    content=content,
+                    tool_results=all_tool_results,
+                    turns=turns,
+                    metadata={
+                        "finish_reason": finish_reason,
+                        "prompt_tokens": total_prompt_tokens,
+                        "completion_tokens": total_completion_tokens,
+                        "total_tokens": (total_prompt_tokens + total_completion_tokens),
+                        "incomplete_tool_call": True,
                     },
                 )
 

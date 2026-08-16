@@ -77,10 +77,10 @@ export interface DurableChatOptions {
   turnId: string;
   signal: AbortSignal;
   model?: string;
-  maxTokens?: number;
   fetchImpl?: ChatFetch;
   retryDelaysMs?: readonly number[];
   waitImpl?: (ms: number, signal: AbortSignal) => Promise<void>;
+  onRuntimeModel?: (model: string) => void;
 }
 
 /**
@@ -92,21 +92,20 @@ export async function demanderChatDurable({
   messages,
   turnId,
   signal,
-  model = MODEL,
-  maxTokens = MAX_TOKENS,
+  model,
   fetchImpl = fetch,
   retryDelaysMs = CHAT_RETRY_DELAYS_MS,
   waitImpl = attendreRetry,
+  onRuntimeModel,
 }: DurableChatOptions): Promise<string> {
   const headers = entetesIdentite({
     'Content-Type': 'application/json',
     [TURN_ID_HEADER]: turnId,
   });
   const body = JSON.stringify({
-    model,
+    ...(model ? { model } : {}),
     messages,
     stream: false,
-    max_tokens: maxTokens,
   });
   let lastError: unknown = new Error('Ava chat failed');
 
@@ -129,8 +128,14 @@ export async function demanderChatDurable({
         throw error;
       }
       const data = await response.json();
+      if (data?.choices?.[0]?.finish_reason !== 'stop') {
+        throw new NonRetryableChatError('réponse durable incomplète');
+      }
       const content: string = data?.choices?.[0]?.message?.content ?? '';
       if (!content) throw new Error('réponse durable vide');
+      if (typeof data?.model === 'string' && data.model) {
+        onRuntimeModel?.(data.model);
+      }
       return content;
     } catch (error) {
       if ((error as Error)?.name === 'AbortError') throw error;
@@ -161,26 +166,6 @@ export async function completerTourDurable(
   history.push(userMessage, { role: 'assistant', content: assistantText });
   return assistantText;
 }
-
-/**
- * ⚠ LE MODÈLE EST CODÉ EN DUR ICI, ET C'EST UN PIÈGE COÛTEUX (constaté le 2026-08-04).
- *
- * Le frontend envoie ce nom dans le corps de la requête, donc il **écrase la
- * configuration du serveur**. On a passé `default_model` à `claude-sonnet-5` côté VM en
- * croyant avoir changé le modèle d'Ava : le navigateur a continué d'envoyer
- * `claude-sonnet-4-6`, et rien ne l'a signalé — les deux existent, les deux répondent.
- *
- * ⚠ Le HUD affiche cette même constante : il annonçait donc fidèlement un modèle que le
- *   serveur n'avait pas choisi. Deux sources de vérité pour une seule valeur, dont une
- *   invisible depuis la machine.
- *
- * Correction de fond possible (non faite) : ne PAS envoyer `model` du tout et laisser le
- * serveur décider — c'est lui qui porte la configuration. Elle demande de vérifier que le
- * daemon retombe bien sur `config.server.model` quand le champ est absent, et de revoir
- * le HUD, qui n'aurait alors rien à afficher avant le premier échange.
- */
-const MODEL = 'claude-sonnet-5';
-const MAX_TOKENS = 800;
 
 /**
  * ⚠ LA VOIX D'AVA REPASSE EN SOUVERAIN (2026-08-04). Ces deux constantes valaient
@@ -243,6 +228,22 @@ function cleanForTTS(text: string): string {
     // Collapse whitespace
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+/** Split spoken text to the HTTP TTS contract without dropping long sentences. */
+export function splitTTSChunks(text: string, maxChars = 500): string[] {
+  if (!Number.isInteger(maxChars) || maxChars < 1) return [];
+  let remaining = cleanForTTS(text);
+  const chunks: string[] = [];
+  while (remaining.length > maxChars) {
+    const whitespace = remaining.lastIndexOf(' ', maxChars);
+    const cut = whitespace > 0 ? whitespace : maxChars;
+    const chunk = remaining.slice(0, cut).trim();
+    if (chunk) chunks.push(chunk);
+    remaining = remaining.slice(cut).trimStart();
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks;
 }
 
 // Shared AudioContext — instantiated lazily on the first user gesture so the
@@ -456,10 +457,10 @@ export function useDaemonChat() {
     //   `streamAva` nourrissent le terminal consultable. Les deux répondent à des
     //   besoins différents — la présence, et la mémoire.
     s.pushLine('user', userText);
-    // Le modèle et le moteur sont ceux que le client demande : le daemon ne les renvoie
-    // pas. C'est donc une intention, pas une observation — mais elle est au moins tirée
-    // d'une constante unique au lieu d'être recopiée dans le HUD.
-    s.setRuntime({ model: MODEL, engine: 'anthropic/cloud' });
+    // Le serveur est l'unique source du modèle effectif. Le HUD reste inconnu jusqu'à
+    // l'acquittement de la réponse, au lieu d'afficher une constante cliente susceptible
+    // de diverger de la release et de son attestation shadow.
+    s.setRuntime({ model: null, engine: null });
     s.setState('listening');
     await sleep(250);
 
@@ -548,7 +549,14 @@ export function useDaemonChat() {
       assembled = await completerTourDurable(
         history.current,
         userText,
-        (messages) => demanderChatDurable({ messages, turnId, signal }),
+        (messages) => demanderChatDurable({
+          messages,
+          turnId,
+          signal,
+          onRuntimeModel: (runtimeModel) => {
+            s.setRuntime({ model: runtimeModel, engine: 'anthropic/cloud' });
+          },
+        }),
       );
       if (assembled) {
         s.setState('speaking');
@@ -572,9 +580,11 @@ export function useDaemonChat() {
         //   Le cas à espace unique fonctionnait parfaitement : c'est pourquoi le défaut
         //   a survécu, tout en s'entendant à chaque réponse un peu longue.
         const { sentences, newEnd } = extractNewSentences(assembled, 0);
-        for (const sentence of sentences) enqueueSentence(sentence);
+        for (const sentence of sentences) {
+          for (const chunk of splitTTSChunks(sentence)) enqueueSentence(chunk);
+        }
         const reste = assembled.slice(newEnd).trim();
-        if (reste) enqueueSentence(reste);
+        for (const chunk of splitTTSChunks(reste)) enqueueSentence(chunk);
       }
       if (assembled) {
         // The server persisted the pair before returning it. There is deliberately
@@ -613,6 +623,10 @@ export function useDaemonChat() {
     if (playbackErrors.length > 0) {
       // eslint-disable-next-line no-console
       console.warn('TTS errors:', playbackErrors);
+      s.pushLine(
+        'system',
+        'Lecture audio incomplète : certaines parties n’ont pas pu être prononcées.',
+      );
     }
 
     // Settle

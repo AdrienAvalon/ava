@@ -274,6 +274,7 @@ class TestCodexGenerate:
         fake_response.status_code = 200
         fake_response.json.return_value = {
             "output_text": "Codex response!",
+            "status": "completed",
             "usage": {"input_tokens": 10, "output_tokens": 5},
         }
         fake_response.raise_for_status = mock.MagicMock()
@@ -302,6 +303,7 @@ class TestCodexGenerate:
         call_kwargs = mock_post.call_args
         sent_body = call_kwargs.kwargs["json"]
         assert sent_body["model"] == "gpt-5-mini-2025-08-07"
+        assert sent_body["max_output_tokens"] == 1024
         assert sent_body["stream"] is False
         assert "input" in sent_body  # Responses API format
         assert "messages" not in sent_body  # NOT chat completions
@@ -321,6 +323,7 @@ class TestCodexGenerate:
         fake_response = mock.MagicMock()
         fake_response.json.return_value = {
             "output": [{"content": [{"type": "output_text", "text": "From blocks!"}]}],
+            "status": "completed",
             "usage": {"input_tokens": 5, "output_tokens": 3},
         }
         fake_response.raise_for_status = mock.MagicMock()
@@ -350,6 +353,7 @@ class TestCodexGenerate:
         fake_response = mock.MagicMock()
         fake_response.json.return_value = {
             "output_text": "ok",
+            "status": "completed",
             "usage": {},
         }
         fake_response.raise_for_status = mock.MagicMock()
@@ -377,6 +381,49 @@ class TestCodexGenerate:
         # System message should NOT appear in input messages
         roles = [m["role"] for m in sent_body["input"]]
         assert "system" not in roles
+
+    @pytest.mark.parametrize(
+        ("status", "details", "expected"),
+        [
+            ("completed", None, "stop"),
+            ("incomplete", {"reason": "max_output_tokens"}, "length"),
+            ("failed", None, "failed"),
+            (None, None, None),
+        ],
+    )
+    def test_generate_codex_preserves_terminal_truth(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        status,
+        details,
+        expected,
+    ) -> None:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        payload = {
+            "output_text": "partial",
+            "usage": {"input_tokens": 1, "output_tokens": 2},
+        }
+        if status is not None:
+            payload["status"] = status
+        if details is not None:
+            payload["incomplete_details"] = details
+        fake_response = mock.MagicMock()
+        fake_response.json.return_value = payload
+        fake_response.raise_for_status = mock.MagicMock()
+        engine = CloudEngine()
+        engine._codex_client = {"token": "t", "url": "https://example.invalid"}
+
+        with mock.patch(
+            "openjarvis.engine.cloud.httpx.post",
+            return_value=fake_response,
+        ):
+            result = engine.generate(
+                [Message(role=Role.USER, content="Hi")],
+                model="codex/gpt-4o",
+            )
+
+        assert result["finish_reason"] == expected
 
     def test_codex_close(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)

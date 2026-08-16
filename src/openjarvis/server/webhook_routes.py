@@ -107,149 +107,16 @@ def create_webhook_router(
     # ----------------------------------------------------------
 
     @router.post("/twilio")
-    async def twilio_incoming(request: Request) -> Response:
-        form = await request.form()
-        params = dict(form)
-        signature = request.headers.get("X-Twilio-Signature", "")
-        url = str(request.url)
+    async def twilio_incoming(_request: Request) -> Response:
+        """Reject Twilio until inbound numbers map to verified managed owners.
 
-        # Fail closed: an unconfigured token means we cannot verify the sender,
-        # so reject rather than trust unsigned input.
-        if not twilio_auth_token:
-            logger.error("Twilio webhook rejected: TWILIO_AUTH_TOKEN not configured.")
-            return Response("Webhook signature verification not configured", 403)
-        if not _validate_twilio_signature(twilio_auth_token, url, params, signature):
-            return Response("Invalid signature", status_code=403)
+        A valid account-wide signature authenticates Twilio, not the managed
+        principal that owns an agent.  Selecting a process-global bridge or an
+        arbitrary stored binding would therefore cross owner boundaries.
+        """
 
-        from_number = params.get("From", "")
-        body = params.get("Body", "")
-
-        if not from_number or not body:
-            return Response(
-                content="<Response></Response>",
-                media_type="application/xml",
-            )
-
-        # Use bridge or app.state.channel_bridge
-        active_bridge = bridge or getattr(
-            request.app.state,
-            "channel_bridge",
-            None,
-        )
-
-        def _handle_twilio() -> None:
-
-            # Send ack via Twilio API
-            try:
-                from twilio.rest import Client
-
-                # Get creds from app state bindings
-                mgr = getattr(
-                    request.app.state,
-                    "agent_manager",
-                    None,
-                )
-                twilio_client = None
-                twilio_from = ""
-                if mgr:
-                    for agent in mgr.list_agents():
-                        aid = agent.get("id", "")
-                        for b in mgr.list_channel_bindings(aid):
-                            if b.get("channel_type") == "twilio":
-                                cfg = b.get("config", {})
-                                sid = cfg.get("account_sid", "")
-                                tok = cfg.get("auth_token", "")
-                                twilio_from = cfg.get(
-                                    "phone_number",
-                                    "",
-                                )
-                                if sid and tok:
-                                    twilio_client = Client(
-                                        sid,
-                                        tok,
-                                    )
-                                break
-
-                if twilio_client and twilio_from:
-                    twilio_client.messages.create(
-                        body=("Message received! Working on it now..."),
-                        from_=twilio_from,
-                        to=from_number,
-                    )
-            except Exception as _e:
-                logger.warning("Twilio ack failed: %s", _e)
-
-            # Process via bridge or agent directly
-            response = ""
-            if active_bridge:
-                response = active_bridge.handle_incoming(
-                    from_number,
-                    body,
-                    "twilio",
-                    max_length=1600,
-                )
-            else:
-                # Direct agent fallback
-                try:
-                    from openjarvis.agents.deep_research import (
-                        DeepResearchAgent,
-                    )
-                    from openjarvis.server.agent_manager_routes import (
-                        _build_deep_research_tools,
-                    )
-
-                    engine = getattr(
-                        request.app.state,
-                        "engine",
-                        None,
-                    )
-                    if engine:
-                        tools = _build_deep_research_tools(
-                            engine=engine,
-                            model="",
-                        )
-                        agent = DeepResearchAgent(
-                            engine=engine,
-                            model=getattr(
-                                engine,
-                                "_model",
-                                "",
-                            ),
-                            tools=tools,
-                            max_turns=5,
-                        )
-                        result = agent.run(body)
-                        response = result.content or ""
-                except Exception as _exc:
-                    response = f"Error: {_exc}"
-
-            # Send response via Twilio
-            if response and twilio_client and twilio_from:
-                try:
-                    clean = _format_for_sms(response)
-                    # Twilio SMS limit is 1600 chars
-                    if len(clean) > 1500:
-                        clean = clean[:1500] + "\n\n(truncated)"
-                    twilio_client.messages.create(
-                        body=clean,
-                        from_=twilio_from,
-                        to=from_number,
-                    )
-                except Exception as _e:
-                    logger.warning(
-                        "Twilio reply failed: %s",
-                        _e,
-                    )
-
-        task = asyncio.create_task(
-            asyncio.to_thread(_handle_twilio),
-        )
-        task.add_done_callback(_log_task_exception)
-
-        return Response(
-            content="<Response></Response>",
-            media_type="application/xml",
-        )
+        logger.warning("Twilio webhook rejected: managed owner mapping unavailable")
+        return Response("Channel unavailable", status_code=503)
 
     # ----------------------------------------------------------
     # BlueBubbles (iMessage)

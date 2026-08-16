@@ -74,6 +74,8 @@ class FileReadTool(BaseTool):
                 "required": ["path"],
             },
             category="filesystem",
+            required_capabilities=["file:read"],
+            requires_capability_policy=True,
         )
 
     def _is_path_allowed(self, path: Path) -> bool:

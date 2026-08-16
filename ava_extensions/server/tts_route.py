@@ -356,7 +356,11 @@ def effacer_conversation(request: Request) -> dict:
     utilisateur = conv.identite(request.headers)
     if utilisateur is None:
         raise HTTPException(status_code=401, detail="identité absente ou illisible")
-    return {"effacees": conv.effacer(utilisateur)}
+    try:
+        effacees = conv.effacer(utilisateur)
+    except conv.ConversationStorageError as exc:
+        raise HTTPException(status_code=503, detail="historique indisponible") from exc
+    return {"effacees": effacees}
 
 
 @router.delete("/conversation/turn/{turn_id}")

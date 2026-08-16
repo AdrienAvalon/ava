@@ -3,6 +3,15 @@ import { useImmersiveStore } from './immersiveStore';
 import { effacerConversation } from './memoireServeur';
 import { useViewportScale } from './useViewportScale';
 
+export async function effacerTranscriptApresConfirmation(
+  clear: () => void,
+  effacerServeur: () => Promise<boolean> = effacerConversation,
+): Promise<boolean> {
+  const efface = await effacerServeur();
+  if (efface) clear();
+  return efface;
+}
+
 /**
  * Terminal de conversation — l'historique complet de la session, défilant.
  *
@@ -136,8 +145,7 @@ export function TranscriptTerminal() {
                 //   côté serveur et dans `history.current`, donc Ava continuait de s'en
                 //   souvenir et de la renvoyer au modèle. L'utilisateur croyait avoir
                 //   effacé — c'est la pire forme d'échec pour une commande d'effacement.
-                clear();
-                void effacerConversation();
+                void effacerTranscriptApresConfirmation(clear);
               }}
               title="Effacer définitivement cette conversation — affichage, serveur et mémoire d'Ava"
               style={btnDiscret}

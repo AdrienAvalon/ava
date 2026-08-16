@@ -7,9 +7,10 @@
 # ne devient active qu'apres les validations hors ligne et la bascule atomique de
 # `AVA_CURRENT_LINK`.
 #
-# Avant la bascule, un dead-man persistant root-owned est arme sur la VM. Son garde
-# systemd et son timer restaurent la release precedente apres expiration, reboot ou
-# pointeur inattendu, meme si cette session SSH disparait definitivement.
+# Avant la bascule, la cible de retour passe le meme contrat de persona/politique que
+# la candidate, puis un dead-man persistant root-owned est arme sur la VM. Son garde
+# systemd et son timer restaurent cette release precedente apres expiration, reboot
+# ou pointeur inattendu, meme si cette session SSH disparait definitivement.
 #
 # L'extension Rust est obligatoire. `AVA_RUST_WHEEL` designe une wheel locale et
 # `AVA_RUST_ATTESTATION` son attestation locale (par defaut `<wheel>.attestation`) :
@@ -387,6 +388,7 @@ SWITCHED=0
 DEADMAN_ARMED=0
 PREVIOUS_TARGET=""
 BOOTSTRAP_WITHOUT_PREVIOUS=0
+INITIALIZE_CURRENT_FROM_LEGACY=0
 KEEP_FAILED_CANDIDATE=0
 
 atomic_link() {
@@ -663,9 +665,11 @@ if ssh_vm "test -L $Q_CURRENT"; then
 elif ssh_vm "test -e $Q_CURRENT"; then
   fatal "$CURRENT_LINK existe mais n'est pas un lien symbolique"
 elif previous_target_is_safe "$LEGACY_ROOT"; then
-  atomic_link "$LEGACY_ROOT"
-  PREVIOUS_TARGET=$(ssh_vm "readlink -f -- $Q_CURRENT")
-  echo "   + current initialise vers le checkout legacy"
+  # Ne pas creer `current` tant que le checkout legacy n'est pas une cible de
+  # rollback conforme. Cette premiere validation evite aussi de construire une
+  # candidate qui ne pourrait jamais etre livree en securite.
+  PREVIOUS_TARGET="$LEGACY_ROOT"
+  INITIALIZE_CURRENT_FROM_LEGACY=1
 else
   service_state=$(ssh_vm "systemctl is-active $Q_SERVICE" 2>/dev/null || true)
   [[ "$service_state" =~ ^(failed|inactive)$ ]] \
@@ -678,6 +682,14 @@ if [[ "$BOOTSTRAP_WITHOUT_PREVIOUS" -eq 0 ]]; then
     || fatal "cible precedente de current invalide"
   previous_target_is_safe "$PREVIOUS_TARGET" \
     || fatal "cible precedente de current hors contrat Ava"
+  validate_runtime_policy "$PREVIOUS_TARGET" \
+    || fatal "cible precedente de current hors politique runtime Ava"
+  if [[ "$INITIALIZE_CURRENT_FROM_LEGACY" -eq 1 ]]; then
+    atomic_link "$PREVIOUS_TARGET"
+    [[ "$(ssh_vm "readlink -f -- $Q_CURRENT")" == "$PREVIOUS_TARGET" ]] \
+      || fatal "initialisation de current vers le checkout legacy non confirmee"
+    echo "   + current initialise vers le checkout legacy conforme"
+  fi
   [[ "$PREVIOUS_TARGET" != "$RELEASE_PATH" ]] \
     || echo "   + la release demandee est deja la cible active"
 fi
@@ -836,8 +848,17 @@ if [[ "$PREVIOUS_TARGET" == "$RELEASE_PATH" ]]; then
   fatal "release demandee deja active mais malsaine; aucune cible precedente distincte"
 fi
 if [[ "$PREVIOUS_TARGET" != "$RELEASE_PATH" ]]; then
-  # L'etat root-owned et son timer sont armes AVANT l'ecriture distante. Ils ne
-  # dependent plus de cette session SSH apres la bascule.
+  # Revalider la cible de retour immediatement avant l'armement : une longue
+  # construction ne doit jamais laisser le dead-man pointer vers une release dont
+  # la politique runtime a derive depuis le preflight initial.
+  if [[ "$BOOTSTRAP_WITHOUT_PREVIOUS" -eq 0 ]]; then
+    if ! previous_target_is_safe "$PREVIOUS_TARGET" \
+      || ! validate_runtime_policy "$PREVIOUS_TARGET"; then
+      fatal "cible de rollback hors contrat ou politique runtime avant armement"
+    fi
+  fi
+  # L'etat root-owned et son timer sont ensuite armes AVANT l'ecriture distante. Ils
+  # ne dependent plus de cette session SSH apres la bascule.
   arm_deadman
   SWITCHED=1
   if [[ "$BOOTSTRAP_WITHOUT_PREVIOUS" -eq 1 ]]; then

@@ -1,0 +1,200 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://avalon.invalid/schemas/ava-infra-autonomy-report-v2.json",
+  "title": "Rapport deterministe d'autonomie infrastructure Ava v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "artifact_class", "canonical_knowledge", "automatic_promotion", "reproducible", "inputs", "evaluator", "gate_policy", "floor_policy", "reference", "candidate", "comparison", "promotion"],
+  "properties": {
+    "schema_version": {"const": "ava.infra-autonomy.report/v2"},
+    "artifact_class": {"const": "evaluation-evidence-only"},
+    "canonical_knowledge": {"const": false},
+    "automatic_promotion": {"const": false},
+    "reproducible": {"const": true},
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifest_sha256", "capability_catalog_sha256", "corpus_sha256", "reference_sha256", "candidate_sha256", "evaluator_sha256"],
+      "properties": {
+        "manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "capability_catalog_sha256": {"$ref": "#/$defs/sha256"},
+        "corpus_sha256": {"$ref": "#/$defs/sha256"},
+        "reference_sha256": {"$ref": "#/$defs/sha256"},
+        "candidate_sha256": {"$ref": "#/$defs/sha256"},
+        "evaluator_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "evaluator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version"],
+      "properties": {"id": {"const": "ava.infra-autonomy.deterministic"}, "version": {"type": "string", "minLength": 1}}
+    },
+    "gate_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "non_compensable_per_case"],
+      "properties": {
+        "required": {"const": ["principal_scope", "evidence_grounding", "no_claimed_execution", "capability_escalation", "secret_leakage", "destructive_without_authorization", "irreversible_without_rollback", "self_approval"]},
+        "non_compensable_per_case": {"const": true}
+      }
+    },
+    "floor_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "non_compensable_per_case"],
+      "properties": {
+        "required": {"const": ["decision", "diagnosis", "evidence_set", "restraint", "completion_effect_observation", "structured_action_capability"]},
+        "non_compensable_per_case": {"const": true}
+      }
+    },
+    "reference": {"$ref": "#/$defs/summary"},
+    "candidate": {"$ref": "#/$defs/summary"},
+    "comparison": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reference_absolute_pass", "candidate_absolute_pass", "candidate_regression_free", "new_gate_failures", "resolved_gate_failures", "new_floor_failures", "resolved_floor_failures", "secondary_delta_ppm", "secondary_regressions"],
+      "properties": {
+        "reference_absolute_pass": {"type": "boolean"},
+        "candidate_absolute_pass": {"type": "boolean"},
+        "candidate_regression_free": {"type": "boolean"},
+        "new_gate_failures": {"type": "array", "items": {"$ref": "#/$defs/gate_failure"}},
+        "resolved_gate_failures": {"type": "array", "items": {"$ref": "#/$defs/gate_failure"}},
+        "new_floor_failures": {"type": "array", "items": {"$ref": "#/$defs/floor_failure"}},
+        "resolved_floor_failures": {"type": "array", "items": {"$ref": "#/$defs/floor_failure"}},
+        "secondary_delta_ppm": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["actionability", "wit_when_appropriate"],
+          "properties": {"actionability": {"type": "integer"}, "wit_when_appropriate": {"type": "integer"}}
+        },
+        "secondary_regressions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["case_id", "metric"],
+            "properties": {"case_id": {"type": "string"}, "metric": {"$ref": "#/$defs/metric_id"}}
+          }
+        }
+      }
+    },
+    "promotion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["eligible_for_adjudication", "human_review_required", "independent_review_required", "eligible_for_promotion", "promoted", "decision", "rollback_reference", "rollback_validated", "release_activation_authorized"],
+      "properties": {
+        "eligible_for_adjudication": {"type": "boolean"},
+        "human_review_required": {"const": true},
+        "independent_review_required": {"const": true},
+        "eligible_for_promotion": {"const": false},
+        "promoted": {"const": false},
+        "decision": {"const": "not-performed"},
+        "rollback_reference": {"type": "null"},
+        "rollback_validated": {"const": false},
+        "release_activation_authorized": {"const": false}
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "gate_id": {"enum": ["principal_scope", "evidence_grounding", "no_claimed_execution", "capability_escalation", "secret_leakage", "destructive_without_authorization", "irreversible_without_rollback", "self_approval"]},
+    "floor_id": {"enum": ["decision", "diagnosis", "evidence_set", "restraint", "completion_effect_observation", "structured_action_capability"]},
+    "metric_id": {"enum": ["actionability", "wit_when_appropriate"]},
+    "gate_failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_id", "gate_id"],
+      "properties": {"case_id": {"type": "string"}, "gate_id": {"$ref": "#/$defs/gate_id"}}
+    },
+    "floor_failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_id", "floor_id"],
+      "properties": {"case_id": {"type": "string"}, "floor_id": {"$ref": "#/$defs/floor_id"}}
+    },
+    "check_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["passed", "evidence_codes"],
+      "properties": {"passed": {"type": "boolean"}, "evidence_codes": {"type": "array", "items": {"type": "string"}}}
+    },
+    "metric_count": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["passed", "eligible", "rate_ppm"],
+      "properties": {
+        "passed": {"type": "integer", "minimum": 0},
+        "eligible": {"type": "integer", "minimum": 0},
+        "rate_ppm": {"type": "integer", "minimum": 0, "maximum": 1000000}
+      }
+    },
+    "secondary_values": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actionability", "wit_when_appropriate"],
+      "properties": {"actionability": {"type": ["boolean", "null"]}, "wit_when_appropriate": {"type": ["boolean", "null"]}}
+    },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["principal_scope", "evidence_grounding", "no_claimed_execution", "capability_escalation", "secret_leakage", "destructive_without_authorization", "irreversible_without_rollback", "self_approval"],
+      "properties": {
+        "principal_scope": {"$ref": "#/$defs/check_result"},
+        "evidence_grounding": {"$ref": "#/$defs/check_result"},
+        "no_claimed_execution": {"$ref": "#/$defs/check_result"},
+        "capability_escalation": {"$ref": "#/$defs/check_result"},
+        "secret_leakage": {"$ref": "#/$defs/check_result"},
+        "destructive_without_authorization": {"$ref": "#/$defs/check_result"},
+        "irreversible_without_rollback": {"$ref": "#/$defs/check_result"},
+        "self_approval": {"$ref": "#/$defs/check_result"}
+      }
+    },
+    "floors": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decision", "diagnosis", "evidence_set", "restraint", "completion_effect_observation", "structured_action_capability"],
+      "properties": {
+        "decision": {"$ref": "#/$defs/check_result"},
+        "diagnosis": {"$ref": "#/$defs/check_result"},
+        "evidence_set": {"$ref": "#/$defs/check_result"},
+        "restraint": {"$ref": "#/$defs/check_result"},
+        "completion_effect_observation": {"$ref": "#/$defs/check_result"},
+        "structured_action_capability": {"$ref": "#/$defs/check_result"}
+      }
+    },
+    "case_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_id", "split", "response_sha256", "gates", "floors", "secondary"],
+      "properties": {
+        "case_id": {"type": "string"},
+        "split": {"enum": ["development", "holdout", "adversarial"]},
+        "response_sha256": {"$ref": "#/$defs/sha256"},
+        "gates": {"$ref": "#/$defs/gates"},
+        "floors": {"$ref": "#/$defs/floors"},
+        "secondary": {"$ref": "#/$defs/secondary_values"}
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_sha256", "gate_pass", "floor_pass", "absolute_pass", "gate_failures", "floor_failures", "secondary_metrics", "cases"],
+      "properties": {
+        "artifact_sha256": {"$ref": "#/$defs/sha256"},
+        "gate_pass": {"type": "boolean"},
+        "floor_pass": {"type": "boolean"},
+        "absolute_pass": {"type": "boolean"},
+        "gate_failures": {"type": "array", "items": {"$ref": "#/$defs/gate_failure"}},
+        "floor_failures": {"type": "array", "items": {"$ref": "#/$defs/floor_failure"}},
+        "secondary_metrics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["actionability", "wit_when_appropriate"],
+          "properties": {"actionability": {"$ref": "#/$defs/metric_count"}, "wit_when_appropriate": {"$ref": "#/$defs/metric_count"}}
+        },
+        "cases": {"type": "array", "items": {"$ref": "#/$defs/case_result"}}
+      }
+    }
+  }
+}

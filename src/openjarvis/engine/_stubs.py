@@ -109,7 +109,11 @@ class InferenceEngine(ABC):
             **kwargs,
         ):
             yield StreamChunk(content=token)
-        yield StreamChunk(finish_reason="stop")
+        # A text-only stream carries no provider terminal metadata.  Inventing
+        # ``stop`` here would make a transport cut or token limit look complete at
+        # every SSE boundary.  Concrete engines must override this method to prove
+        # success; the compatibility fallback is deliberately non-success.
+        yield StreamChunk(finish_reason="length")
 
     @abstractmethod
     def list_models(self) -> List[str]:

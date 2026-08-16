@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://avalon.invalid/schemas/ava-infra-autonomy-manifest-v2.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "manifest_id", "artifact", "freeze", "provenance", "license", "consent", "execution_policy", "files", "splits", "required_gates", "required_floors", "secondary_metrics"],
+  "properties": {
+    "schema_version": {"const": "ava.infra-autonomy.manifest/v2"},
+    "manifest_id": {"type": "string", "minLength": 1},
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "kind", "immutable"],
+      "properties": {
+        "id": {"type": "string"},
+        "version": {"const": "2.0.0"},
+        "kind": {"const": "synthetic-infra-autonomy-evaluation"},
+        "immutable": {"const": true}
+      }
+    },
+    "freeze": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "requires_version_bump"],
+      "properties": {
+        "state": {"const": "frozen"},
+        "requires_version_bump": {"const": true}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authoring_method", "source", "contains_personal_data", "contains_production_data"],
+      "properties": {
+        "authoring_method": {"const": "human-authored-synthetic-scenarios"},
+        "source": {"const": "repo://ava/ava_extensions/evals/infra_autonomy/data/corpus.v2.json"},
+        "contains_personal_data": {"const": false},
+        "contains_production_data": {"const": false}
+      }
+    },
+    "license": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["spdx", "scope"],
+      "properties": {"spdx": {"const": "CC0-1.0"}, "scope": {"type": "string", "minLength": 1}}
+    },
+    "consent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "basis", "production_use"],
+      "properties": {"required": {"const": false}, "basis": {"type": "string", "minLength": 1}, "production_use": {"const": "forbidden"}}
+    },
+    "execution_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["network", "tools", "memory", "traces", "runtime_mutation", "production_data"],
+      "properties": {
+        "network": {"const": "forbidden"},
+        "tools": {"const": "forbidden"},
+        "memory": {"const": "forbidden"},
+        "traces": {"const": "forbidden"},
+        "runtime_mutation": {"const": "forbidden"},
+        "production_data": {"const": "forbidden"}
+      }
+    },
+    "files": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capability_catalog", "capability_catalog_schema", "corpus", "corpus_schema", "manifest_schema", "responses_schema", "report_schema", "negative_selftest_fixture", "positive_selftest_fixture"],
+      "properties": {
+        "capability_catalog": {"$ref": "#/$defs/file"},
+        "capability_catalog_schema": {"$ref": "#/$defs/file"},
+        "corpus": {"$ref": "#/$defs/file"},
+        "corpus_schema": {"$ref": "#/$defs/file"},
+        "manifest_schema": {"$ref": "#/$defs/file"},
+        "responses_schema": {"$ref": "#/$defs/file"},
+        "report_schema": {"$ref": "#/$defs/file"},
+        "negative_selftest_fixture": {"$ref": "#/$defs/file"},
+        "positive_selftest_fixture": {"$ref": "#/$defs/file"}
+      }
+    },
+    "splits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["development", "holdout", "adversarial"],
+      "properties": {
+        "development": {"$ref": "#/$defs/string_list"},
+        "holdout": {"$ref": "#/$defs/string_list"},
+        "adversarial": {"$ref": "#/$defs/string_list"}
+      }
+    },
+    "required_gates": {"const": ["principal_scope", "evidence_grounding", "no_claimed_execution", "capability_escalation", "secret_leakage", "destructive_without_authorization", "irreversible_without_rollback", "self_approval"]},
+    "required_floors": {"const": ["decision", "diagnosis", "evidence_set", "restraint", "completion_effect_observation", "structured_action_capability"]},
+    "secondary_metrics": {"const": ["actionability", "wit_when_appropriate"]}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {"path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}
+    },
+    "string_list": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}}
+  }
+}

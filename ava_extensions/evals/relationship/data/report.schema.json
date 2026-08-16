@@ -164,9 +164,10 @@
     "metricNumbers": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["warmth", "continuity", "accuracy"],
+      "required": ["warmth", "wit", "continuity", "accuracy"],
       "properties": {
         "warmth": {"type": "integer"},
+        "wit": {"type": "integer"},
         "continuity": {"type": "integer"},
         "accuracy": {"type": "integer"}
       }
@@ -187,15 +188,16 @@
       "required": ["case_id", "metric"],
       "properties": {
         "case_id": {"type": "string", "minLength": 1},
-        "metric": {"enum": ["warmth", "continuity", "accuracy"]}
+        "metric": {"enum": ["warmth", "wit", "continuity", "accuracy"]}
       }
     },
     "metrics": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["warmth", "continuity", "accuracy"],
+      "required": ["warmth", "wit", "continuity", "accuracy"],
       "properties": {
         "warmth": {"$ref": "#/$defs/metricCounts"},
+        "wit": {"$ref": "#/$defs/metricCounts"},
         "continuity": {"$ref": "#/$defs/metricCounts"},
         "accuracy": {"$ref": "#/$defs/metricCounts"}
       }
@@ -214,7 +216,8 @@
       "additionalProperties": false,
       "required": [
         "scope_leakage", "wrong_principal", "deceptive_humanity", "deceptive_emotion", "jealousy", "guilt",
-        "exclusivity", "isolation", "dependency", "coercion", "tool_escalation", "false_memory"
+        "exclusivity", "isolation", "dependency", "coercion", "self_promotion", "conversation_echo",
+        "tool_escalation", "false_memory"
       ],
       "properties": {
         "scope_leakage": {"$ref": "#/$defs/gateResult"},
@@ -227,6 +230,8 @@
         "isolation": {"$ref": "#/$defs/gateResult"},
         "dependency": {"$ref": "#/$defs/gateResult"},
         "coercion": {"$ref": "#/$defs/gateResult"},
+        "self_promotion": {"$ref": "#/$defs/gateResult"},
+        "conversation_echo": {"$ref": "#/$defs/gateResult"},
         "tool_escalation": {"$ref": "#/$defs/gateResult"},
         "false_memory": {"$ref": "#/$defs/gateResult"}
       }
@@ -234,9 +239,10 @@
     "secondary": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["warmth", "continuity", "accuracy"],
+      "required": ["warmth", "wit", "continuity", "accuracy"],
       "properties": {
         "warmth": {"type": ["boolean", "null"]},
+        "wit": {"type": ["boolean", "null"]},
         "continuity": {"type": ["boolean", "null"]},
         "accuracy": {"type": ["boolean", "null"]}
       }

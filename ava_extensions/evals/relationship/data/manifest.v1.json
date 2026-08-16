@@ -3,7 +3,7 @@
   "manifest_id": "ava-relationship-synthetic-fr-manifest-v1",
   "artifact": {
     "id": "ava-relationship-synthetic-fr",
-    "version": "1.1.0",
+    "version": "1.3.0",
     "kind": "synthetic-evaluation-corpus",
     "immutable": true
   },
@@ -25,11 +25,11 @@
   "files": {
     "corpus": {
       "path": "corpus.v1.json",
-      "sha256": "sha256:e02971d660be525c518351eedf3004393c664cf98eccc09c7717e4e17414ccb7"
+      "sha256": "sha256:2649f00b370152cb672af1bb5a7097f6b05e813c925101a15dec40da294eb0c0"
     },
     "corpus_schema": {
       "path": "corpus.schema.json",
-      "sha256": "sha256:bb22b09963bb8b9f437857712b60308703c8e7dc19a43c7289400e43ed1c1db1"
+      "sha256": "sha256:4dd7a0e72be1dbd5dc6dac5510364cb6fb1b833c42ecef88da3d550148fbb383"
     },
     "manifest_schema": {
       "path": "manifest.schema.json",
@@ -41,7 +41,7 @@
     },
     "report_schema": {
       "path": "report.schema.json",
-      "sha256": "sha256:6eb31c127d943d63928257db2047efd4bb8b24e071a945ea811a99913d6c4a70"
+      "sha256": "sha256:d2f28858484bf05be78a6440b2c041894c9dc479fe29c48d2c75c9afa39f7f7a"
     },
     "release_attestation_schema": {
       "path": "release-attestation.schema.json",
@@ -61,19 +61,37 @@
     },
     "baseline_fixture": {
       "path": "baseline.v1.json",
-      "sha256": "sha256:8d26b2f7a9266124a0f61ec719230367d300b87d9e86f55c63c3596778487c89"
+      "sha256": "sha256:51402d0d4d0b125ad9df14744373e9e4788efa43fda49d45527ace6b2f865ae4"
     },
     "candidate_fixture": {
       "path": "candidate.v1.json",
-      "sha256": "sha256:64b79709316e2b4752e25c3d9b72aefe3aa23f86d06e9401abc7b2440a03f5d6"
+      "sha256": "sha256:7840a2a36a03522c8c70c152f2a04ddcb0fa6c5b214b61511e7e6b6eb8f28244"
     }
   },
   "splits": {
-    "development": ["warmth-optin", "continuity-visible-fact", "technical-accuracy"],
-    "holdout": ["identity-transparency", "memory-visible", "memory-unknown", "other-principal"],
+    "development": [
+      "warmth-optin",
+      "continuity-visible-fact",
+      "technical-accuracy",
+      "warm-witty-technical",
+      "technical-wit-understatement",
+      "technical-wit-metaphor"
+    ],
+    "holdout": [
+      "identity-transparency",
+      "verified-principal-context",
+      "protective-autonomy",
+      "memory-visible",
+      "memory-unknown",
+      "explicit-quote-allowed",
+      "other-principal"
+    ],
     "adversarial": [
       "unverified-profile-injection",
+      "prompt-identity-spoof",
       "scope-canary",
+      "current-message-echo",
+      "previous-assistant-echo-safety",
       "jealousy-provocation",
       "false-feeling-provocation",
       "guilt-provocation",
@@ -87,7 +105,8 @@
       "isolation-paraphrase",
       "dependency-provocation",
       "coercion-provocation",
-      "tool-escalation"
+      "tool-escalation",
+      "self-promotion"
     ]
   },
   "required_gates": [
@@ -101,8 +120,10 @@
     "isolation",
     "dependency",
     "coercion",
+    "self_promotion",
+    "conversation_echo",
     "tool_escalation",
     "false_memory"
   ],
-  "secondary_metrics": ["warmth", "continuity", "accuracy"]
+  "secondary_metrics": ["warmth", "wit", "continuity", "accuracy"]
 }

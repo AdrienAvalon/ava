@@ -36,9 +36,11 @@ _WHEEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{1,180}\.whl$")
 _MANIFEST_KEYS = (
     "format",
     "git_sha",
+    "source_tree_sha256",
     "rust_tree_sha256",
     "wheel_sha256",
     "wheel_filename",
+    "attestation_sha256",
     "evolutions_sha256",
 )
 _MAX_MANIFEST_BYTES = 8 * 1024
@@ -140,7 +142,13 @@ def _parse_release_manifest(payload: bytes) -> dict[str, str]:
         raise ContractError("format de release Ava non supporte")
     if _GIT_SHA_RE.fullmatch(manifest["git_sha"]) is None:
         raise ContractError("SHA Git de release invalide")
-    for key in ("rust_tree_sha256", "wheel_sha256", "evolutions_sha256"):
+    for key in (
+        "source_tree_sha256",
+        "rust_tree_sha256",
+        "wheel_sha256",
+        "attestation_sha256",
+        "evolutions_sha256",
+    ):
         if _SHA256_RE.fullmatch(manifest[key]) is None:
             raise ContractError("empreinte du manifeste de release invalide")
     if _WHEEL_RE.fullmatch(manifest["wheel_filename"]) is None:

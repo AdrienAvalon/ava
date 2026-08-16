@@ -9,14 +9,40 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from ava_extensions.server.principal import Principal
 
 from openjarvis.agents.manager import AgentManager
+
+OWNER = Principal("oidc", "https://issuer.example.invalid", "managed-owner")
+OTHER_OWNER = Principal("oidc", "https://issuer.example.invalid", "managed-other")
+
+
+@pytest.fixture(autouse=True)
+def _verified_managed_owner(monkeypatch):
+    """Keep pre-existing route tests behind a verified synthetic principal."""
+
+    from ava_extensions.server import principal as principal_module
+
+    monkeypatch.setattr(
+        principal_module,
+        "resolve_request_principal",
+        lambda _headers: OWNER,
+    )
 
 
 @pytest.fixture
 def manager():
     with tempfile.TemporaryDirectory() as tmpdir:
         mgr = AgentManager(db_path=str(Path(tmpdir) / "agents.db"))
+        original_create = mgr.create_agent
+
+        def create_owned_agent(*args, **kwargs):
+            kwargs.setdefault("owner_provenance", OWNER.provenance)
+            return original_create(*args, **kwargs)
+
+        # Route tests that seed state directly must model records previously
+        # created by the same verified HTTP principal.
+        mgr.create_agent = create_owned_agent
         yield mgr
         mgr.close()
 
@@ -47,6 +73,197 @@ class TestAgentManagerRoutes:
         resp = client.get("/v1/managed-agents")
         assert resp.status_code == 200
         assert resp.json()["agents"] == []
+
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            {},
+            {"X-Ava-Identity": "forged.jwt"},
+            {
+                "X-Ava-Identity": "one.jwt",
+                "X-Ava-Service-Assertion": "ambiguous",
+            },
+        ],
+    )
+    def test_absent_invalid_or_ambiguous_principal_fails_closed_before_create(
+        self,
+        client,
+        manager,
+        monkeypatch,
+        headers,
+    ):
+        from ava_extensions.server import principal as principal_module
+
+        monkeypatch.setattr(
+            principal_module,
+            "resolve_request_principal",
+            lambda _headers: None,
+        )
+
+        listed = client.get("/v1/managed-agents", headers=headers)
+        created = client.post(
+            "/v1/managed-agents",
+            headers=headers,
+            json={"name": "must-not-exist"},
+        )
+
+        assert listed.status_code == 401
+        assert created.status_code == 401
+        assert manager.list_agents() == []
+
+    def test_all_private_agent_routes_are_scoped_to_verified_owner(
+        self,
+        client,
+        manager,
+        monkeypatch,
+    ):
+        from ava_extensions.server import principal as principal_module
+
+        selected = {"principal": OWNER}
+        monkeypatch.setattr(
+            principal_module,
+            "resolve_request_principal",
+            lambda _headers: selected["principal"],
+        )
+        created = client.post(
+            "/v1/managed-agents",
+            json={"name": "owner-private", "agent_type": "simple"},
+        )
+        assert created.status_code == 200
+        agent_id = created.json()["id"]
+        assert created.json()["owner_provenance"] == OWNER.provenance
+        assert (
+            client.post(
+                f"/v1/managed-agents/{agent_id}/messages",
+                json={"content": "PRIVATE_MESSAGE_CANARY", "mode": "queued"},
+            ).status_code
+            == 200
+        )
+        task = client.post(
+            f"/v1/managed-agents/{agent_id}/tasks",
+            json={"description": "PRIVATE_TASK_CANARY"},
+        ).json()
+        binding = client.post(
+            f"/v1/managed-agents/{agent_id}/channels",
+            json={"channel_type": "test", "config": {"channel": "private"}},
+        ).json()
+
+        selected["principal"] = OTHER_OWNER
+        assert client.get("/v1/managed-agents").json() == {"agents": []}
+
+        denied_requests = [
+            ("get", f"/v1/managed-agents/{agent_id}", None),
+            (
+                "patch",
+                f"/v1/managed-agents/{agent_id}",
+                {"name": "cross-principal-write"},
+            ),
+            ("delete", f"/v1/managed-agents/{agent_id}", None),
+            ("post", f"/v1/managed-agents/{agent_id}/pause", None),
+            ("post", f"/v1/managed-agents/{agent_id}/resume", None),
+            ("post", f"/v1/managed-agents/{agent_id}/run", None),
+            ("post", f"/v1/managed-agents/{agent_id}/recover", None),
+            ("get", f"/v1/managed-agents/{agent_id}/tasks", None),
+            (
+                "post",
+                f"/v1/managed-agents/{agent_id}/tasks",
+                {"description": "cross-principal-task"},
+            ),
+            (
+                "get",
+                f"/v1/managed-agents/{agent_id}/tasks/{task['id']}",
+                None,
+            ),
+            (
+                "patch",
+                f"/v1/managed-agents/{agent_id}/tasks/{task['id']}",
+                {"description": "cross-principal-task-update"},
+            ),
+            (
+                "delete",
+                f"/v1/managed-agents/{agent_id}/tasks/{task['id']}",
+                None,
+            ),
+            ("get", f"/v1/managed-agents/{agent_id}/channels", None),
+            (
+                "post",
+                f"/v1/managed-agents/{agent_id}/channels",
+                {"channel_type": "test", "config": {}},
+            ),
+            (
+                "delete",
+                f"/v1/managed-agents/{agent_id}/channels/{binding['id']}",
+                None,
+            ),
+            ("get", f"/v1/managed-agents/{agent_id}/messages", None),
+            (
+                "post",
+                f"/v1/managed-agents/{agent_id}/messages",
+                {"content": "cross-principal-message", "mode": "queued"},
+            ),
+            ("get", f"/v1/managed-agents/{agent_id}/state", None),
+            ("get", f"/v1/managed-agents/{agent_id}/learning", None),
+            ("post", f"/v1/managed-agents/{agent_id}/learning/run", None),
+            ("get", f"/v1/managed-agents/{agent_id}/traces", None),
+            (
+                "get",
+                f"/v1/managed-agents/{agent_id}/traces/private-trace",
+                None,
+            ),
+        ]
+        for method, path, payload in denied_requests:
+            kwargs = {"json": payload} if payload is not None else {}
+            response = getattr(client, method)(path, **kwargs)
+            assert response.status_code == 404, (method, path, response.text)
+            assert "PRIVATE_MESSAGE_CANARY" not in response.text
+
+        unchanged = manager.get_agent(agent_id)
+        assert unchanged is not None
+        assert unchanged["name"] == "owner-private"
+        assert unchanged["status"] == "idle"
+        assert [m["content"] for m in manager.list_messages(agent_id)] == [
+            "PRIVATE_MESSAGE_CANARY"
+        ]
+        assert manager._get_task(task["id"])["description"] == "PRIVATE_TASK_CANARY"
+        assert manager._get_binding(binding["id"])["agent_id"] == agent_id
+
+        other = client.post(
+            "/v1/managed-agents",
+            json={"name": "other-private", "agent_type": "simple"},
+        )
+        assert other.status_code == 200
+        assert other.json()["owner_provenance"] == OTHER_OWNER.provenance
+        assert [a["id"] for a in client.get("/v1/managed-agents").json()["agents"]] == [
+            other.json()["id"]
+        ]
+
+        selected["principal"] = OWNER
+        assert [a["id"] for a in client.get("/v1/managed-agents").json()["agents"]] == [
+            agent_id
+        ]
+
+    def test_legacy_ownerless_agent_is_invisible_and_not_mutable_over_http(
+        self,
+        client,
+        manager,
+    ):
+        legacy = manager.create_agent(
+            name="legacy-ownerless",
+            agent_type="simple",
+            owner_provenance=None,
+        )
+
+        assert client.get("/v1/managed-agents").json() == {"agents": []}
+        assert client.get(f"/v1/managed-agents/{legacy['id']}").status_code == 404
+        assert (
+            client.patch(
+                f"/v1/managed-agents/{legacy['id']}",
+                json={"name": "must-not-change"},
+            ).status_code
+            == 404
+        )
+        assert client.delete(f"/v1/managed-agents/{legacy['id']}").status_code == 404
+        assert manager.get_agent(legacy["id"])["name"] == "legacy-ownerless"
 
     def test_sendblue_verify_uses_async_http_client(self, client):
         mock_resp = MagicMock()
@@ -210,15 +427,15 @@ class TestAgentManagerRoutes:
         resp = client.get(f"/v1/managed-agents/{agent_id}/tasks")
         assert len(resp.json()["tasks"]) == 2
 
-    def test_channel_binding_crud(self, client):
-        create_resp = client.post("/v1/managed-agents", json={"name": "slacker"})
+    def test_declarative_channel_binding_crud(self, client):
+        create_resp = client.post("/v1/managed-agents", json={"name": "notifier"})
         agent_id = create_resp.json()["id"]
         # Bind
         bind_resp = client.post(
             f"/v1/managed-agents/{agent_id}/channels",
             json={
-                "channel_type": "slack",
-                "config": {"channel": "#research"},
+                "channel_type": "test",
+                "config": {"channel": "private"},
             },
         )
         assert bind_resp.status_code == 200
@@ -230,6 +447,119 @@ class TestAgentManagerRoutes:
         url = f"/v1/managed-agents/{agent_id}/channels/{binding_id}"
         unbind_resp = client.delete(url)
         assert unbind_resp.status_code == 200
+
+    @pytest.mark.parametrize(
+        "channel_type",
+        ["imessage", "sendblue", "slack", "twilio"],
+    )
+    def test_two_owners_cannot_activate_process_global_channel_bindings(
+        self,
+        client,
+        manager,
+        monkeypatch,
+        channel_type,
+    ):
+        from ava_extensions.server import principal as principal_module
+
+        selected = {"principal": OWNER}
+        monkeypatch.setattr(
+            principal_module,
+            "resolve_request_principal",
+            lambda _headers: selected["principal"],
+        )
+        owner_agent = manager.create_agent(name="owner-runtime")
+        other_agent = manager.create_agent(
+            name="other-runtime",
+            owner_provenance=OTHER_OWNER.provenance,
+        )
+        other_binding = manager.bind_channel(
+            other_agent["id"],
+            channel_type=channel_type,
+            config={},
+        )
+        bind_spy = MagicMock(wraps=manager.bind_channel)
+        monkeypatch.setattr(manager, "bind_channel", bind_spy)
+
+        responses = []
+        for principal, agent in (
+            (OWNER, owner_agent),
+            (OTHER_OWNER, other_agent),
+        ):
+            selected["principal"] = principal
+            responses.append(
+                client.post(
+                    f"/v1/managed-agents/{agent['id']}/channels",
+                    json={"channel_type": channel_type, "config": {}},
+                )
+            )
+
+        assert [response.status_code for response in responses] == [409, 409]
+        assert [response.json() for response in responses] == [
+            {"detail": "Channel binding is unavailable"},
+            {"detail": "Channel binding is unavailable"},
+        ]
+        bind_spy.assert_not_called()
+        assert manager.list_channel_bindings(owner_agent["id"]) == []
+        assert manager._get_binding(other_binding["id"]) == other_binding
+
+    @pytest.mark.parametrize(
+        "channel_type",
+        ["imessage", "sendblue", "slack", "twilio"],
+    )
+    def test_two_owners_cannot_mutate_or_stop_process_global_bindings(
+        self,
+        client,
+        manager,
+        monkeypatch,
+        channel_type,
+    ):
+        from ava_extensions.server import principal as principal_module
+
+        selected = {"principal": OWNER}
+        monkeypatch.setattr(
+            principal_module,
+            "resolve_request_principal",
+            lambda _headers: selected["principal"],
+        )
+        owner_agent = manager.create_agent(name="owner-runtime")
+        other_agent = manager.create_agent(
+            name="other-runtime",
+            owner_provenance=OTHER_OWNER.provenance,
+        )
+        owner_binding = manager.bind_channel(
+            owner_agent["id"],
+            channel_type=channel_type,
+            config={},
+        )
+        other_binding = manager.bind_channel(
+            other_agent["id"],
+            channel_type=channel_type,
+            config={},
+        )
+        unbind_spy = MagicMock(wraps=manager.unbind_channel)
+        monkeypatch.setattr(manager, "unbind_channel", unbind_spy)
+
+        with (
+            patch("openjarvis.channels.imessage_daemon.stop_daemon") as stop_imessage,
+            patch("openjarvis.channels.slack_daemon.stop_daemon") as stop_slack,
+        ):
+            owner_response = client.delete(
+                f"/v1/managed-agents/{owner_agent['id']}/channels/{owner_binding['id']}"
+            )
+            selected["principal"] = OTHER_OWNER
+            foreign_response = client.delete(
+                f"/v1/managed-agents/{owner_agent['id']}/channels/{owner_binding['id']}"
+            )
+
+        assert owner_response.status_code == 409
+        assert owner_response.json() == {"detail": "Channel binding is unavailable"}
+        assert foreign_response.status_code == 404
+        assert foreign_response.json() == {"detail": "Agent not found"}
+        unbind_spy.assert_not_called()
+        stop_imessage.assert_not_called()
+        stop_slack.assert_not_called()
+        assert manager._get_binding(owner_binding["id"]) == owner_binding
+        assert manager._get_binding(other_binding["id"]) == other_binding
 
     def test_templates(self, client):
         resp = client.get("/v1/templates")
@@ -281,6 +611,7 @@ class TestAgentManagerRoutes:
             outcome="success",
             total_latency_seconds=0.1,
             started_at=1.0,
+            metadata={"provenance": OWNER.provenance},
             steps=[
                 SimpleNamespace(
                     step_type=SimpleNamespace(value="tool_call"),
@@ -309,6 +640,7 @@ class TestAgentManagerRoutes:
             outcome="success",
             total_latency_seconds=0.1,
             started_at=1.0,
+            metadata={"provenance": OWNER.provenance},
             steps=[
                 SimpleNamespace(
                     step_type=SimpleNamespace(value="tool_call"),
@@ -745,6 +1077,103 @@ class TestAgentManagerStreaming:
         # Last chunk should have finish_reason="stop"
         assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
 
+    def test_missing_agent_max_tokens_inherits_server_limit_without_persisting_it(
+        self, manager
+    ):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient as TC
+
+        from openjarvis.engine._stubs import StreamChunk
+        from openjarvis.server.agent_manager_routes import create_agent_manager_router
+
+        captured = {}
+        engine = MagicMock(engine_id="inherited-limit", _model="test-model")
+
+        async def inherited_stream(messages, *, model, max_tokens, **kwargs):
+            captured["max_tokens"] = max_tokens
+            yield StreamChunk(content="complete")
+            yield StreamChunk(finish_reason="stop")
+
+        engine.stream_full = inherited_stream
+        app = FastAPI()
+        app.state.engine = engine
+        app.state.bus = None
+        app.state.config = SimpleNamespace(
+            intelligence=SimpleNamespace(max_tokens=16_384)
+        )
+        for router in create_agent_manager_router(manager):
+            app.include_router(router)
+        agent = manager.create_agent(name="inherits", agent_type="simple", config={})
+
+        response = TC(app).post(
+            f"/v1/managed-agents/{agent['id']}/messages",
+            json={"content": "question", "stream": True},
+        )
+
+        assert response.status_code == 200
+        assert captured["max_tokens"] == 16_384
+        assert "max_tokens" not in manager.get_agent(agent["id"])["config"]
+
+    def test_personal_research_template_inherits_runtime_limit(
+        self, manager, monkeypatch
+    ):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient as TC
+
+        import openjarvis.agents.deep_research as deep_research_module
+        from openjarvis.agents._stubs import AgentResult
+        from openjarvis.server import agent_manager_routes as routes
+        from openjarvis.server.agent_manager_routes import create_agent_manager_router
+
+        captured = {}
+
+        class CapturingDeepResearchAgent:
+            def __init__(self, **kwargs):
+                captured["max_tokens"] = kwargs["max_tokens"]
+                self._executor = SimpleNamespace(execute=lambda _call: None)
+
+            def run(self, _input_text, context=None):
+                del context
+                return AgentResult(
+                    content="complete research",
+                    metadata={"finish_reason": "stop"},
+                )
+
+        monkeypatch.setattr(
+            deep_research_module,
+            "DeepResearchAgent",
+            CapturingDeepResearchAgent,
+        )
+        monkeypatch.setattr(
+            routes,
+            "_build_deep_research_tools",
+            lambda **_kwargs: [object()],
+        )
+        agent = manager.create_from_template(
+            "personal_deep_research",
+            "template-inherits",
+            owner_provenance=OWNER.provenance,
+        )
+        assert "max_tokens" not in agent["config"]
+
+        app = FastAPI()
+        app.state.engine = MagicMock(engine_id="fake", _model="test-model")
+        app.state.bus = None
+        app.state.config = SimpleNamespace(
+            intelligence=SimpleNamespace(max_tokens=16_384)
+        )
+        for router in create_agent_manager_router(manager):
+            app.include_router(router)
+
+        response = TC(app).post(
+            f"/v1/managed-agents/{agent['id']}/messages",
+            json={"content": "question", "stream": True},
+        )
+
+        assert response.status_code == 200
+        assert captured["max_tokens"] == 16_384
+        assert '"finish_reason": "stop"' in response.text
+
     def test_truncated_stream_is_failed_instead_of_relabelled_stop(self, manager):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient as TC
@@ -1080,7 +1509,10 @@ class TestAgentManagerStreaming:
             def run(self, input_text, context=None):
                 captured["input"] = input_text
                 captured["context"] = context
-                return AgentResult(content="bounded research answer")
+                return AgentResult(
+                    content="bounded research answer",
+                    metadata={"finish_reason": "end_turn"},
+                )
 
         monkeypatch.setattr(
             deep_research_module,
@@ -1142,6 +1574,85 @@ class TestAgentManagerStreaming:
         )
         assert current["status"] == "delivered"
         assert answer["content"] == "bounded research answer"
+        assert '"finish_reason": "stop"' in response.text
+
+    @pytest.mark.parametrize(
+        ("finish_reason", "max_turns_exceeded", "incomplete_tool_call"),
+        [
+            ("length", False, False),
+            ("max_tokens", False, False),
+            (None, False, False),
+            ("stop", True, False),
+            ("stop", False, True),
+        ],
+    )
+    def test_deep_research_incomplete_terminal_is_failed_without_assistant_reply(
+        self,
+        manager,
+        monkeypatch,
+        finish_reason,
+        max_turns_exceeded,
+        incomplete_tool_call,
+    ):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient as TC
+
+        import openjarvis.agents.deep_research as deep_research_module
+        from openjarvis.agents._stubs import AgentResult
+        from openjarvis.server import agent_manager_routes as routes
+        from openjarvis.server.agent_manager_routes import create_agent_manager_router
+
+        class IncompleteDeepResearchAgent:
+            def __init__(self, **_kwargs):
+                self._executor = SimpleNamespace(execute=lambda _call: None)
+
+            def run(self, _input_text, context=None):
+                del context
+                return AgentResult(
+                    content="PARTIAL_RESEARCH",
+                    metadata={
+                        "finish_reason": finish_reason,
+                        "max_turns_exceeded": max_turns_exceeded,
+                        "incomplete_tool_call": incomplete_tool_call,
+                    },
+                )
+
+        monkeypatch.setattr(
+            deep_research_module,
+            "DeepResearchAgent",
+            IncompleteDeepResearchAgent,
+        )
+        monkeypatch.setattr(
+            routes,
+            "_build_deep_research_tools",
+            lambda **_kwargs: [object()],
+        )
+        app = FastAPI()
+        app.state.engine = MagicMock(engine_id="fake", _model="test-model")
+        app.state.bus = None
+        app.state.config = SimpleNamespace(
+            intelligence=SimpleNamespace(max_tokens=16_384)
+        )
+        for router in create_agent_manager_router(manager):
+            app.include_router(router)
+        client = TC(app)
+        agent = manager.create_agent(
+            name="deep-incomplete",
+            agent_type="deep_research",
+            config={"model": "test-model"},
+        )
+
+        response = client.post(
+            f"/v1/managed-agents/{agent['id']}/messages",
+            json={"content": "current question", "stream": True},
+        )
+
+        assert response.status_code == 200
+        assert "generation_error" in response.text
+        assert '"finish_reason": "stop"' not in response.text
+        messages = manager.list_messages(agent["id"])
+        assert len(messages) == 1
+        assert messages[0]["status"] == "failed"
 
 
 @pytest.mark.skipif(not HAS_FASTAPI, reason="fastapi not installed")

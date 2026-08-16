@@ -95,7 +95,11 @@ class TestJarvisSystem:
                 pass
 
             def run(self, input, context=None, **kwargs):
-                return AgentResult(content="From test agent", turns=1)
+                return AgentResult(
+                    content="From test agent",
+                    turns=1,
+                    metadata={"finish_reason": "end_turn"},
+                )
 
         # Register (or re-register) the agent
         if not AgentRegistry.contains("test-system-agent"):
@@ -112,6 +116,7 @@ class TestJarvisSystem:
         )
         result = system.ask("Hi", agent="test-system-agent")
         assert result["content"] == "From test agent"
+        assert result["finish_reason"] == "stop"
 
     def test_ask_unknown_agent(self):
         """Unknown agent should return an error dict."""

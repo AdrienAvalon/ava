@@ -237,6 +237,39 @@ def _infra(monkeypatch, valeur):
     monkeypatch.setattr(evolutions, "_cote_infra", lambda *_a, **_k: valeur)
 
 
+def test_la_surrelecture_infra_respecte_la_borne_du_control_plane(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """`nombre=20` sur-lisait 80 lignes et recevait toujours HTTP 422."""
+
+    token = tmp_path / "voice-token"
+    token.write_text("synthetic-token")
+    monkeypatch.setattr(evolutions, "CHEMIN_JETON", token)
+    vu: dict[str, str] = {}
+
+    class _Reponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def read() -> bytes:
+            return b'{"changements": []}'
+
+    def ouvrir(req, **_kwargs):  # noqa: ANN001, ANN003
+        vu["url"] = req.full_url
+        return _Reponse()
+
+    monkeypatch.setattr(evolutions.urllib.request, "urlopen", ouvrir)
+
+    assert evolutions._cote_infra("30j", 80) == []
+    assert "jours=30" in vu["url"]
+    assert f"limite={evolutions._CP_LIMITE_MAX}" in vu["url"]
+
+
 def test_les_DEUX_sources_sont_fusionnees_et_ETIQUETEES(_git, monkeypatch) -> None:
     """⚠ L'ANGLE MORT TROUVÉ EN LUI PARLANT le 2026-08-06. Son journal ne lisait que SON
     dépôt, alors que la moitié de ce qui la change vit dans `infra_avalon` : ses outils

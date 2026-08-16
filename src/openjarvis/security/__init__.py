@@ -36,6 +36,7 @@ class SecurityContext:
     engine: Any
     capability_policy: Any = None
     audit_logger: Any = None
+    boundary_guard: Any = None
 
 
 def setup_security(
@@ -50,7 +51,9 @@ def setup_security(
     if not config.security.enabled:
         return SecurityContext(engine=engine)
 
-    # Scanners + engine wrapping
+    # Scanners + engine wrapping.  The same scanner instances protect both
+    # model traffic and arguments sent through non-local tools.
+    boundary_guard = None
     try:
         scanners: list[BaseScanner] = []
         if config.security.secret_scanner:
@@ -68,6 +71,13 @@ def setup_security(
                 scan_output=config.security.scan_output,
                 bus=bus,
             )
+            from openjarvis.security.boundary import BoundaryGuard
+
+            boundary_guard = BoundaryGuard(
+                mode=config.security.mode,
+                bus=bus,
+                scanners=scanners,
+            )
     except Exception as exc:
         logger.debug("Failed to set up security scanners: %s", exc)
 
@@ -79,6 +89,10 @@ def setup_security(
 
             cap_policy = CapabilityPolicy(
                 policy_path=config.security.capabilities.policy_path or None,
+                # A configured policy is a grant list, never an allow-list
+                # exception layered on top of an open default.  Missing agent
+                # entries and missing policy files therefore deny.
+                default_deny=True,
             )
         except Exception as exc:
             logger.debug("Failed to set up capability policy: %s", exc)
@@ -97,6 +111,7 @@ def setup_security(
         engine=engine,
         capability_policy=cap_policy,
         audit_logger=audit,
+        boundary_guard=boundary_guard,
     )
 
 

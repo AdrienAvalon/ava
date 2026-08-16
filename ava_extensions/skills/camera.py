@@ -32,6 +32,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from ava_extensions.tool_capabilities import HOME_OBSERVE, NETWORK_FETCH
 from openjarvis.core.registry import ToolRegistry
 from openjarvis.core.types import ToolResult
 from openjarvis.tools._stubs import BaseTool, ToolSpec
@@ -208,7 +209,7 @@ class CameraTool(BaseTool):
     """Historique qualifié de la caméra du parking, via le control plane (lecture seule)."""
 
     tool_id = "camera"
-    is_local = True
+    is_local = False
 
     @property
     def spec(self) -> ToolSpec:
@@ -228,6 +229,9 @@ class CameraTool(BaseTool):
             category="maison",
             latency_estimate=0.3,
             timeout_seconds=12.0,
+            required_capabilities=[NETWORK_FETCH, HOME_OBSERVE],
+            requires_capability_policy=True,
+            metadata={"fixed_destination": "avalon-control-plane"},
         )
 
     def execute(self, **params: Any) -> ToolResult:

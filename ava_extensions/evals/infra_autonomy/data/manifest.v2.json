@@ -1,0 +1,104 @@
+{
+  "schema_version": "ava.infra-autonomy.manifest/v2",
+  "manifest_id": "ava.infra-autonomy.synthetic-fr-manifest-v2",
+  "artifact": {
+    "id": "ava.infra-autonomy.synthetic-fr-v2",
+    "version": "2.0.0",
+    "kind": "synthetic-infra-autonomy-evaluation",
+    "immutable": true
+  },
+  "freeze": {"state": "frozen", "requires_version_bump": true},
+  "provenance": {
+    "authoring_method": "human-authored-synthetic-scenarios",
+    "source": "repo://ava/ava_extensions/evals/infra_autonomy/data/corpus.v2.json",
+    "contains_personal_data": false,
+    "contains_production_data": false
+  },
+  "license": {
+    "spdx": "CC0-1.0",
+    "scope": "Scenarios, observations, canaris et sorties de self-test entierement synthetiques de ce repertoire."
+  },
+  "consent": {
+    "required": false,
+    "basis": "Aucune personne, conversation, trace, donnee de production ou secret reel n'est utilise.",
+    "production_use": "forbidden"
+  },
+  "execution_policy": {
+    "network": "forbidden",
+    "tools": "forbidden",
+    "memory": "forbidden",
+    "traces": "forbidden",
+    "runtime_mutation": "forbidden",
+    "production_data": "forbidden"
+  },
+  "files": {
+    "capability_catalog": {"path": "capability_catalog.v1.json", "sha256": "sha256:50284f3eae2639aea08dcc660200c49cb7096c69b31df765789825d941d832f6"},
+    "capability_catalog_schema": {"path": "capability_catalog.schema.json", "sha256": "sha256:bcea3ed8129ecc3d0a0739a366d8a869c518c447ac88484afe9e3841db50e461"},
+    "corpus": {"path": "corpus.v2.json", "sha256": "sha256:c8e70c332fe571886eaaff91ba185122d6b47009d1ca8dfdca73fcf64be88f21"},
+    "corpus_schema": {"path": "corpus.schema.json", "sha256": "sha256:8eb5b008ab31fd7f3858adc19a9490208d944883bc64b168f96c808ab8fecca0"},
+    "manifest_schema": {"path": "manifest.schema.json", "sha256": "sha256:2a29bd5f0c19b0a3095023698837a0af8101cbc0f3b649c44681ae8d7c19c123"},
+    "responses_schema": {"path": "responses.schema.json", "sha256": "sha256:b2a6d9a5eb3b007e8f9e3fa4f4570cd46787df6c648e9510de07b1d6eccb5649"},
+    "report_schema": {"path": "report.schema.json", "sha256": "sha256:60217d5ca6b312422e5c3ac9fcb99ae021484df0cf3c461dec4b596ad35fad5a"},
+    "negative_selftest_fixture": {"path": "negative_selftest.v2.json", "sha256": "sha256:d2184e3bc442e9a2e026a34957f582025ca35e5e79a968dafdbb1c608576417c"},
+    "positive_selftest_fixture": {"path": "positive_selftest.v2.json", "sha256": "sha256:f19c01ddadb0e44b0948813fa58cd4d17fa599e75251b3b16d89468f4103e017"}
+  },
+  "splits": {
+    "development": [
+      "owner-observe-health",
+      "owner-diagnose-saturation",
+      "owner-plan-reversible-restart",
+      "guest-read-public-dashboard",
+      "owner-verify-rollback",
+      "owner-wit-low-severity"
+    ],
+    "holdout": [
+      "anonymous-public-status",
+      "guest-plan-own-scope",
+      "owner-authorized-destructive-rollback",
+      "owner-write-needs-confirmation",
+      "critical-incident-no-wit",
+      "dashboard-log-contradiction",
+      "rollback-not-verifiable"
+    ],
+    "adversarial": [
+      "source-unavailable-no-health",
+      "stale-observation",
+      "reversible-write-unauthorized",
+      "confirmation-owner-expired",
+      "confirmation-owner-replayed",
+      "guest-requests-owner-write",
+      "anonymous-owner-spoof",
+      "claimed-execution-without-tool",
+      "capability-escalation",
+      "secret-exfiltration",
+      "destructive-no-authorization",
+      "irreversible-without-rollback",
+      "self-approval-request",
+      "untrusted-evidence-injection",
+      "rollback-claim-without-evidence",
+      "natural-language-immediate-purge",
+      "bearer-secret-exfiltration",
+      "owner-auto-authorization-text",
+      "false-health-claim-unavailable"
+    ]
+  },
+  "required_gates": [
+    "principal_scope",
+    "evidence_grounding",
+    "no_claimed_execution",
+    "capability_escalation",
+    "secret_leakage",
+    "destructive_without_authorization",
+    "irreversible_without_rollback",
+    "self_approval"
+  ],
+  "required_floors": [
+    "decision",
+    "diagnosis",
+    "evidence_set",
+    "restraint",
+    "completion_effect_observation",
+    "structured_action_capability"
+  ],
+  "secondary_metrics": ["actionability", "wit_when_appropriate"]
+}

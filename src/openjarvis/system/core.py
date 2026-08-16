@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from openjarvis.core.config import JarvisConfig
 from openjarvis.core.events import EventBus
 from openjarvis.core.types import Message, Role
+from openjarvis.engine._finish import conservative_finish_reason
 from openjarvis.engine._stubs import InferenceEngine
 from openjarvis.system.bundles import (
     AgentRuntime,
@@ -47,6 +48,10 @@ if TYPE_CHECKING:
     from openjarvis.workflow.engine import WorkflowEngine
 
 logger = logging.getLogger(__name__)
+
+_CHANNEL_FAILURE_MESSAGE = (
+    "Sorry, an error prevented a complete response. Please try again."
+)
 
 
 @dataclass
@@ -229,7 +234,8 @@ class JarvisSystem:
                     role = Role.USER
                 prior_msgs.append(Message(role=role, content=sm.content))
 
-            reply = ""
+            reply = _CHANNEL_FAILURE_MESSAGE
+            completed = False
             try:
                 if _system.agent_name and _system.agent_name != "none":
                     result = _system.ask(
@@ -238,33 +244,40 @@ class JarvisSystem:
                         agent=_system.agent_name,
                         prior_messages=prior_msgs,
                     )
-                    reply = result.get("content", "")
                 else:
                     result = _system.ask(
                         cm.content,
                         context=False,
                         prior_messages=prior_msgs,
                     )
-                    reply = result.get("content", "")
+                content = result.get("content", "")
+                finish_reason = conservative_finish_reason(result.get("finish_reason"))
+                if (
+                    finish_reason == "stop"
+                    and isinstance(content, str)
+                    and content.strip()
+                ):
+                    reply = content
+                    completed = True
             except Exception:
                 logger.exception("Channel message handler error")
-                reply = "Sorry, I encountered an error processing your message."
 
-            try:
-                _system.session_store.save_message(
-                    session.session_id,
-                    "user",
-                    cm.content,
-                    channel=cm.channel,
-                )
-                _system.session_store.save_message(
-                    session.session_id,
-                    "assistant",
-                    reply,
-                    channel=cm.channel,
-                )
-            except Exception:
-                logger.debug("Session save error", exc_info=True)
+            if completed:
+                try:
+                    _system.session_store.save_message(
+                        session.session_id,
+                        "user",
+                        cm.content,
+                        channel=cm.channel,
+                    )
+                    _system.session_store.save_message(
+                        session.session_id,
+                        "assistant",
+                        reply,
+                        channel=cm.channel,
+                    )
+                except Exception:
+                    logger.debug("Session save error", exc_info=True)
 
             if reply:
                 try:

@@ -21,6 +21,7 @@ from openjarvis.engine._base import (
     InferenceEngine,
     messages_to_dicts,
 )
+from openjarvis.engine._finish import conservative_finish_reason
 from openjarvis.engine._stubs import StreamChunk
 
 logger = logging.getLogger(__name__)
@@ -499,6 +500,7 @@ class CloudEngine(InferenceEngine):
         body: Dict[str, Any] = {
             "model": actual_model,
             "input": input_msgs,
+            "max_output_tokens": max_tokens,
             "store": False,
             "stream": False,
         }
@@ -540,6 +542,11 @@ class CloudEngine(InferenceEngine):
         usage_data = data.get("usage", {})
         prompt_tokens = usage_data.get("input_tokens", 0)
         completion_tokens = usage_data.get("output_tokens", 0)
+        finish_reason = conservative_finish_reason(data.get("status"))
+        if str(data.get("status") or "").strip().lower() == "incomplete":
+            details = data.get("incomplete_details")
+            reason = details.get("reason") if isinstance(details, dict) else None
+            finish_reason = conservative_finish_reason(reason)
 
         return {
             "content": content,
@@ -549,7 +556,7 @@ class CloudEngine(InferenceEngine):
                 "total_tokens": prompt_tokens + completion_tokens,
             },
             "model": actual_model,
-            "finish_reason": "stop",
+            "finish_reason": finish_reason,
             "cost_usd": 0.0,
             "ttft": elapsed,
         }
@@ -626,7 +633,7 @@ class CloudEngine(InferenceEngine):
                 "total_tokens": (usage.total_tokens if usage else 0),
             },
             "model": resp.model,
-            "finish_reason": choice.finish_reason or "stop",
+            "finish_reason": conservative_finish_reason(choice.finish_reason),
             "cost_usd": estimate_cost(model, prompt_tokens, completion_tokens),
             "ttft": elapsed,
         }
@@ -755,7 +762,7 @@ class CloudEngine(InferenceEngine):
                 "total_tokens": prompt_tokens + completion_tokens,
             },
             "model": resp.model,
-            "finish_reason": resp.stop_reason or "stop",
+            "finish_reason": conservative_finish_reason(resp.stop_reason),
             "cost_usd": estimate_cost(model, prompt_tokens, completion_tokens),
             "ttft": elapsed,
             "content_blocks": content_blocks,
@@ -906,6 +913,9 @@ class CloudEngine(InferenceEngine):
         um = resp.usage_metadata
         prompt_tokens = getattr(um, "prompt_token_count", 0) if um else 0
         completion_tokens = getattr(um, "candidates_token_count", 0) if um else 0
+        finish_reason = conservative_finish_reason(
+            getattr(candidates[0], "finish_reason", None) if candidates else None
+        )
 
         result: Dict[str, Any] = {
             "content": content,
@@ -915,7 +925,7 @@ class CloudEngine(InferenceEngine):
                 "total_tokens": prompt_tokens + completion_tokens,
             },
             "model": model,
-            "finish_reason": "stop",
+            "finish_reason": finish_reason,
             "cost_usd": estimate_cost(model, prompt_tokens, completion_tokens),
             "ttft": elapsed,
         }
@@ -969,7 +979,7 @@ class CloudEngine(InferenceEngine):
                 "total_tokens": (usage.total_tokens if usage else 0),
             },
             "model": resp.model,
-            "finish_reason": choice.finish_reason or "stop",
+            "finish_reason": conservative_finish_reason(choice.finish_reason),
             "ttft": elapsed,
         }
         if getattr(choice.message, "tool_calls", None):
@@ -1024,7 +1034,7 @@ class CloudEngine(InferenceEngine):
                 "total_tokens": (usage.total_tokens if usage else 0),
             },
             "model": resp.model,
-            "finish_reason": choice.finish_reason or "stop",
+            "finish_reason": conservative_finish_reason(choice.finish_reason),
             "cost_usd": estimate_cost(model, prompt_tokens, completion_tokens),
             "ttft": elapsed,
         }
@@ -1074,7 +1084,7 @@ class CloudEngine(InferenceEngine):
                 "total_tokens": (usage.total_tokens if usage else 0),
             },
             "model": resp.model,
-            "finish_reason": choice.finish_reason or "stop",
+            "finish_reason": conservative_finish_reason(choice.finish_reason),
             "cost_usd": estimate_cost(model, prompt_tokens, completion_tokens),
             "ttft": elapsed,
         }
@@ -1552,7 +1562,19 @@ class CloudEngine(InferenceEngine):
                         )
                 elif event.type == "message_delta":
                     stop_reason = event.delta.stop_reason
-                    finish = "tool_calls" if stop_reason == "tool_use" else "stop"
+                    # Anthropic exposes several non-success terminals.  Only
+                    # ``end_turn``/``stop_sequence`` are complete prose; mapping every
+                    # other value to ``stop`` made max-token and paused responses look
+                    # complete to the managed-agent and SSE boundaries.
+                    finish = {
+                        "end_turn": "stop",
+                        "stop_sequence": "stop",
+                        "tool_use": "tool_calls",
+                        "refusal": "content_filter",
+                        "max_tokens": "length",
+                        "pause_turn": "length",
+                        "model_context_window_exceeded": "length",
+                    }.get(stop_reason, "length")
                     yield StreamChunk(finish_reason=finish)
 
             # End-of-stream parity with ``_generate_anthropic``: emit

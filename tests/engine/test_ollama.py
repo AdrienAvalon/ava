@@ -68,6 +68,39 @@ class TestOllamaGenerate:
                 )
 
 
+@pytest.mark.parametrize(
+    ("done_reason", "expected"),
+    [("stop", "stop"), ("length", "length"), (None, None)],
+)
+def test_generate_preserves_ollama_done_reason(
+    engine: OllamaEngine,
+    done_reason,
+    expected,
+) -> None:
+    payload = {
+        "message": {"role": "assistant", "content": "partial"},
+        "model": "qwen3:8b",
+    }
+    if done_reason is not None:
+        payload["done_reason"] = done_reason
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload, request=request)
+
+    engine._client.close()
+    engine._client = httpx.Client(
+        base_url="http://testhost:11434",
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = engine.generate(
+        [Message(role=Role.USER, content="Hi")],
+        model="qwen3:8b",
+    )
+
+    assert result["finish_reason"] == expected
+
+
 @requires_respx
 class TestOllamaListModels:
     def test_list_models(self, engine: OllamaEngine) -> None:
@@ -406,6 +439,77 @@ class TestOllamaStreamIsAsyncAndBounded:
                 tokens.append(tok)
         # The disconnect happened AFTER the first token was delivered (mid-stream).
         assert tokens == ["Hi"]
+
+    @pytest.mark.asyncio
+    async def test_tool_call_does_not_hide_length_terminal(self) -> None:
+        body = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "function": {
+                                        "name": "calculator",
+                                        "arguments": {"expression": "2+"},
+                                    },
+                                }
+                            ]
+                        },
+                        "done": False,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "message": {},
+                        "done": True,
+                        "done_reason": "length",
+                    }
+                ),
+            ]
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text=body, request=request)
+
+        engine = OllamaEngine(host="http://localhost:11434")
+        engine._async_transport = httpx.MockTransport(handler)
+        chunks = [
+            chunk
+            async for chunk in engine.stream_full(
+                [Message(role=Role.USER, content="Hi")],
+                model="qwen3:8b",
+                tools=[{"type": "function", "function": {"name": "calculator"}}],
+            )
+        ]
+
+        assert any(chunk.tool_calls for chunk in chunks)
+        assert chunks[-1].finish_reason == "length"
+
+    @pytest.mark.asyncio
+    async def test_stream_full_rejects_malformed_frame_before_stop(self) -> None:
+        body = "\n".join(
+            [
+                '{"message":{"content":"lost"}',
+                '{"message":{},"done":true,"done_reason":"stop"}',
+            ]
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text=body, request=request)
+
+        engine = OllamaEngine(host="http://localhost:11434")
+        engine._async_transport = httpx.MockTransport(handler)
+
+        with pytest.raises(json.JSONDecodeError):
+            _ = [
+                chunk
+                async for chunk in engine.stream_full(
+                    [Message(role=Role.USER, content="Hi")],
+                    model="qwen3:8b",
+                )
+            ]
 
 
 class TestOllamaStreamHttpErrorMapping:

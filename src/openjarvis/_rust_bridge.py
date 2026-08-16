@@ -11,6 +11,8 @@ import functools
 import json
 from typing import TYPE_CHECKING, List
 
+from openjarvis.engine._finish import conservative_finish_reason
+
 if TYPE_CHECKING:
     import types as _types
 
@@ -169,10 +171,13 @@ def optimization_run_from_json(json_str: str) -> dict:
 def generate_result_from_json(json_str: str) -> dict:
     """Convert Rust GenerateResult JSON to a Python dict."""
     data = json.loads(json_str)
+    finish_reason = conservative_finish_reason(data.get("finish_reason"))
+    if finish_reason not in {"stop", "length", "tool_calls", "content_filter"}:
+        finish_reason = "length"
     return {
         "content": data.get("content", ""),
         "model": data.get("model", ""),
-        "finish_reason": data.get("finish_reason", "stop"),
+        "finish_reason": finish_reason,
         "usage": data.get("usage", {}),
         "tool_calls": data.get("tool_calls"),
         "ttft": data.get("ttft", 0.0),

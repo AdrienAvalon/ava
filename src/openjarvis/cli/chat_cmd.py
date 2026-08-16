@@ -13,7 +13,10 @@ from openjarvis.cli._tool_names import resolve_tool_names
 from openjarvis.core.config import load_config
 from openjarvis.core.events import EventBus
 from openjarvis.core.types import Message, Role
+from openjarvis.engine._finish import conservative_finish_reason
 from openjarvis.memory import publish_completed_exchange
+
+_INCOMPLETE_RESPONSE_MESSAGE = "Response generation did not complete. Please retry."
 
 
 def _read_input(prompt: str = "You> ") -> Optional[str]:
@@ -104,7 +107,10 @@ def chat(
 
             if AgentRegistry.contains(agent_key):
                 agent_cls = AgentRegistry.get(agent_key)
-                kwargs: dict = {"bus": bus}
+                kwargs: dict = {
+                    "bus": bus,
+                    "max_tokens": config.intelligence.max_tokens,
+                }
 
                 if getattr(agent_cls, "accepts_tools", False):
                     tool_names_list = resolve_tool_names(
@@ -259,8 +265,8 @@ def chat(
                     console.print(f"[bold]{role}:[/bold] {msg.content[:200]}")
             continue
 
-        # Add user message
-        history.append(Message(role=Role.USER, content=user_input))
+        user_message = Message(role=Role.USER, content=user_input)
+        request_history = [*history, user_message]
 
         # Generate response
         try:
@@ -269,15 +275,36 @@ def chat(
                 content = (
                     response.content if hasattr(response, "content") else str(response)
                 )
+                metadata = getattr(response, "metadata", {}) or {}
+                finish_reason = conservative_finish_reason(
+                    metadata.get("finish_reason")
+                )
             else:
-                result = engine.generate(history, model=model)
+                result = engine.generate(
+                    request_history,
+                    model=model,
+                    temperature=config.intelligence.temperature,
+                    max_tokens=config.intelligence.max_tokens,
+                )
                 content = (
                     result.get("content", "")
                     if isinstance(result, dict)
                     else str(result)
                 )
+                finish_reason = conservative_finish_reason(
+                    result.get("finish_reason") if isinstance(result, dict) else None
+                )
 
-            history.append(Message(role=Role.ASSISTANT, content=content))
+            if (
+                finish_reason != "stop"
+                or not isinstance(content, str)
+                or not content.strip()
+            ):
+                raise RuntimeError(_INCOMPLETE_RESPONSE_MESSAGE)
+
+            history.extend(
+                [user_message, Message(role=Role.ASSISTANT, content=content)]
+            )
             console.print()
             console.print(Markdown(content))
             console.print()

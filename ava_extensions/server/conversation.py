@@ -406,8 +406,46 @@ def lire_strict(utilisateur: str, limite: int = 200) -> list[dict[str, Any]]:
                 " WHERE utilisateur = ? ORDER BY id DESC LIMIT ?",
                 (utilisateur, limite),
             ).fetchall()
+            visible_turn_ids = sorted(
+                {str(row[3]) for row in rangs if row[3] is not None}
+            )
+            journaux: list[tuple[str, str | None, str | None, str | None, str]] = []
+            if visible_turn_ids:
+                placeholders = ",".join("?" for _turn_id in visible_turn_ids)
+                journaux = cx.execute(
+                    "SELECT turn_id, assistant_text, response_json, "
+                    "request_sha256, state FROM tours "
+                    "WHERE utilisateur = ? "
+                    f"AND turn_id IN ({placeholders})",
+                    (utilisateur, *visible_turn_ids),
+                ).fetchall()
     except Exception as exc:  # noqa: BLE001
         raise ConversationStorageError("conversation history read failed") from exc
+    # A manually reconciled/imported pair has no request fingerprint and remains
+    # valid without an OpenAI replay envelope. A model-generated durable turn is
+    # different: its fingerprint proves that it names a generation effect, so a
+    # missing, corrupt or non-stop envelope must quarantine it exactly like
+    # ``finish_reason=length``. Missing journal rows and non-completed states are
+    # also invisible rather than being inferred complete from the two text rows.
+    tours_persistes_complets = {
+        str(turn_id)
+        for turn_id, assistant_text, response_json, request_sha256, state in journaux
+        if state == "completed"
+        and assistant_text is not None
+        and (
+            request_sha256 is None
+            or (
+                response_json is not None
+                and _response_envelope_is_complete(response_json, assistant_text)
+            )
+        )
+    }
+    tours_incomplets = set(visible_turn_ids) - tours_persistes_complets
+    if tours_incomplets:
+        logger.warning(
+            "conversation history quarantined %d incomplete durable turn(s)",
+            len(tours_incomplets),
+        )
     positions_par_tour: dict[str, set[tuple[str, int | None]]] = {}
     for role, _texte, _horodatage, turn_id, turn_position in rangs:
         if turn_id is not None:
@@ -424,7 +462,8 @@ def lire_strict(utilisateur: str, limite: int = 200) -> list[dict[str, Any]]:
         # Une limite peut couper juste entre les deux lignes atomiques d'un tour.
         # Dans ce cas on retire la moitie visible au lieu de rejouer une reponse
         # orpheline ou une question sans reponse dans le contexte du modele.
-        if turn_id is None or turn_id in tours_complets
+        if turn_id is None
+        or (turn_id in tours_complets and turn_id in tours_persistes_complets)
     ]
 
 
@@ -646,6 +685,33 @@ def _valider_response_json(
     if content != assistant_text:
         raise ValueError("conversation response envelope content does not match")
     return serialized
+
+
+def _response_envelope_is_complete(
+    response_json: str,
+    assistant_text: str | None,
+) -> bool:
+    """Recognize a historically committed answer only with terminal proof.
+
+    Older daemon versions committed ``finish_reason=length`` as completed.
+    Their rows remain available for forensic recovery, but must not be replayed
+    to the model: doing so encourages the next answer to finish the truncated
+    sentence before addressing the current user message.
+    """
+
+    if not assistant_text:
+        return False
+    try:
+        serialized = _valider_response_json(response_json, assistant_text)
+        if serialized is None:
+            return False
+        response = ChatCompletionResponse.model_validate_json(serialized, strict=True)
+        choice = response.choices[0]
+        return choice.finish_reason == "stop" and bool(
+            (choice.message.content or "").strip()
+        )
+    except (IndexError, TypeError, ValueError):
+        return False
 
 
 def restaurer_response_json(response_json: str) -> ChatCompletionResponse:
@@ -1157,7 +1223,13 @@ def ajouter(utilisateur: str, lignes: list[dict[str, Any]]) -> int:
 
 
 def effacer(utilisateur: str) -> int:
-    """Efface la conversation de CET utilisateur uniquement."""
+    """Efface la conversation de CET utilisateur uniquement.
+
+    Contrairement aux anciens appels best-effort de lecture et d'ajout, un
+    effacement explicite ne peut jamais etre acquitte si SQLite ne l'a pas
+    durabilise. Le client s'appuie sur cette exception pour conserver sa copie
+    locale tant que la suppression serveur n'est pas confirmee.
+    """
     try:
         with _verrou, contextlib.closing(_connexion()) as cx, cx:
             turn_ids = cx.execute(
@@ -1177,5 +1249,4 @@ def effacer(utilisateur: str) -> int:
             cx.execute("DELETE FROM tours WHERE utilisateur = ?", (utilisateur,))
             return cur.rowcount or 0
     except Exception as exc:  # noqa: BLE001
-        logger.warning("effacement impossible: %s", exc)
-        return 0
+        raise ConversationStorageError("conversation deletion failed") from exc

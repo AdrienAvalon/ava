@@ -2,6 +2,8 @@
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from openjarvis.agents.monitor_operative import MonitorOperativeAgent
 from openjarvis.core.registry import AgentRegistry
 
@@ -63,3 +65,29 @@ class TestMonitorOperativeAgent:
         result = agent.run("What is the answer?")
         assert result.content == "The answer is 42."
         assert result.turns >= 1
+        assert result.metadata["finish_reason"] == "stop"
+
+    @pytest.mark.parametrize("finish_reason", ["length", "max_tokens", None])
+    def test_incomplete_native_tool_call_is_not_executed(self, finish_reason) -> None:
+        engine = _make_engine("partial")
+        engine.generate.return_value.update(
+            {
+                "finish_reason": finish_reason,
+                "tool_calls": [
+                    {
+                        "id": "partial",
+                        "name": "think",
+                        "arguments": '{"thought":"partial"}',
+                    }
+                ],
+            }
+        )
+        agent = MonitorOperativeAgent(engine, "test-model")
+        agent._executor.execute = MagicMock()
+
+        result = agent.run("Do not execute")
+
+        agent._executor.execute.assert_not_called()
+        assert result.metadata["finish_reason"] == (
+            "length" if finish_reason == "max_tokens" else finish_reason
+        )

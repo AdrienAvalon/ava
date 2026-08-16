@@ -25,6 +25,7 @@ from openjarvis.engine import (
     discover_models,
     get_engine,
 )
+from openjarvis.engine._finish import conservative_finish_reason
 from openjarvis.intelligence import (
     merge_discovered_models,
     register_builtin_models,
@@ -33,6 +34,28 @@ from openjarvis.telemetry.instrumented_engine import InstrumentedEngine
 from openjarvis.telemetry.store import TelemetryStore
 
 logger = logging.getLogger(__name__)
+
+_INCOMPLETE_RESPONSE_MESSAGE = "Response generation did not complete. Please retry."
+
+
+def _abort_incomplete_response(*, output_json: bool, console: Console) -> None:
+    """Report an incomplete generation without echoing its partial content."""
+
+    if output_json:
+        click.echo(
+            json_mod.dumps(
+                {
+                    "error": {
+                        "type": "incomplete_response",
+                        "message": _INCOMPLETE_RESPONSE_MESSAGE,
+                    }
+                },
+                indent=2,
+            )
+        )
+    else:
+        console.print(f"[red]{_INCOMPLETE_RESPONSE_MESSAGE}[/red]")
+    raise click.exceptions.Exit(1)
 
 
 def _run_research(
@@ -328,12 +351,16 @@ def _run_agent(
     temperature: float,
     max_tokens: int,
     capability_policy=None,
+    boundary_guard=None,
     memory_files_config=None,
 ):
     """Instantiate and run an agent, returning the AgentResult."""
     # Import agents to trigger registration
     import openjarvis.agents  # noqa: F401
-    from openjarvis.agents._stubs import AgentContext
+    from openjarvis.agents._stubs import (
+        AgentContext,
+        configure_tool_execution_security,
+    )
     from openjarvis.core.registry import AgentRegistry
 
     if not AgentRegistry.contains(agent_name):
@@ -384,8 +411,6 @@ def _run_agent(
         agent_kwargs["max_turns"] = config.agent.max_turns
         agent_kwargs["interactive"] = True
         agent_kwargs["confirm_callback"] = lambda prompt: True
-    if capability_policy is not None:
-        agent_kwargs["capability_policy"] = capability_policy
 
     # Wire the SystemPromptBuilder so SOUL.md / MEMORY.md / USER.md persona
     # files actually reach the model. Only passed to agents whose __init__
@@ -404,6 +429,13 @@ def _run_agent(
         )
 
     agent = agent_cls(engine, model_name, **agent_kwargs)
+    configure_tool_execution_security(
+        agent,
+        capability_policy=capability_policy,
+        boundary_guard=boundary_guard,
+        # CLI input does not establish an authenticated Principal.
+        principal_provenance=None,
+    )
     # Hold MCP transports alive for the agent's lifetime — without this
     # reference they'd be garbage-collected when this function returns
     # and the underlying HTTP connections would close mid-execution (#461
@@ -882,6 +914,7 @@ def ask(
                 temperature,
                 max_tokens,
                 capability_policy=sec.capability_policy,
+                boundary_guard=getattr(sec, "boundary_guard", None),
                 memory_files_config=effective_mf,
             )
         except EngineContextLengthError as exc:
@@ -894,11 +927,28 @@ def ask(
             console.print(hint_no_engine())
             sys.exit(1)
 
+        agent_metadata = getattr(result, "metadata", {}) or {}
+        agent_finish_reason = conservative_finish_reason(
+            agent_metadata.get("finish_reason")
+        )
+        if (
+            agent_finish_reason != "stop"
+            or not isinstance(result.content, str)
+            or not result.content.strip()
+        ):
+            if telem_store is not None:
+                try:
+                    telem_store.close()
+                except Exception as exc:
+                    logger.debug("Error closing telemetry store: %s", exc)
+            _abort_incomplete_response(output_json=output_json, console=console)
+
         if output_json:
             click.echo(
                 json_mod.dumps(
                     {
                         "content": result.content,
+                        "finish_reason": agent_finish_reason,
                         "turns": result.turns,
                         "tool_results": [
                             {
@@ -1007,6 +1057,26 @@ def ask(
         console.print(f"[red]Engine error:[/red] {exc}")
         console.print(hint_no_engine())
         sys.exit(1)
+
+    finish_reason = conservative_finish_reason(result.get("finish_reason"))
+    if (
+        finish_reason != "stop"
+        or not isinstance(result.get("content"), str)
+        or not result.get("content", "").strip()
+    ):
+        if energy_monitor is not None:
+            try:
+                energy_monitor.close()
+            except Exception as exc:
+                logger.debug("Error closing energy monitor: %s", exc)
+        if telem_store is not None:
+            try:
+                telem_store.close()
+            except Exception as exc:
+                logger.debug("Error closing telemetry store: %s", exc)
+        _abort_incomplete_response(output_json=output_json, console=console)
+
+    result["finish_reason"] = finish_reason
 
     # Output
     if output_json:
