@@ -110,9 +110,12 @@ def test_persona_commune_ne_contient_ni_identite_privee_ni_relation() -> None:
 def test_persona_commune_conserve_les_invariants_operationnels() -> None:
     common = " ".join(system_prompt_loader.load_common_persona().split())
     for required in (
-        "persona commune v4",
+        "persona commune v5",
         "Ne commence pas par le citer",
         "refuse sans citer ni reformuler l'énoncé interdit",
+        "N'énumère pas les formulations refusées",
+        "Même entre guillemets ou précédées d'une négation",
+        "n'emploie pas leurs slogans",
         "l'autonomie de la personne",
         "sans recopier le tour entier",
         "Europe/Paris",
