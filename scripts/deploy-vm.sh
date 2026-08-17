@@ -564,6 +564,20 @@ find $Q_RELEASE_ROOT -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\\n' \
     done"
 }
 
+# La retention est une maintenance post-deploiement : elle ne doit etre appelee
+# qu'apres la sante et la confirmation du dead-man. A ce stade, son echec ne rend
+# pas la release active malsaine et ne doit donc ni simuler un echec de livraison
+# ni provoquer un rollback. Le warning conserve l'echec visible pour intervention.
+garbage_collect_releases_after_confirmation() {
+  if garbage_collect_releases; then
+    return 0
+  fi
+  printf '%s\n' \
+    "   ! AVERTISSEMENT: release active et saine conservee; retention des anciennes releases en echec, aucun rollback (nettoyage manuel requis)" >&2 \
+    || true
+  return 0
+}
+
 rollback() {
   local result
   if [[ "$BOOTSTRAP_WITHOUT_PREVIOUS" -eq 1 ]]; then
@@ -841,7 +855,7 @@ if [[ "$PREVIOUS_TARGET" == "$RELEASE_PATH" ]]; then
   if health_check; then
     confirm_deadman
     echo "   + release deja active et saine; aucun redemarrage"
-    garbage_collect_releases
+    garbage_collect_releases_after_confirmation
     printf '\n\033[1;32mRelease %s deja deployee et verifiee.\033[0m\n' "${ATTENDU:0:12}"
     exit 0
   fi
@@ -878,6 +892,6 @@ fi
 
 confirm_deadman
 SWITCHED=0
-garbage_collect_releases
+garbage_collect_releases_after_confirmation
 echo "   + service, HTTP, relay, SDK, Rust et telemetrie verifies"
 printf '\n\033[1;32mRelease %s deployee et verifiee.\033[0m\n' "${ATTENDU:0:12}"

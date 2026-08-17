@@ -38,6 +38,23 @@ def _rust_tree_hash(repo: Path, commit: str) -> str:
     return hashlib.sha256(archive).hexdigest()
 
 
+def _make_collectable_releases(releases: Path, *, count: int = 3) -> list[Path]:
+    """Create ordered, ready-looking stale releases eligible for retention."""
+
+    releases.mkdir(parents=True, exist_ok=True)
+    created: list[Path] = []
+    oldest_timestamp = time.time() - 1_000
+    for index in range(count):
+        release = releases / f"{index + 1:040x}"
+        release.mkdir()
+        (release / ".ava-ready").write_text(f"{release.name}\n")
+        (release / ".ava-release").write_text("format=ava-release-v1\n")
+        timestamp = oldest_timestamp + index
+        os.utime(release, (timestamp, timestamp))
+        created.append(release)
+    return created
+
+
 class DeploymentFixture(NamedTuple):
     repo: Path
     remote: Path
@@ -414,6 +431,20 @@ else
 fi
 """,
     )
+    _write_executable(
+        fake_bin / "chmod",
+        """#!/usr/bin/env bash
+set -euo pipefail
+target=${!#}
+if [[ -n "${FAKE_FAIL_GC_CHMOD_TARGET:-}" \
+  && "${1:-}" == "-R" && "${2:-}" == "u+w" && "${3:-}" == "--" \
+  && "$target" == "$FAKE_FAIL_GC_CHMOD_TARGET" ]]; then
+  printf 'fake GC chmod failure: %s\n' "$target" >&2
+  exit 97
+fi
+exec /usr/bin/chmod "$@"
+""",
+    )
 
     environment = os.environ.copy()
     environment.update(
@@ -606,6 +637,63 @@ def test_same_sha_reuses_release_without_rebuilding_it(tmp_path: Path) -> None:
     assert (release / ".ava-release").read_bytes() == manifest_before
     assert fixture.build_log.read_bytes() == build_log_before
     assert fixture.restart_count.read_text().strip() == "1"
+
+
+def test_gc_chmod_failure_after_confirmation_is_a_warning(tmp_path: Path) -> None:
+    fixture = _make_deployment_fixture(tmp_path)
+    stale_releases = _make_collectable_releases(fixture.releases)
+    oldest = stale_releases[0]
+
+    result = _deploy(
+        fixture,
+        AVA_RELEASE_KEEP="2",
+        FAKE_FAIL_GC_CHMOD_TARGET=str(oldest),
+    )
+
+    candidate = fixture.releases / fixture.commit
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert fixture.current.resolve() == candidate
+    assert fixture.service_state.read_text().strip() == "active"
+    assert oldest.is_dir()
+    assert "fake GC chmod failure" in result.stderr
+    assert (
+        "AVERTISSEMENT: release active et saine conservee; retention des anciennes "
+        "releases en echec, aucun rollback (nettoyage manuel requis)" in result.stderr
+    )
+    assert "restauration de" not in result.stderr
+    assert not fixture.deadman_state.exists()
+    assert not (fixture.releases / ".deploy-lock").exists()
+
+
+def test_gc_chmod_failure_for_already_active_release_is_a_warning(
+    tmp_path: Path,
+) -> None:
+    fixture = _make_deployment_fixture(tmp_path)
+    first = _deploy(fixture)
+    assert first.returncode == 0, first.stdout + first.stderr
+    candidate = fixture.releases / fixture.commit
+    stale_releases = _make_collectable_releases(fixture.releases)
+    oldest = stale_releases[0]
+
+    repeated = _deploy(
+        fixture,
+        AVA_RELEASE_KEEP="2",
+        FAKE_FAIL_GC_CHMOD_TARGET=str(oldest),
+    )
+
+    assert repeated.returncode == 0, repeated.stdout + repeated.stderr
+    assert "release deja active et saine; aucun redemarrage" in repeated.stdout
+    assert fixture.current.resolve() == candidate
+    assert fixture.restart_count.read_text().strip() == "1"
+    assert oldest.is_dir()
+    assert "fake GC chmod failure" in repeated.stderr
+    assert (
+        "AVERTISSEMENT: release active et saine conservee; retention des anciennes "
+        "releases en echec, aucun rollback (nettoyage manuel requis)" in repeated.stderr
+    )
+    assert "restauration de" not in repeated.stderr
+    assert not fixture.deadman_state.exists()
+    assert not (fixture.releases / ".deploy-lock").exists()
 
 
 def test_same_sha_rejects_mutated_attestation_and_writable_release(
@@ -1073,6 +1161,7 @@ def test_contract_has_no_in_place_checkout_or_frontend_mutation() -> None:
     source = SCRIPT.read_text()
 
     assert "git pull" not in source
+    assert "sudo rm" not in source
     assert "cd $Q_LEGACY" not in source
     assert "ls -t /tmp/openjarvis_rust" not in source
     assert source.index("remote_wheel_hash=") < source.index("pip install")
