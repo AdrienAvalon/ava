@@ -181,6 +181,21 @@ def _relationship_allowed(case: dict[str, Any]) -> bool:
     )
 
 
+@pytest.fixture
+def _legacy_baseline_without_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Emulate a baseline release that predates the runtime guard hook."""
+
+    from ava_extensions.evals.relationship import shadow_runner
+    from openjarvis.server import routes
+
+    monkeypatch.setattr(
+        routes,
+        "_prepare_relationship_guard_or_503",
+        lambda _relationship_overlay: None,
+    )
+    monkeypatch.setattr(shadow_runner, "_relationship_guard_module", lambda: None)
+
+
 def test_shadow_assertion_key_encodes_trailing_crlf_entropy_as_hex() -> None:
     entropy = b"\xa5" * 46 + b"\r\n"
 
@@ -196,6 +211,7 @@ def test_shadow_runner_exercises_auth_rollback_and_corpus_without_effects(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    _legacy_baseline_without_guard: None,
 ) -> None:
     from ava_extensions.server import principal as principal_module
 
@@ -433,6 +449,7 @@ def test_shadow_runner_rejects_any_engine_tool_call_before_publication(
 
 def test_shadow_runner_can_emit_a_separately_versioned_baseline(
     tmp_path: Path,
+    _legacy_baseline_without_guard: None,
 ) -> None:
     engine = FakeEngine(_safe_outputs())
     output_directory = _private_output_directory(tmp_path)
@@ -459,7 +476,11 @@ def test_shadow_runner_can_emit_a_separately_versioned_baseline(
 
 def test_candidate_shadow_fails_closed_without_observed_runtime_guard(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from ava_extensions.evals.relationship import shadow_runner
+
+    monkeypatch.setattr(shadow_runner, "_relationship_guard_module", lambda: None)
     engine = FakeEngine(_safe_outputs())
     output_directory = _private_output_directory(tmp_path)
     attestation_path, attestation_sha256 = _release_attestation(tmp_path)
@@ -938,6 +959,7 @@ def test_engine_result_model_must_match_before_http_response(
 def test_configured_anthropic_path_catalogs_attested_new_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    _legacy_baseline_without_guard: None,
 ) -> None:
     api_key = "configured-anthropic-key"
     monkeypatch.setenv("ANTHROPIC_API_KEY", api_key)
@@ -991,6 +1013,7 @@ def test_configured_anthropic_path_catalogs_attested_new_model(
 def test_configured_anthropic_path_uses_real_cloud_engine_adapter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    _legacy_baseline_without_guard: None,
 ) -> None:
     from types import SimpleNamespace
 
@@ -1092,7 +1115,7 @@ def test_configured_anthropic_rejects_reflected_api_key_without_publishing(
             release_attestation_path=attestation_path,
             release_attestation_sha256=attestation_sha256,
             execution_mode="configured-anthropic",
-            role="baseline",
+            role="candidate",
         )
 
     captured = capsys.readouterr()

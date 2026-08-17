@@ -130,6 +130,23 @@ class TestWebSocketStreaming:
         assert messages[1].role == Role.USER
         assert messages[1].content == "Hi"
 
+    def test_no_overlay_accepts_minimal_stream_chunks_without_tool_calls(self):
+        engine = MagicMock()
+        engine.engine_id = "minimal-stream"
+
+        async def stream_full(messages, *, model="test-model", **kwargs):
+            del messages, model, kwargs
+            yield SimpleNamespace(content="minimal", finish_reason=None)
+            yield SimpleNamespace(content=None, finish_reason="stop")
+
+        engine.stream_full = stream_full
+        client = TestClient(_make_app(engine))
+
+        with client.websocket_connect("/v1/chat/stream") as ws:
+            ws.send_text(json.dumps({"message": "Hi"}))
+            assert ws.receive_json() == {"type": "chunk", "content": "minimal"}
+            assert ws.receive_json() == {"type": "done", "content": "minimal"}
+
     def test_missing_message_field(self):
         """Sending JSON without a 'message' field should return an error."""
         app = _make_app()
@@ -331,7 +348,9 @@ class TestWebSocketStreaming:
         assert "Test Owner" in system_prompt
         assert principal.subject not in system_prompt
         trace = app.state.trace_store.save.call_args.args[0]
-        assert trace.metadata == {"provenance": principal.provenance}
+        assert trace.metadata["provenance"] == principal.provenance
+        assert trace.metadata["policy_id"] == "ava.relationship.text-safety"
+        assert trace.metadata["relationship_guard_action"] == "allow"
         assert principal.subject not in trace.metadata["provenance"]
         app.state.memory_service.submit.assert_not_called()
 

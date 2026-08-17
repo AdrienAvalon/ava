@@ -805,6 +805,7 @@ def _record_ws_trace(
     started_at: float,
     ended_at: float,
     provenance: str | None,
+    metadata: dict[str, object] | None = None,
 ) -> None:
     """Record a trace for a completed WebSocket chat (best-effort)."""
     if trace_store is None or not result:
@@ -819,6 +820,7 @@ def _record_ws_trace(
         started_at=started_at,
         ended_at=ended_at,
         provenance=provenance,
+        metadata=metadata,
     )
 
 
@@ -832,6 +834,7 @@ async def _websocket_trust_context(websocket: WebSocket):
     from openjarvis.server.routes import (
         _base_identity_prompt,
         _identity_header_present,
+        _prepare_relationship_guard_or_503,
         _relationship_context,
     )
 
@@ -870,7 +873,13 @@ async def _websocket_trust_context(websocket: WebSocket):
             relationship_overlay is not None and relationship_overlay.display_name
         ),
     )
-    return principal, relationship_overlay, base_identity_prompt
+    relationship_guard = _prepare_relationship_guard_or_503(relationship_overlay)
+    return (
+        principal,
+        relationship_overlay,
+        base_identity_prompt,
+        relationship_guard,
+    )
 
 
 async def _close_untrusted_websocket(websocket: WebSocket, exc: Exception) -> None:
@@ -881,6 +890,11 @@ async def _close_untrusted_websocket(websocket: WebSocket, exc: Exception) -> No
     if isinstance(exc, _WebSocketIdentityRejectedError):
         code = 1008
         reason = "Ava identity rejected"
+    elif isinstance(exc, HTTPException) and exc.detail == (
+        "Ava relationship output policy unavailable"
+    ):
+        code = 1011
+        reason = "Ava relationship output policy unavailable"
     elif isinstance(exc, RelationshipPolicyError):
         code = 1011
         reason = "Ava relationship policy unavailable"
@@ -944,6 +958,7 @@ async def websocket_chat_stream(websocket: WebSocket):
                     principal,
                     relationship_overlay,
                     base_identity_prompt,
+                    relationship_guard,
                 ) = await _websocket_trust_context(websocket)
             except Exception as exc:  # noqa: BLE001 - generic client response
                 logger.warning(
@@ -970,16 +985,68 @@ async def websocket_chat_stream(websocket: WebSocket):
 
             from openjarvis.core.types import Message, Role
             from openjarvis.server.routes import (
+                _RELATIONSHIP_STREAM_BUFFER_BYTES,
+                _apply_relationship_guard,
+                _assembled_stream_tool_calls,
+                _bind_relationship_guard,
+                _copy_engine_for_relationship_events,
                 _ensure_identity_prompt,
                 _motif_arret,
+                _reject_client_temporal_context_marker,
+                _relationship_request_event_bus,
                 _runtime_completion_limit,
             )
+
+            if "temporal_context" in data:
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "detail": "Ava temporal context rejected",
+                    }
+                )
+                continue
+            try:
+                _reject_client_temporal_context_marker([message])
+            except HTTPException as exc:
+                if exc.status_code == 503:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "detail": "Ava temporal context unavailable",
+                        }
+                    )
+                    await websocket.close(code=1011)
+                    return
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "detail": "Ava temporal context rejected",
+                    }
+                )
+                continue
 
             messages = _ensure_identity_prompt(
                 [Message(role=Role.USER, content=message)],
                 base_identity_prompt,
                 relationship_overlay,
             )
+            relationship_guard = _bind_relationship_guard(
+                relationship_guard,
+                messages,
+            )
+            if relationship_guard is not None:
+                event_bus = getattr(websocket.app.state, "bus", None)
+                if event_bus is None:
+                    event_bus = getattr(engine, "_bus", None)
+                if event_bus is not None:
+                    request_bus = _relationship_request_event_bus(
+                        event_bus,
+                        relationship_guard,
+                    )
+                    engine = _copy_engine_for_relationship_events(
+                        engine,
+                        request_bus,
+                    )
             max_tokens = _runtime_completion_limit(websocket)
 
             # This WS path streams straight from the engine (no agent /
@@ -998,6 +1065,9 @@ async def websocket_chat_stream(websocket: WebSocket):
                 if stream_fn is not None and inspect.isasyncgenfunction(stream_fn):
                     full_content = ""
                     terminal_reason: Optional[str] = None
+                    buffered_content: list[str] = []
+                    buffered_bytes = 0
+                    tool_call_batches: list[list[dict[str, Any]]] = []
                     gen = stream_fn(
                         messages,
                         model=model,
@@ -1006,10 +1076,37 @@ async def websocket_chat_stream(websocket: WebSocket):
                     async for chunk in gen:
                         content = chunk.content or ""
                         if content:
+                            if relationship_guard is not None:
+                                content_bytes = len(content.encode("utf-8"))
+                                if content_bytes > (
+                                    _RELATIONSHIP_STREAM_BUFFER_BYTES - buffered_bytes
+                                ):
+                                    raise RuntimeError(
+                                        "relationship websocket exceeds output buffer"
+                                    )
+                                buffered_bytes += content_bytes
+                                buffered_content.append(content)
                             full_content += content
-                            await websocket.send_json(
-                                {"type": "chunk", "content": content},
-                            )
+                            if relationship_guard is None:
+                                await websocket.send_json(
+                                    {"type": "chunk", "content": content},
+                                )
+                        if relationship_guard is not None and chunk.tool_calls:
+                            encoded_tool_calls = json.dumps(
+                                chunk.tool_calls,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                allow_nan=False,
+                            ).encode("utf-8")
+                            if len(encoded_tool_calls) > (
+                                _RELATIONSHIP_STREAM_BUFFER_BYTES - buffered_bytes
+                            ):
+                                raise RuntimeError(
+                                    "relationship websocket exceeds output buffer"
+                                )
+                            buffered_bytes += len(encoded_tool_calls)
+                            tool_call_batches.append(chunk.tool_calls)
                         if chunk.finish_reason is not None:
                             terminal_reason = _motif_arret(
                                 {"finish_reason": chunk.finish_reason}
@@ -1019,19 +1116,58 @@ async def websocket_chat_stream(websocket: WebSocket):
                             {"type": "error", "detail": "Chat response incomplete"},
                         )
                         continue
+                    effective_content = full_content
+                    relationship_trace_metadata = None
+                    if relationship_guard is not None:
+                        try:
+                            decision = _apply_relationship_guard(
+                                relationship_guard,
+                                full_content,
+                                _assembled_stream_tool_calls(tool_call_batches),
+                            )
+                            relationship_trace_metadata = relationship_guard.metadata()
+                            if not isinstance(relationship_trace_metadata, dict):
+                                raise RuntimeError(
+                                    "relationship guard metadata is invalid"
+                                )
+                        except Exception:
+                            logger.warning(
+                                "WebSocket relationship policy failed before emission"
+                            )
+                            await websocket.send_json(
+                                {
+                                    "type": "error",
+                                    "detail": "Chat output policy unavailable",
+                                }
+                            )
+                            continue
+                        effective_content = decision.output_text
+                        chunks_to_emit = (
+                            [effective_content]
+                            if decision.action == "replace"
+                            else buffered_content
+                        )
+                        for buffered_content_chunk in chunks_to_emit:
+                            await websocket.send_json(
+                                {
+                                    "type": "chunk",
+                                    "content": buffered_content_chunk,
+                                }
+                            )
                     await websocket.send_json(
-                        {"type": "done", "content": full_content},
+                        {"type": "done", "content": effective_content},
                     )
                     _record_ws_trace(
                         trace_store,
                         query=message,
-                        result=full_content,
+                        result=effective_content,
                         model=model,
                         started_at=_ws_started_at,
                         ended_at=_time.time(),
                         provenance=(
                             principal.provenance if principal is not None else None
                         ),
+                        metadata=relationship_trace_metadata,
                     )
                 else:
                     # No rich stream — single-shot generate. Blocking upstream
@@ -1059,7 +1195,7 @@ async def websocket_chat_stream(websocket: WebSocket):
                             )
                         }
                     )
-                    if content:
+                    if content and relationship_guard is None:
                         await websocket.send_json(
                             {"type": "chunk", "content": content},
                         )
@@ -1068,19 +1204,59 @@ async def websocket_chat_stream(websocket: WebSocket):
                             {"type": "error", "detail": "Chat response incomplete"},
                         )
                         continue
+                    effective_content = content
+                    relationship_trace_metadata = None
+                    if relationship_guard is not None:
+                        try:
+                            if len(content.encode("utf-8")) > (
+                                _RELATIONSHIP_STREAM_BUFFER_BYTES
+                            ):
+                                raise RuntimeError(
+                                    "relationship websocket exceeds output buffer"
+                                )
+                            decision = _apply_relationship_guard(
+                                relationship_guard,
+                                content,
+                                (
+                                    result.get("tool_calls")
+                                    if isinstance(result, dict)
+                                    else None
+                                ),
+                            )
+                            relationship_trace_metadata = relationship_guard.metadata()
+                            if not isinstance(relationship_trace_metadata, dict):
+                                raise RuntimeError(
+                                    "relationship guard metadata is invalid"
+                                )
+                        except Exception:
+                            logger.warning(
+                                "WebSocket relationship policy failed before emission"
+                            )
+                            await websocket.send_json(
+                                {
+                                    "type": "error",
+                                    "detail": "Chat output policy unavailable",
+                                }
+                            )
+                            continue
+                        effective_content = decision.output_text
+                        await websocket.send_json(
+                            {"type": "chunk", "content": effective_content},
+                        )
                     await websocket.send_json(
-                        {"type": "done", "content": content},
+                        {"type": "done", "content": effective_content},
                     )
                     _record_ws_trace(
                         trace_store,
                         query=message,
-                        result=content,
+                        result=effective_content,
                         model=model,
                         started_at=_ws_started_at,
                         ended_at=_time.time(),
                         provenance=(
                             principal.provenance if principal is not None else None
                         ),
+                        metadata=relationship_trace_metadata,
                     )
             except WebSocketDisconnect:
                 raise

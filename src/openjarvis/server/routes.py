@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
+import time
 import uuid
 from typing import Any
 
@@ -13,7 +15,14 @@ from fastapi import APIRouter, HTTPException, Request, WebSocket
 from fastapi.responses import StreamingResponse
 
 from openjarvis.core.paths import get_config_dir
-from openjarvis.core.types import Message, Role, ToolCall
+from openjarvis.core.types import (
+    Message,
+    Role,
+    StepType,
+    TelemetryRecord,
+    ToolCall,
+    Trace,
+)
 from openjarvis.server.models import (
     MAX_COMPLETION_TOKENS,
     ChatCompletionChunk,
@@ -38,6 +47,828 @@ class IdentityPromptUnavailableError(RuntimeError):
 
 class ToolCapabilityPolicyUnavailableError(RuntimeError):
     """The request-scoped model tool surface could not be authorized safely."""
+
+
+_RELATIONSHIP_STREAM_BUFFER_BYTES = 512 * 1024
+_RELATIONSHIP_SUPPORTED_AGENT_ID = "orchestrator"
+_RELATIONSHIP_INFERENCE_EVENT_STRING_FIELDS = frozenset(
+    {"model", "engine", "energy_method", "energy_vendor"}
+)
+_RELATIONSHIP_INFERENCE_EVENT_NUMERIC_FIELDS = frozenset(
+    {
+        "latency",
+        "ttft",
+        "throughput_tok_per_sec",
+        "energy_per_output_token_joules",
+        "throughput_per_watt",
+        "energy_joules",
+        "power_watts",
+        "gpu_utilization_pct",
+        "gpu_memory_used_gb",
+        "gpu_temperature_c",
+        "prefill_latency_seconds",
+        "decode_latency_seconds",
+        "prefill_energy_joules",
+        "decode_energy_joules",
+        "mean_itl_ms",
+        "median_itl_ms",
+        "p95_itl_ms",
+        "completion_tokens",
+    }
+)
+_RELATIONSHIP_INFERENCE_EVENT_STRUCTURED_FIELDS = frozenset(
+    {"tool_calls", "tool_results", "content_blocks"}
+)
+_RELATIONSHIP_INFERENCE_EVENT_FIELDS = frozenset(
+    {
+        *_RELATIONSHIP_INFERENCE_EVENT_STRING_FIELDS,
+        *_RELATIONSHIP_INFERENCE_EVENT_NUMERIC_FIELDS,
+        *_RELATIONSHIP_INFERENCE_EVENT_STRUCTURED_FIELDS,
+        "usage",
+        "content",
+        "finish_reason",
+        "is_streaming",
+    }
+)
+_RELATIONSHIP_USAGE_FIELDS = frozenset(
+    {
+        "prompt_tokens",
+        "prompt_tokens_evaluated",
+        "completion_tokens",
+        "total_tokens",
+    }
+)
+_RELATIONSHIP_FINISH_REASONS = frozenset(
+    {
+        "",
+        "end_turn",
+        "stop",
+        "stop_sequence",
+        "max_tokens",
+        "length",
+        "tool_use",
+        "tool_calls",
+        "content_filter",
+        "pause_turn",
+        "model_context_window_exceeded",
+        "refusal",
+    }
+)
+
+
+def _valid_relationship_guard_interface(value: Any) -> bool:
+    digest = getattr(value, "policy_sha256", None)
+    return (
+        isinstance(digest, str)
+        and len(digest) == 71
+        and digest.startswith("sha256:")
+        and all(character in "0123456789abcdef" for character in digest[7:])
+        and all(
+            callable(getattr(value, name, None))
+            for name in (
+                "with_turns",
+                "apply",
+                "inspect_tool_arguments",
+                "metadata",
+                "_inspect_tool_arguments_nonmutating",
+                "_scrub_trace_fragment",
+                "_terminal_decision_applied",
+            )
+        )
+    )
+
+
+def _prepare_relationship_guard_or_503(relationship_overlay):
+    """Run the overlay-only policy preflight without logging inspected text."""
+
+    try:
+        import importlib
+
+        guard_module = importlib.import_module(
+            "ava_extensions.identity.relationship_guard"
+        )
+        prepare = getattr(guard_module, "prepare_relationship_guard", None)
+        if not callable(prepare):
+            raise RuntimeError("relationship guard entrypoint unavailable")
+        relationship_guard = prepare(relationship_overlay, ())
+        if relationship_overlay is None:
+            return None
+        if not _valid_relationship_guard_interface(relationship_guard):
+            raise RuntimeError("relationship guard preflight returned invalid data")
+        return relationship_guard
+    except Exception as exc:
+        if relationship_overlay is None:
+            return None
+        logging.getLogger("openjarvis.server").error(
+            "Ava relationship output policy preflight failed (%s)",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Ava relationship output policy unavailable",
+        ) from exc
+
+
+def _relationship_turns(messages: list[Message]) -> tuple[tuple[str, str], ...]:
+    """Return only the user/assistant turns actually dispatched to the model."""
+
+    return tuple(
+        (message.role.value, message.text)
+        for message in messages
+        if message.role in {Role.USER, Role.ASSISTANT}
+    )
+
+
+def _bind_relationship_guard(relationship_guard, messages: list[Message]):
+    if relationship_guard is None:
+        return None
+    try:
+        policy_sha256 = relationship_guard.policy_sha256
+        bound_guard = relationship_guard.with_turns(_relationship_turns(messages))
+        if (
+            not _valid_relationship_guard_interface(bound_guard)
+            or bound_guard.policy_sha256 != policy_sha256
+        ):
+            raise RuntimeError("relationship guard binding returned invalid data")
+        return bound_guard
+    except Exception as exc:
+        logging.getLogger("openjarvis.server").error(
+            "Ava relationship output policy binding failed (%s)",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Ava relationship output policy unavailable",
+        ) from exc
+
+
+def _require_supported_relationship_agent(relationship_guard, agent) -> None:
+    """Fail before effects unless the configured agent path is guard-attested."""
+
+    if relationship_guard is None or agent is None:
+        return
+    agent_id = getattr(agent, "agent_id", "")
+    if agent_id == "morning_digest":
+        raise HTTPException(
+            status_code=503,
+            detail="Ava relationship audio agent is unavailable",
+        )
+    from openjarvis.agents.orchestrator import OrchestratorAgent
+
+    if (
+        type(agent) is not OrchestratorAgent
+        or getattr(agent, "agent_id", None) != _RELATIONSHIP_SUPPORTED_AGENT_ID
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="Ava relationship agent is unsupported",
+        )
+
+
+def _tool_argument_json(tool_calls: Any) -> tuple[str, ...]:
+    """Extract model-owned function arguments from flat or OpenAI call shapes."""
+
+    if tool_calls in (None, []):
+        return ()
+    if not isinstance(tool_calls, (list, tuple)):
+        raise HTTPException(
+            status_code=503,
+            detail="Ava structured output could not be inspected",
+        )
+    arguments: list[str] = []
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            raise HTTPException(
+                status_code=503,
+                detail="Ava structured output could not be inspected",
+            )
+        raw_arguments = tool_call.get("arguments")
+        function = tool_call.get("function")
+        if raw_arguments is None and isinstance(function, dict):
+            raw_arguments = function.get("arguments")
+        if raw_arguments is None:
+            continue
+        if not isinstance(raw_arguments, str):
+            try:
+                raw_arguments = json.dumps(
+                    raw_arguments,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            except (TypeError, ValueError, OverflowError):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Ava structured output could not be inspected",
+                ) from None
+        arguments.append(raw_arguments)
+    return tuple(arguments)
+
+
+def _tool_call_json(tool_calls: Any) -> tuple[str, ...]:
+    """Serialize every complete model-owned tool call for terminal inspection."""
+
+    if tool_calls in (None, []):
+        return ()
+    if not isinstance(tool_calls, (list, tuple)):
+        raise HTTPException(
+            status_code=503,
+            detail="Ava structured output could not be inspected",
+        )
+    serialized: list[str] = []
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            raise HTTPException(
+                status_code=503,
+                detail="Ava structured output could not be inspected",
+            )
+        try:
+            serialized.append(
+                json.dumps(
+                    tool_call,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            )
+        except (TypeError, ValueError, OverflowError):
+            raise HTTPException(
+                status_code=503,
+                detail="Ava structured output could not be inspected",
+            ) from None
+    return tuple(serialized)
+
+
+def _apply_relationship_guard(relationship_guard, content: str, tool_calls: Any = None):
+    """Apply one complete decision and translate policy failure to a safe 503."""
+
+    if relationship_guard is None:
+        return None
+    try:
+        arguments = _tool_argument_json(tool_calls)
+        for arguments_json in arguments:
+            relationship_guard.inspect_tool_arguments(arguments_json)
+        return relationship_guard.apply(
+            content,
+            tool_argument_json=_tool_call_json(tool_calls),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logging.getLogger("openjarvis.server").error(
+            "Ava relationship output inspection failed (%s)",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Ava relationship output policy unavailable",
+        ) from exc
+
+
+def _relationship_trace_filter(relationship_guard):
+    """Adapt the shared guard to TraceCollector's dependency-free filter API."""
+
+    from openjarvis.traces.collector import TraceContentFilterResult
+
+    def apply_filter(
+        content: str,
+        structured_output_json,
+        *,
+        allow_conversation_echo: bool,
+        final: bool,
+    ) -> TraceContentFilterResult:
+        try:
+            if final:
+                decision = relationship_guard.apply(
+                    content,
+                    tool_argument_json=structured_output_json,
+                )
+                blocked = decision.action == "replace"
+                filtered_content = decision.output_text
+            else:
+                filtered_content, blocked = relationship_guard._scrub_trace_fragment(
+                    content,
+                    structured_output_json=structured_output_json,
+                    allow_conversation_echo=allow_conversation_echo,
+                )
+        except Exception as exc:
+            raise RuntimeError("relationship trace filtering failed") from exc
+        return TraceContentFilterResult(
+            content=filtered_content,
+            suppress_structured_output=blocked,
+            force_stop=blocked,
+        )
+
+    return apply_filter
+
+
+def _relationship_event_json(value: Any) -> str:
+    """Canonicalize one event-owned value without unsafe repr fallbacks."""
+
+    import dataclasses
+
+    def dataclass_default(item: Any) -> Any:
+        if dataclasses.is_dataclass(item) and not isinstance(item, type):
+            return dataclasses.asdict(item)
+        raise TypeError
+
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+            default=dataclass_default,
+        )
+    except (TypeError, ValueError, OverflowError):
+        raise RuntimeError("relationship event cannot be inspected") from None
+
+
+def _relationship_json_clone(value: Any) -> Any:
+    try:
+        return json.loads(_relationship_event_json(value))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        raise RuntimeError("relationship event cannot be inspected") from None
+
+
+def _clone_relationship_trace(trace: Trace) -> Trace:
+    import dataclasses
+
+    return dataclasses.replace(
+        trace,
+        steps=[
+            dataclasses.replace(
+                step,
+                input=_relationship_json_clone(step.input),
+                output=_relationship_json_clone(step.output),
+                metadata=_relationship_json_clone(step.metadata),
+            )
+            for step in trace.steps
+        ],
+        metadata=_relationship_json_clone(trace.metadata),
+        messages=_relationship_json_clone(trace.messages),
+    )
+
+
+def _validate_relationship_trace_for_parent(relationship_guard, trace: Trace) -> None:
+    try:
+        expected_metadata = relationship_guard.metadata()
+    except Exception:
+        raise RuntimeError("relationship trace event cannot be inspected") from None
+    if not isinstance(expected_metadata, dict) or any(
+        trace.metadata.get(key) != value for key, value in expected_metadata.items()
+    ):
+        raise RuntimeError("relationship trace event cannot be inspected")
+    guard_metadata_keys = {
+        key
+        for key in trace.metadata
+        if key.startswith("relationship_guard_")
+        or key in {"policy_id", "policy_version", "policy_sha256"}
+    }
+    if guard_metadata_keys != set(expected_metadata):
+        raise RuntimeError("relationship trace event cannot be inspected")
+
+    def require_safe(
+        content: str,
+        structured: tuple[str, ...] = (),
+        *,
+        allow_conversation_echo: bool,
+    ) -> None:
+        if not isinstance(content, str):
+            raise RuntimeError("relationship trace event cannot be inspected")
+        _, blocked = relationship_guard._scrub_trace_fragment(
+            content,
+            structured_output_json=structured,
+            allow_conversation_echo=allow_conversation_echo,
+        )
+        if blocked:
+            raise RuntimeError("relationship trace event blocked")
+
+    require_safe(trace.result, allow_conversation_echo=True)
+    require_safe(
+        "",
+        (
+            _relationship_event_json(
+                {
+                    "agent": trace.agent,
+                    "model": trace.model,
+                    "engine": trace.engine,
+                    "metadata": trace.metadata,
+                }
+            ),
+        ),
+        allow_conversation_echo=False,
+    )
+    for step in trace.steps:
+        if step.step_type in {StepType.GENERATE, StepType.RESPOND}:
+            output = dict(step.output)
+            content = output.pop("content", "")
+            require_safe(
+                content,
+                (_relationship_event_json({"output": output}),),
+                allow_conversation_echo=True,
+            )
+        elif step.step_type == StepType.TOOL_CALL:
+            output = dict(step.output)
+            content = output.pop("result", "")
+            require_safe(
+                content,
+                (
+                    _relationship_event_json({"input": step.input}),
+                    _relationship_event_json({"output": output}),
+                    _relationship_event_json({"metadata": step.metadata}),
+                ),
+                allow_conversation_echo=False,
+            )
+        else:
+            require_safe(
+                "",
+                (
+                    _relationship_event_json({"output": step.output}),
+                    _relationship_event_json({"metadata": step.metadata}),
+                ),
+                allow_conversation_echo=False,
+            )
+    for message in trace.messages:
+        if not isinstance(message, dict):
+            raise RuntimeError("relationship trace event cannot be inspected")
+        role = message.get("role")
+        if set(message) != {"role", "content"}:
+            raise RuntimeError("relationship trace event cannot be inspected")
+        if role == "user":
+            if not isinstance(message.get("content", ""), str):
+                raise RuntimeError("relationship trace event cannot be inspected")
+            continue
+        if role not in {"assistant", "tool"}:
+            raise RuntimeError("relationship trace event cannot be inspected")
+        content = message.get("content", "")
+        structured = {
+            key: value
+            for key, value in message.items()
+            if key not in {"role", "content"}
+        }
+        require_safe(
+            content,
+            (_relationship_event_json({"message": structured}),),
+            allow_conversation_echo=role == "assistant",
+        )
+
+
+def _clone_relationship_telemetry_record(record: TelemetryRecord) -> TelemetryRecord:
+    import dataclasses
+
+    return dataclasses.replace(
+        record,
+        metadata=_relationship_json_clone(record.metadata),
+    )
+
+
+def _relationship_nonnegative_number(value: Any) -> int | float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise RuntimeError("relationship event cannot be inspected")
+    try:
+        valid = math.isfinite(value) and value >= 0
+    except (OverflowError, TypeError, ValueError):
+        valid = False
+    if not valid:
+        raise RuntimeError("relationship event cannot be inspected")
+    return value
+
+
+def _canonical_relationship_usage(value: Any) -> dict[str, int | float]:
+    if not isinstance(value, dict) or set(value) - _RELATIONSHIP_USAGE_FIELDS:
+        raise RuntimeError("relationship event cannot be inspected")
+    return {
+        key: _relationship_nonnegative_number(token_count)
+        for key, token_count in value.items()
+    }
+
+
+def _canonical_relationship_inference_event(
+    data: dict[str, Any],
+) -> dict[str, Any]:
+    """Rebuild one inference event from the closed runtime schema."""
+
+    if set(data) - _RELATIONSHIP_INFERENCE_EVENT_FIELDS:
+        raise RuntimeError("relationship event cannot be inspected")
+    canonical: dict[str, Any] = {}
+    for key, value in data.items():
+        if key in _RELATIONSHIP_INFERENCE_EVENT_STRING_FIELDS:
+            if not isinstance(value, str):
+                raise RuntimeError("relationship event cannot be inspected")
+            canonical[key] = value
+        elif key in _RELATIONSHIP_INFERENCE_EVENT_NUMERIC_FIELDS:
+            canonical[key] = _relationship_nonnegative_number(value)
+        elif key == "usage":
+            canonical[key] = _canonical_relationship_usage(value)
+        elif key == "content":
+            if not isinstance(value, str):
+                raise RuntimeError("relationship event cannot be inspected")
+            canonical[key] = value
+        elif key in _RELATIONSHIP_INFERENCE_EVENT_STRUCTURED_FIELDS:
+            if not isinstance(value, list):
+                raise RuntimeError("relationship event cannot be inspected")
+            _relationship_event_json(value)
+            canonical[key] = list(value)
+        elif key == "finish_reason":
+            if not isinstance(value, str) or value not in _RELATIONSHIP_FINISH_REASONS:
+                raise RuntimeError("relationship event cannot be inspected")
+            canonical[key] = value
+        elif key == "is_streaming":
+            if not isinstance(value, bool):
+                raise RuntimeError("relationship event cannot be inspected")
+            canonical[key] = value
+        else:  # pragma: no cover - set membership above keeps this unreachable.
+            raise RuntimeError("relationship event cannot be inspected")
+    return canonical
+
+
+def _sanitize_relationship_event_data(
+    relationship_guard,
+    event_type,
+    data: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Scrub model/tool text before a request event reaches its parent bus."""
+
+    from openjarvis.core.events import EventType
+
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise RuntimeError("relationship event cannot be inspected")
+    if event_type == EventType.TRACE_COMPLETE:
+        if set(data) != {"trace"} or not isinstance(data["trace"], Trace):
+            raise RuntimeError("relationship event cannot be inspected")
+        try:
+            terminal_applied = relationship_guard._terminal_decision_applied()
+        except Exception:
+            terminal_applied = False
+        if terminal_applied is not True:
+            raise RuntimeError("relationship trace event blocked")
+        trace = _clone_relationship_trace(data["trace"])
+        _validate_relationship_trace_for_parent(relationship_guard, trace)
+        return {"trace": trace}
+    if event_type == EventType.TELEMETRY_RECORD:
+        if set(data) != {"record"} or not isinstance(data["record"], TelemetryRecord):
+            raise RuntimeError("relationship event cannot be inspected")
+        record = _clone_relationship_telemetry_record(data["record"])
+        _, blocked = relationship_guard._scrub_trace_fragment(
+            "",
+            structured_output_json=(_relationship_event_json({"record": record}),),
+            allow_conversation_echo=False,
+        )
+        if blocked:
+            raise RuntimeError("relationship telemetry event blocked")
+        return {"record": record}
+    sanitized = _relationship_json_clone(data)
+    if not isinstance(sanitized, dict):
+        raise RuntimeError("relationship event cannot be inspected")
+
+    if event_type == EventType.INFERENCE_END:
+        sanitized = _canonical_relationship_inference_event(sanitized)
+        content = sanitized.get("content", "")
+        tool_calls = sanitized.get("tool_calls", [])
+        try:
+            for arguments_json in _tool_argument_json(tool_calls):
+                relationship_guard._inspect_tool_arguments_nonmutating(arguments_json)
+        except Exception:
+            raise RuntimeError("relationship inference event blocked") from None
+        structured = list(_tool_call_json(tool_calls))
+        if sanitized.get("content_blocks") not in (None, [], {}, ""):
+            structured.append(
+                _relationship_event_json(
+                    {"content_blocks": sanitized["content_blocks"]}
+                )
+            )
+        filtered_content, blocked = relationship_guard._scrub_trace_fragment(
+            content,
+            structured_output_json=tuple(structured),
+            allow_conversation_echo=True,
+        )
+        sanitized["content"] = filtered_content
+        if blocked:
+            sanitized["tool_calls"] = []
+            sanitized["content_blocks"] = []
+            sanitized["finish_reason"] = "stop"
+
+        tool_results = sanitized.get("tool_results")
+        if tool_results not in (None, [], {}, ""):
+            _, tool_results_blocked = relationship_guard._scrub_trace_fragment(
+                "",
+                structured_output_json=(
+                    _relationship_event_json({"tool_results": tool_results}),
+                ),
+                allow_conversation_echo=False,
+            )
+            if tool_results_blocked:
+                sanitized["tool_results"] = []
+        _, residual_blocked = relationship_guard._scrub_trace_fragment(
+            "",
+            structured_output_json=(_relationship_event_json({"event": sanitized}),),
+            allow_conversation_echo=True,
+        )
+        if residual_blocked:
+            raise RuntimeError("relationship inference event blocked")
+        return sanitized
+
+    if event_type == EventType.TOOL_CALL_START:
+        arguments_json = _relationship_event_json(sanitized.get("arguments", {}))
+        if relationship_guard._inspect_tool_arguments_nonmutating(arguments_json):
+            raise RuntimeError("relationship tool event blocked")
+        _, residual_blocked = relationship_guard._scrub_trace_fragment(
+            "",
+            structured_output_json=(_relationship_event_json({"event": sanitized}),),
+            allow_conversation_echo=False,
+        )
+        if residual_blocked:
+            raise RuntimeError("relationship tool event blocked")
+        return sanitized
+
+    if event_type == EventType.TOOL_CALL_END:
+        result_content = sanitized.get("result", "")
+        if result_content is None:
+            result_content = ""
+        if not isinstance(result_content, str):
+            result_content = _relationship_event_json(result_content)
+        structured = ()
+        if sanitized.get("metadata") not in (None, [], {}, ""):
+            structured = (
+                _relationship_event_json({"metadata": sanitized["metadata"]}),
+            )
+        filtered_content, blocked = relationship_guard._scrub_trace_fragment(
+            result_content,
+            structured_output_json=structured,
+            allow_conversation_echo=False,
+        )
+        sanitized["result"] = filtered_content
+        if blocked:
+            sanitized["metadata"] = {}
+        _, residual_blocked = relationship_guard._scrub_trace_fragment(
+            "",
+            structured_output_json=(_relationship_event_json({"event": sanitized}),),
+            allow_conversation_echo=False,
+        )
+        if residual_blocked:
+            raise RuntimeError("relationship tool event blocked")
+        return sanitized
+
+    if event_type == EventType.AGENT_TURN_START:
+        if (
+            set(sanitized) != {"agent", "input"}
+            or sanitized["agent"] != _RELATIONSHIP_SUPPORTED_AGENT_ID
+            or not isinstance(sanitized["input"], str)
+        ):
+            raise RuntimeError("relationship event cannot be inspected")
+        # The request already owns the verified user turn. Forwarding another
+        # free-form copy lets an agent spoof model output as a turn input.
+        return {"agent": _RELATIONSHIP_SUPPORTED_AGENT_ID}
+
+    _, residual_blocked = relationship_guard._scrub_trace_fragment(
+        "",
+        structured_output_json=(_relationship_event_json({"event": sanitized}),),
+        allow_conversation_echo=False,
+    )
+    if residual_blocked:
+        raise RuntimeError("relationship event blocked")
+    return sanitized
+
+
+class _RelationshipRequestEventBus:
+    """Overlay-only bus proxy that sanitizes before parent/history forwarding."""
+
+    __slots__ = ("_delegate", "_relationship_guard")
+
+    def __init__(self, delegate, relationship_guard) -> None:
+        self._delegate = delegate
+        self._relationship_guard = relationship_guard
+
+    def subscribe(self, event_type, callback) -> None:
+        self._delegate.subscribe(event_type, callback)
+
+    def unsubscribe(self, event_type, callback) -> None:
+        self._delegate.unsubscribe(event_type, callback)
+
+    def publish(self, event_type, data=None):
+        sanitized = _sanitize_relationship_event_data(
+            self._relationship_guard,
+            event_type,
+            data,
+        )
+        return self._delegate.publish(event_type, sanitized)
+
+    @property
+    def history(self):
+        return self._delegate.history
+
+    def clear_history(self) -> None:
+        self._delegate.clear_history()
+
+
+def _relationship_request_event_bus(bus, relationship_guard):
+    if relationship_guard is None:
+        return bus
+    if bus is None:
+        from openjarvis.core.events import EventBus
+
+        bus = EventBus()
+    scoped = bus.scoped(uuid.uuid4().hex) if hasattr(bus, "scoped") else bus
+    return _RelationshipRequestEventBus(scoped, relationship_guard)
+
+
+def _copy_engine_for_relationship_events(engine, request_bus):
+    """Redirect a shared instrumented engine without mutating daemon state."""
+
+    try:
+        owns_bus = "_bus" in vars(engine)
+    except TypeError:
+        owns_bus = False
+    if request_bus is None or not owns_bus:
+        return engine
+    import copy
+
+    request_engine = copy.copy(engine)
+    request_engine._bus = request_bus
+    return request_engine
+
+
+def _bounded_stream_append(
+    buffered: list[str],
+    frame: str,
+    buffered_bytes: int,
+) -> int:
+    frame_bytes = len(frame.encode("utf-8"))
+    if frame_bytes > _RELATIONSHIP_STREAM_BUFFER_BYTES - buffered_bytes:
+        raise RuntimeError("relationship stream exceeds output buffer")
+    buffered.append(frame)
+    return buffered_bytes + frame_bytes
+
+
+def _assembled_stream_tool_calls(
+    tool_call_batches: list[list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Assemble only the strict OpenAI delta shape inspected before replay."""
+
+    assembled: dict[int, dict[str, str]] = {}
+    allowed_call_keys = frozenset({"index", "id", "type", "function"})
+    allowed_function_keys = frozenset({"name", "arguments"})
+    for batch in tool_call_batches:
+        if not isinstance(batch, list):
+            raise RuntimeError("relationship stream tool output is invalid")
+        for position, call in enumerate(batch):
+            if not isinstance(call, dict):
+                raise RuntimeError("relationship stream tool output is invalid")
+            if set(call) - allowed_call_keys:
+                raise RuntimeError("relationship stream tool output is invalid")
+            index = call.get("index", position)
+            if type(index) is not int or index < 0:
+                raise RuntimeError("relationship stream tool output is invalid")
+            function = call.get("function")
+            if function is not None and not isinstance(function, dict):
+                raise RuntimeError("relationship stream tool output is invalid")
+            if isinstance(function, dict) and set(function) - allowed_function_keys:
+                raise RuntimeError("relationship stream tool output is invalid")
+            source = function or {}
+            current = assembled.setdefault(
+                index,
+                {"id": "", "type": "", "name": "", "arguments": ""},
+            )
+            call_id = call.get("id")
+            call_type = call.get("type")
+            name = source.get("name")
+            arguments = source.get("arguments")
+            for key, fragment in (
+                ("id", call_id),
+                ("type", call_type),
+                ("name", name),
+                ("arguments", arguments),
+            ):
+                if fragment is None:
+                    continue
+                if not isinstance(fragment, str):
+                    raise RuntimeError("relationship stream tool output is invalid")
+                if key in {"id", "name", "type"} and current[key] == fragment:
+                    continue
+                current[key] += fragment
+    if any(
+        not current["id"] or not current["name"] or current["type"] != "function"
+        for current in assembled.values()
+    ):
+        raise RuntimeError("relationship stream tool output is incomplete")
+    return [
+        {
+            "index": index,
+            "id": assembled[index]["id"],
+            "type": assembled[index]["type"],
+            "function": {
+                "name": assembled[index]["name"],
+                "arguments": assembled[index]["arguments"],
+            },
+        }
+        for index in sorted(assembled)
+    ]
 
 
 def _to_messages(chat_messages) -> list[Message]:
@@ -110,6 +941,7 @@ def _ensure_identity_prompt(
     base_prompt: str,
     relationship_overlay=None,
     trusted_context_messages: list[Message] | None = None,
+    temporal_context_fragment: str | None = None,
 ) -> list[Message]:
     """Prepend one server-owned common persona and optional trusted overlay.
 
@@ -124,11 +956,140 @@ def _ensure_identity_prompt(
 
     sanitized = _sanitize_client_identity(messages, base_prompt)
     prompt = compose_server_prompt(base_prompt, relationship_overlay)
+    prompt = _compose_temporal_context_prompt(prompt, temporal_context_fragment)
     return [
         Message(role=Role.SYSTEM, content=prompt),
         *(trusted_context_messages or []),
         *sanitized,
     ]
+
+
+def _compose_temporal_context_prompt(
+    server_prompt: str,
+    temporal_context_fragment: str | None,
+) -> str:
+    """Append one validated temporal fragment to one server-owned prompt."""
+
+    if temporal_context_fragment is None:
+        return server_prompt
+    try:
+        from ava_extensions.identity.temporal_context import TEMPORAL_CONTEXT_MARKER
+
+        if (
+            not isinstance(server_prompt, str)
+            or not server_prompt.strip()
+            or not isinstance(temporal_context_fragment, str)
+            or not temporal_context_fragment.strip()
+            or TEMPORAL_CONTEXT_MARKER in server_prompt
+            or temporal_context_fragment.count(TEMPORAL_CONTEXT_MARKER) != 1
+        ):
+            raise ValueError("invalid temporal prompt composition")
+        return (
+            f"{server_prompt}\n\n"
+            "## Contexte temporel Matrix établi par le serveur\n"
+            f"{temporal_context_fragment}"
+        )
+    except Exception as exc:
+        raise IdentityPromptUnavailableError from exc
+
+
+def _reject_client_temporal_context_marker(values: list[Any]) -> None:
+    """Reject the server marker anywhere in client-owned message data."""
+
+    try:
+        from ava_extensions.identity.temporal_context import TEMPORAL_CONTEXT_MARKER
+    except Exception as exc:
+        logging.getLogger("openjarvis.server").error(
+            "Ava temporal context contract could not be loaded (%s)",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Ava temporal context unavailable",
+        ) from exc
+    pending: list[Any] = list(values)
+    inspected = 0
+    while pending:
+        value = pending.pop()
+        inspected += 1
+        if inspected > 16_384:
+            raise HTTPException(
+                status_code=422,
+                detail="Ava temporal context rejected",
+            )
+        if isinstance(value, str):
+            if TEMPORAL_CONTEXT_MARKER in value:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Ava temporal context rejected",
+                )
+        elif isinstance(value, dict):
+            for key, nested in value.items():
+                pending.extend((key, nested))
+        elif isinstance(value, (list, tuple)):
+            pending.extend(value)
+
+
+def _trusted_temporal_context_fragment(
+    request_body: ChatCompletionRequest,
+    principal,
+) -> str | None:
+    """Validate Matrix transport metadata only after principal resolution."""
+
+    _reject_client_temporal_context_marker(
+        [
+            *[message.model_dump(mode="json") for message in request_body.messages],
+            request_body.tools,
+        ]
+    )
+    if "temporal_context" not in request_body.model_fields_set:
+        return None
+    try:
+        from ava_extensions.identity.temporal_context import (
+            TemporalContextValidationError,
+            parse_matrix_temporal_context_v1,
+            render_temporal_context_system_fragment,
+        )
+    except Exception as exc:
+        logging.getLogger("openjarvis.server").error(
+            "Ava temporal context contract could not be loaded (%s)",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Ava temporal context unavailable",
+        ) from exc
+
+    try:
+        if request_body.temporal_context is None:
+            raise TemporalContextValidationError("null temporal context")
+        now_ms = time.time_ns() // 1_000_000
+        context = parse_matrix_temporal_context_v1(
+            request_body.temporal_context,
+            principal=principal,
+            now_ms=now_ms,
+        )
+        return render_temporal_context_system_fragment(
+            context,
+            principal=principal,
+            now_ms=now_ms,
+        )
+    except TemporalContextValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="Ava temporal context rejected",
+        ) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logging.getLogger("openjarvis.server").error(
+            "Ava temporal context could not be established (%s)",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Ava temporal context unavailable",
+        ) from exc
 
 
 def _sanitize_client_identity(
@@ -402,7 +1363,13 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
         # shared legacy memory enabled.
         raise HTTPException(status_code=401, detail="Ava identity rejected")
     request.state.ava_principal = principal
+    temporal_context_fragment = _trusted_temporal_context_fragment(
+        request_body,
+        principal,
+    )
     allow_legacy_memory = False
+    relationship_guard = _prepare_relationship_guard_or_503(relationship_overlay)
+    _require_supported_relationship_agent(relationship_guard, agent)
     if _declares_legacy_memory_tool(request_body.tools):
         raise HTTPException(
             status_code=422,
@@ -420,13 +1387,15 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
         )
 
     principal_provenance = principal.provenance if principal is not None else None
+    request_disabled_tools = _HTTP_DISABLED_TOOLS
     agent_tool_surface: frozenset[str] | None = None
     if agent is not None and not request_body.stream and not request_body.tools:
         try:
             agent_tool_surface = _request_agent_tool_surface(
                 agent,
-                _HTTP_DISABLED_TOOLS,
+                request_disabled_tools,
                 principal_provenance=principal_provenance,
+                zero_capability_allowlist=_HTTP_ZERO_CAPABILITY_TOOL_ALLOWLIST,
             )
         except ToolCapabilityPolicyUnavailableError as exc:
             logging.getLogger("openjarvis.server").error(
@@ -467,14 +1436,18 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                 request_body,
                 relationship_overlay,
                 principal_context,
+                relationship_guard,
+                temporal_context_fragment=temporal_context_fragment,
             )
-            existing_response = await _resolve_existing_durable_turn(
-                conversation_store,
-                durable_conversation_key,
-                durable_turn_id,
-                durable_user_text,
-                durable_request_sha256,
-            )
+            existing_response = None
+            if relationship_guard is None:
+                existing_response = await _resolve_existing_durable_turn(
+                    conversation_store,
+                    durable_conversation_key,
+                    durable_turn_id,
+                    durable_user_text,
+                    durable_request_sha256,
+                )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="invalid Ava turn id") from exc
         except conversation_store.TurnCollisionError as exc:
@@ -527,6 +1500,49 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     # Future personal recall belongs to the governed principal-scoped ledger.
     trusted_context_messages: list[Message] = []
 
+    try:
+        dispatched_messages = _ensure_identity_prompt(
+            _to_messages(request_body.messages),
+            base_identity_prompt,
+            relationship_overlay,
+            trusted_context_messages,
+            temporal_context_fragment,
+        )
+    except IdentityPromptUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Ava temporal context unavailable",
+        ) from exc
+    relationship_guard = _bind_relationship_guard(
+        relationship_guard,
+        dispatched_messages,
+    )
+
+    # Overlay replays are deliberately checked only after binding the guard to
+    # the exact sanitized turns. They remain before reservation, model and tool
+    # execution, while no-overlay retries retain their historical fast path.
+    if durable_turn_id is not None and relationship_guard is not None:
+        assert durable_conversation_key is not None
+        assert durable_request_sha256 is not None
+        from ava_extensions.server import conversation as conversation_store
+
+        try:
+            existing_response = await _resolve_existing_durable_turn(
+                conversation_store,
+                durable_conversation_key,
+                durable_turn_id,
+                durable_user_text,
+                durable_request_sha256,
+                relationship_guard=relationship_guard,
+            )
+        except conversation_store.ConversationStorageError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Ava conversation storage unavailable",
+            ) from exc
+        if existing_response is not None:
+            return existing_response
+
     # Commit the idempotency/effect barrier immediately before dispatch. Everything
     # above is local validation or read-only context preparation; everything below may
     # call a model or an agent tool. A crash leaves ``pending`` and retries fail closed.
@@ -550,6 +1566,7 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                     durable_turn_id,
                     durable_user_text,
                     durable_request_sha256,
+                    relationship_guard=relationship_guard,
                 )
                 if existing_response is not None:
                     return existing_response
@@ -601,8 +1618,10 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                 bus=getattr(request.app.state, "bus", None),
                 memory_service=getattr(request.app.state, "memory_service", None),
                 relationship_overlay=relationship_overlay,
+                relationship_guard=relationship_guard,
                 allow_legacy_memory=allow_legacy_memory,
                 trusted_context_messages=trusted_context_messages,
+                temporal_context_fragment=temporal_context_fragment,
                 principal_provenance=(
                     principal.provenance if principal is not None else None
                 ),
@@ -617,8 +1636,10 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
             bus=getattr(request.app.state, "bus", None),
             memory_service=getattr(request.app.state, "memory_service", None),
             relationship_overlay=relationship_overlay,
+            relationship_guard=relationship_guard,
             allow_legacy_memory=allow_legacy_memory,
             trusted_context_messages=trusted_context_messages,
+            temporal_context_fragment=temporal_context_fragment,
             principal_provenance=(
                 principal.provenance if principal is not None else None
             ),
@@ -655,9 +1676,12 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
             bus=getattr(request.app.state, "bus", None),
             base_identity_prompt=base_identity_prompt,
             relationship_overlay=relationship_overlay,
+            relationship_guard=relationship_guard,
             trusted_context_messages=trusted_context_messages,
+            temporal_context_fragment=temporal_context_fragment,
             principal_provenance=principal_provenance,
             tool_surface=agent_tool_surface,
+            disabled_tools=request_disabled_tools,
         )
     else:
         bus = getattr(request.app.state, "bus", None)
@@ -670,7 +1694,9 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
             complexity_info=complexity_info,
             base_identity_prompt=base_identity_prompt,
             relationship_overlay=relationship_overlay,
+            relationship_guard=relationship_guard,
             trusted_context_messages=trusted_context_messages,
+            temporal_context_fragment=temporal_context_fragment,
         )
 
     if durable_turn_id is not None:
@@ -821,6 +1847,9 @@ def _durable_request_sha256(
     request_body: ChatCompletionRequest,
     relationship_overlay,
     principal_context=None,
+    relationship_guard=None,
+    *,
+    temporal_context_fragment: str | None = None,
 ) -> str:
     """Bind one idempotency key to the complete effective client request.
 
@@ -852,6 +1881,21 @@ def _durable_request_sha256(
         payload["principal_context_sha256"] = principal_context_sha256(
             principal_context
         )
+    if relationship_guard is not None:
+        policy_sha256 = getattr(relationship_guard, "policy_sha256", None)
+        if not isinstance(policy_sha256, str) or not policy_sha256:
+            raise ValueError("relationship output policy digest unavailable")
+        payload["relationship_output_policy"] = {
+            "policy_sha256": policy_sha256,
+        }
+    if temporal_context_fragment is not None:
+        if not isinstance(temporal_context_fragment, str) or not (
+            temporal_context_fragment
+        ):
+            raise ValueError("temporal context prompt unavailable")
+        payload["temporal_context_prompt_sha256"] = hashlib.sha256(
+            temporal_context_fragment.encode("utf-8")
+        ).hexdigest()
     canonical = json.dumps(
         payload,
         ensure_ascii=False,
@@ -879,6 +1923,8 @@ async def _resolve_existing_durable_turn(
     turn_id: str,
     user_text: str,
     request_sha256: str,
+    *,
+    relationship_guard=None,
 ) -> ChatCompletionResponse | None:
     """Replay completed content or wait for one concurrent owner, never regenerate."""
 
@@ -964,6 +2010,18 @@ async def _resolve_existing_durable_turn(
             status_code=410,
             detail="Ava durable turn is incomplete and cannot be replayed",
         )
+    decision = _apply_relationship_guard(
+        relationship_guard,
+        entry.assistant_text,
+        getattr(response.choices[0].message, "tool_calls", None),
+    )
+    if decision is not None and (
+        decision.action != "allow" or decision.output_text != entry.assistant_text
+    ):
+        raise HTTPException(
+            status_code=410,
+            detail="Ava durable turn is unsafe and cannot be replayed",
+        )
     return response
 
 
@@ -1027,7 +2085,9 @@ def _handle_direct(
     complexity_info=None,
     base_identity_prompt: str = "",
     relationship_overlay=None,
+    relationship_guard=None,
     trusted_context_messages: list[Message] | None = None,
+    temporal_context_fragment: str | None = None,
 ) -> ChatCompletionResponse:
     """Direct engine call without agent."""
     messages = _to_messages(req.messages)
@@ -1036,7 +2096,19 @@ def _handle_direct(
         base_identity_prompt,
         relationship_overlay,
         trusted_context_messages,
+        temporal_context_fragment,
     )
+    if relationship_overlay is not None and relationship_guard is None:
+        relationship_guard = _prepare_relationship_guard_or_503(relationship_overlay)
+    relationship_guard = _bind_relationship_guard(relationship_guard, messages)
+    if relationship_guard is not None:
+        event_bus = bus if bus is not None else getattr(engine, "_bus", None)
+        if event_bus is not None:
+            bus = _relationship_request_event_bus(
+                event_bus,
+                relationship_guard,
+            )
+            engine = _copy_engine_for_relationship_events(engine, bus)
     kwargs: dict[str, Any] = {}
     if req.tools:
         kwargs["tools"] = req.tools
@@ -1095,10 +2167,19 @@ def _handle_direct(
         )
     content = result.get("content", "")
     usage = result.get("usage", {})
+    tool_calls = result.get("tool_calls")
+    guard_decision = _apply_relationship_guard(
+        relationship_guard,
+        content,
+        tool_calls,
+    )
+    if guard_decision is not None:
+        content = guard_decision.output_text
+        if guard_decision.action == "replace":
+            tool_calls = None
 
     choice_msg = ChoiceMessage(role="assistant", content=content)
     # Include tool calls if present
-    tool_calls = result.get("tool_calls")
     if tool_calls:
         choice_msg.tool_calls = [
             {
@@ -1118,7 +2199,14 @@ def _handle_direct(
             Choice(
                 message=choice_msg,
                 finish_reason=_motif_arret(
-                    {"finish_reason": result.get("finish_reason")}
+                    {
+                        "finish_reason": (
+                            "stop"
+                            if guard_decision is not None
+                            and guard_decision.action == "replace"
+                            else result.get("finish_reason")
+                        )
+                    }
                 ),
             )
         ],
@@ -1137,6 +2225,7 @@ _HTTP_DISABLED_TOOLS = frozenset(
         "code_interpreter",
         "code_interpreter_docker",
         "db_query",
+        "channel_send",
         "docker_shell_exec",
         "file_read",
         "file_write",
@@ -1149,11 +2238,60 @@ _HTTP_DISABLED_TOOLS = frozenset(
         "repl",
         "retrieval",
         "shell_exec",
+        "text_to_speech",
         "user_profile_manage",
     }
 )
+_HTTP_ZERO_CAPABILITY_TOOL_ALLOWLIST = frozenset({"calculator", "think"})
 
 _AVA_VEILLE_SCHEDULER_TOOLS = frozenset({"avalon_status", "lire_doc", "proposer_plan"})
+
+
+class _RelationshipToolExecutorProxy:
+    """Request-local pre-dispatch guard for every tool, local or external."""
+
+    __slots__ = ("_delegate", "_relationship_guard")
+
+    def __init__(self, delegate, relationship_guard) -> None:
+        self._delegate = delegate
+        self._relationship_guard = relationship_guard
+
+    def __getattr__(self, name: str):
+        return getattr(self._delegate, name)
+
+    def execute(self, tool_call):
+        from openjarvis.core.types import ToolResult
+
+        registered = getattr(self._delegate, "_tools", None)
+        tool_name = getattr(tool_call, "name", None)
+        if (
+            not isinstance(registered, dict)
+            or not isinstance(tool_name, str)
+            or tool_name not in registered
+        ):
+            return ToolResult(
+                tool_name="unavailable",
+                content="Tool request rejected.",
+                success=False,
+            )
+        arguments = getattr(tool_call, "arguments", None)
+        try:
+            if not isinstance(arguments, str):
+                raise RuntimeError
+            gate_ids = self._relationship_guard.inspect_tool_arguments(arguments)
+        except Exception:
+            return ToolResult(
+                tool_name=tool_name,
+                content="Tool request rejected.",
+                success=False,
+            )
+        if gate_ids:
+            return ToolResult(
+                tool_name=tool_name,
+                content="Tool request rejected.",
+                success=False,
+            )
+        return self._delegate.execute(tool_call)
 
 
 def _is_ava_veille_scheduler(principal_provenance: str | None) -> bool:
@@ -1176,6 +2314,7 @@ def _request_agent_tool_surface(
     disabled_tools: frozenset[str],
     *,
     principal_provenance: str | None,
+    zero_capability_allowlist: frozenset[str] | None = None,
 ) -> frozenset[str]:
     """Authorize the exact tool names a request may expose to its model.
 
@@ -1268,6 +2407,12 @@ def _request_agent_tool_surface(
             raise ToolCapabilityPolicyUnavailableError(
                 "invalid tool capability contract"
             )
+        if (
+            not capabilities
+            and zero_capability_allowlist is not None
+            and name not in zero_capability_allowlist
+        ):
+            continue
 
         allowed = True
         for capability in capabilities:
@@ -1305,6 +2450,8 @@ def _copy_agent_for_request(
     request_bus=None,
     principal_provenance: str | None = None,
     tool_surface: frozenset[str] | None = None,
+    relationship_guard=None,
+    zero_capability_allowlist: frozenset[str] | None = None,
 ):
     """Return an isolated shallow agent copy for one server request.
 
@@ -1319,6 +2466,11 @@ def _copy_agent_for_request(
 
     request_agent = copy.copy(agent)
     request_agent._bus = request_bus
+    if relationship_guard is not None and hasattr(agent, "_engine"):
+        request_agent._engine = _copy_engine_for_relationship_events(
+            agent._engine,
+            request_bus,
+        )
     if model:
         request_agent._model = model
     request_agent._temperature = temperature
@@ -1339,6 +2491,7 @@ def _copy_agent_for_request(
             agent,
             disabled_tools,
             principal_provenance=principal_provenance,
+            zero_capability_allowlist=zero_capability_allowlist,
         )
 
     tools = getattr(agent, "_tools", None)
@@ -1368,7 +2521,21 @@ def _copy_agent_for_request(
             request_executor._tools = {
                 name: tool for name, tool in registered.items() if name in tool_surface
             }
-        request_agent._executor = request_executor
+        if relationship_guard is not None:
+            from ava_extensions.identity.relationship_guard import (
+                compose_relationship_tool_boundary_guard,
+            )
+
+            request_executor._boundary_guard = compose_relationship_tool_boundary_guard(
+                relationship_guard,
+                getattr(executor, "_boundary_guard", None),
+            )
+            request_agent._executor = _RelationshipToolExecutorProxy(
+                request_executor,
+                relationship_guard,
+            )
+        else:
+            request_agent._executor = request_executor
 
     loop_guard = getattr(agent, "_loop_guard", None)
     if loop_guard is not None:
@@ -1393,9 +2560,12 @@ def _handle_agent(
     bus=None,
     base_identity_prompt: str = "",
     relationship_overlay=None,
+    relationship_guard=None,
     trusted_context_messages: list[Message] | None = None,
+    temporal_context_fragment: str | None = None,
     principal_provenance: str | None = None,
     tool_surface: frozenset[str] | None = None,
+    disabled_tools: frozenset[str] | None = None,
 ) -> ChatCompletionResponse:
     """Run through agent.
 
@@ -1409,6 +2579,21 @@ def _handle_agent(
     from ava_extensions.identity.relationship import compose_server_prompt
 
     from openjarvis.agents._stubs import AgentContext
+
+    dispatched_messages = _ensure_identity_prompt(
+        _to_messages(req.messages),
+        base_identity_prompt,
+        relationship_overlay,
+        trusted_context_messages,
+        temporal_context_fragment,
+    )
+    if relationship_overlay is not None and relationship_guard is None:
+        relationship_guard = _prepare_relationship_guard_or_503(relationship_overlay)
+    _require_supported_relationship_agent(relationship_guard, agent)
+    relationship_guard = _bind_relationship_guard(
+        relationship_guard,
+        dispatched_messages,
+    )
 
     # Build context from prior messages
     ctx = AgentContext()
@@ -1428,8 +2613,13 @@ def _handle_agent(
             "## Contexte d'interlocuteur établi par le serveur\n"
             f"{relationship_display_context}"
         )
+    server_identity_prompt = _compose_temporal_context_prompt(
+        server_identity_prompt,
+        temporal_context_fragment,
+    )
     ctx.metadata["server_identity_prompt"] = server_identity_prompt
-    disabled_tools = _HTTP_DISABLED_TOOLS
+    if disabled_tools is None:
+        disabled_tools = _HTTP_DISABLED_TOOLS
     ctx.metadata["disabled_tools"] = disabled_tools
     for message in trusted_context_messages or []:
         ctx.conversation.add(message)
@@ -1444,9 +2634,12 @@ def _handle_agent(
     # Last message is the input
     input_text = req.messages[-1].content if req.messages else ""
 
-    from openjarvis.core.events import EventBus
+    if relationship_guard is not None:
+        request_bus = _relationship_request_event_bus(bus, relationship_guard)
+    else:
+        from openjarvis.core.events import EventBus
 
-    request_bus = bus.scoped(uuid.uuid4().hex) if bus is not None else EventBus()
+        request_bus = bus.scoped(uuid.uuid4().hex) if bus is not None else EventBus()
     request_agent = _copy_agent_for_request(
         agent,
         model,
@@ -1456,6 +2649,8 @@ def _handle_agent(
         request_bus=request_bus,
         principal_provenance=principal_provenance,
         tool_surface=tool_surface,
+        relationship_guard=relationship_guard,
+        zero_capability_allowlist=_HTTP_ZERO_CAPABILITY_TOOL_ALLOWLIST,
     )
     trace_id: str | None = None
     if trace_store is not None:
@@ -1466,6 +2661,14 @@ def _handle_agent(
             input_text,
             context=ctx,
             provenance=principal_provenance,
+            content_filter=(
+                _relationship_trace_filter(relationship_guard)
+                if relationship_guard is not None
+                else None
+            ),
+            trace_metadata_provider=(
+                relationship_guard.metadata if relationship_guard is not None else None
+            ),
         )
         # ⚠ On le lit APRÈS `run`, jamais avant : `last_trace` n'est renseigné
         #   qu'une fois la trace construite et persistée.
@@ -1473,6 +2676,24 @@ def _handle_agent(
         trace_id = _trace.trace_id if _trace is not None else None
     else:
         result = request_agent.run(input_text, context=ctx)
+        decision = _apply_relationship_guard(
+            relationship_guard,
+            result.content,
+            result.metadata.get("tool_calls"),
+        )
+        if decision is not None:
+            result.content = decision.output_text
+            if decision.action == "replace":
+                result.tool_results = []
+                for key in (
+                    "tool_calls",
+                    "tool_results",
+                    "content_blocks",
+                    "audio",
+                    "audio_path",
+                ):
+                    result.metadata.pop(key, None)
+                result.metadata["finish_reason"] = "stop"
 
     usage = UsageInfo(
         prompt_tokens=result.metadata.get("prompt_tokens", 0),
@@ -1519,8 +2740,10 @@ async def _handle_stream_tools(
     bus=None,
     memory_service=None,
     relationship_overlay=None,
+    relationship_guard=None,
     allow_legacy_memory: bool = False,
     trusted_context_messages: list[Message] | None = None,
+    temporal_context_fragment: str | None = None,
     principal_provenance: str | None = None,
 ):
     """Stream a raw OpenAI-compat function-calling response via SSE.
@@ -1544,7 +2767,19 @@ async def _handle_stream_tools(
         base_identity_prompt,
         relationship_overlay,
         trusted_context_messages,
+        temporal_context_fragment,
     )
+    if relationship_overlay is not None and relationship_guard is None:
+        relationship_guard = _prepare_relationship_guard_or_503(relationship_overlay)
+    relationship_guard = _bind_relationship_guard(relationship_guard, messages)
+    if relationship_guard is not None:
+        event_bus = bus if bus is not None else getattr(engine, "_bus", None)
+        if event_bus is not None:
+            bus = _relationship_request_event_bus(
+                event_bus,
+                relationship_guard,
+            )
+            engine = _copy_engine_for_relationship_events(engine, bus)
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     use_cloud = is_cloud_model(model)
     query_text = ""
@@ -1556,13 +2791,19 @@ async def _handle_stream_tools(
     async def generate():
         full_content = ""
         saw_tool_calls = False
+        buffered_frames: list[str] = []
+        buffered_tool_frames: list[str] = []
+        buffered_bytes = 0
+        tool_call_batches: list[list[dict[str, Any]]] = []
         # Send the role chunk first (OpenAI convention).
         first_chunk = ChatCompletionChunk(
             id=chunk_id,
             model=model,
             choices=[StreamChoice(delta=DeltaMessage(role="assistant"))],
         )
-        yield f"data: {first_chunk.model_dump_json()}\n\n"
+        first_frame = f"data: {first_chunk.model_dump_json()}\n\n"
+        if relationship_guard is None:
+            yield first_frame
 
         finish_reason = None
         try:
@@ -1574,15 +2815,34 @@ async def _handle_stream_tools(
                 tools=req.tools,
             ):
                 if sc.content:
+                    if relationship_guard is not None:
+                        content_bytes = len(sc.content.encode("utf-8"))
+                        if content_bytes > (
+                            _RELATIONSHIP_STREAM_BUFFER_BYTES
+                            - len(full_content.encode("utf-8"))
+                        ):
+                            raise RuntimeError(
+                                "relationship stream exceeds output buffer"
+                            )
                     full_content += sc.content
                     content_chunk = ChatCompletionChunk(
                         id=chunk_id,
                         model=model,
                         choices=[StreamChoice(delta=DeltaMessage(content=sc.content))],
                     )
-                    yield f"data: {content_chunk.model_dump_json()}\n\n"
+                    content_frame = f"data: {content_chunk.model_dump_json()}\n\n"
+                    if relationship_guard is None:
+                        yield content_frame
+                    else:
+                        buffered_bytes = _bounded_stream_append(
+                            buffered_frames,
+                            content_frame,
+                            buffered_bytes,
+                        )
                 if sc.tool_calls:
                     saw_tool_calls = True
+                    if relationship_guard is not None:
+                        tool_call_batches.append(sc.tool_calls)
                     tc_chunk = ChatCompletionChunk(
                         id=chunk_id,
                         model=model,
@@ -1590,16 +2850,27 @@ async def _handle_stream_tools(
                             StreamChoice(delta=DeltaMessage(tool_calls=sc.tool_calls))
                         ],
                     )
-                    yield f"data: {tc_chunk.model_dump_json()}\n\n"
+                    tool_frame = f"data: {tc_chunk.model_dump_json()}\n\n"
+                    if relationship_guard is None:
+                        yield tool_frame
+                    else:
+                        buffered_bytes = _bounded_stream_append(
+                            buffered_tool_frames,
+                            tool_frame,
+                            buffered_bytes,
+                        )
                 if sc.finish_reason:
                     finish_reason = sc.finish_reason
         except Exception:
-            import logging
-
-            logging.getLogger("openjarvis.server").error(
-                "Tool stream generation failed",
-                exc_info=True,
-            )
+            if relationship_guard is None:
+                logging.getLogger("openjarvis.server").error(
+                    "Tool stream generation failed",
+                    exc_info=True,
+                )
+            else:
+                logging.getLogger("openjarvis.server").error(
+                    "Relationship tool stream failed before emission"
+                )
             yield (
                 'data: {"error":{"type":"generation_error",'
                 '"message":"Chat generation failed"}}\n\n'
@@ -1618,12 +2889,65 @@ async def _handle_stream_tools(
             yield "data: [DONE]\n\n"
             return
 
+        effective_content = full_content
+        effective_finish_reason = finish_reason
+        if relationship_guard is not None:
+            try:
+                assembled_tool_calls = _assembled_stream_tool_calls(tool_call_batches)
+                decision = _apply_relationship_guard(
+                    relationship_guard,
+                    full_content,
+                    assembled_tool_calls,
+                )
+            except Exception:
+                logging.getLogger("openjarvis.server").error(
+                    "Relationship tool stream policy failed before emission"
+                )
+                yield (
+                    'data: {"error":{"type":"relationship_policy_error",'
+                    '"message":"Chat output policy unavailable"}}\n\n'
+                )
+                yield "data: [DONE]\n\n"
+                return
+            assert decision is not None
+            yield first_frame
+            if decision.action == "replace":
+                effective_content = decision.output_text
+                effective_finish_reason = "stop"
+                replacement_chunk = ChatCompletionChunk(
+                    id=chunk_id,
+                    model=model,
+                    choices=[
+                        StreamChoice(delta=DeltaMessage(content=effective_content))
+                    ],
+                )
+                yield f"data: {replacement_chunk.model_dump_json()}\n\n"
+            else:
+                for buffered_frame in buffered_frames:
+                    yield buffered_frame
+                if assembled_tool_calls:
+                    canonical_tool_chunk = ChatCompletionChunk(
+                        id=chunk_id,
+                        model=model,
+                        choices=[
+                            StreamChoice(
+                                delta=DeltaMessage(tool_calls=assembled_tool_calls)
+                            )
+                        ],
+                    )
+                    yield (f"data: {canonical_tool_chunk.model_dump_json()}\n\n")
+
         import json as _json
 
         finish_data = ChatCompletionChunk(
             id=chunk_id,
             model=model,
-            choices=[StreamChoice(delta=DeltaMessage(), finish_reason=finish_reason)],
+            choices=[
+                StreamChoice(
+                    delta=DeltaMessage(),
+                    finish_reason=effective_finish_reason,
+                )
+            ],
         )
         finish_dict = _json.loads(finish_data.model_dump_json())
         # Tag the finish chunk with the engine label, matching _handle_stream
@@ -1633,11 +2957,11 @@ async def _handle_stream_tools(
         if complexity_info is not None:
             finish_dict["complexity"] = complexity_info.model_dump()
         yield f"data: {_json.dumps(finish_dict)}\n\n"
-        if finish_reason == "stop" and full_content:
+        if effective_finish_reason == "stop" and effective_content:
             _record_completed_exchange(
                 memory_service,
                 query_text,
-                full_content,
+                effective_content,
                 bus=bus,
                 source="server.chat.stream",
                 allow_legacy_memory=allow_legacy_memory,
@@ -1662,8 +2986,10 @@ async def _handle_stream(
     bus=None,
     memory_service=None,
     relationship_overlay=None,
+    relationship_guard=None,
     allow_legacy_memory: bool = False,
     trusted_context_messages: list[Message] | None = None,
+    temporal_context_fragment: str | None = None,
     principal_provenance: str | None = None,
 ):
     """Stream response using SSE format.
@@ -1688,7 +3014,19 @@ async def _handle_stream(
         base_identity_prompt,
         relationship_overlay,
         trusted_context_messages,
+        temporal_context_fragment,
     )
+    if relationship_overlay is not None and relationship_guard is None:
+        relationship_guard = _prepare_relationship_guard_or_503(relationship_overlay)
+    relationship_guard = _bind_relationship_guard(relationship_guard, messages)
+    if relationship_guard is not None:
+        event_bus = bus if bus is not None else getattr(engine, "_bus", None)
+        if event_bus is not None:
+            bus = _relationship_request_event_bus(
+                event_bus,
+                relationship_guard,
+            )
+            engine = _copy_engine_for_relationship_events(engine, bus)
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
     # Last user message — recorded as the trace query.
@@ -1706,6 +3044,9 @@ async def _handle_stream(
         started_at = time.time()
         full_content = ""
         finish_reason: str | None = None
+        buffered_frames: list[str] = []
+        buffered_bytes = 0
+        relationship_trace_metadata: dict[str, object] | None = None
         # Send role chunk first
         first_chunk = ChatCompletionChunk(
             id=chunk_id,
@@ -1716,7 +3057,9 @@ async def _handle_stream(
                 )
             ],
         )
-        yield f"data: {first_chunk.model_dump_json()}\n\n"
+        first_frame = f"data: {first_chunk.model_dump_json()}\n\n"
+        if relationship_guard is None:
+            yield first_frame
 
         try:
             # Cloud models → direct cloud API (reads keys from disk).
@@ -1759,6 +3102,15 @@ async def _handle_stream(
                     )
             async for stream_chunk in chunk_iter:
                 if stream_chunk.content:
+                    if relationship_guard is not None:
+                        content_bytes = len(stream_chunk.content.encode("utf-8"))
+                        if content_bytes > (
+                            _RELATIONSHIP_STREAM_BUFFER_BYTES
+                            - len(full_content.encode("utf-8"))
+                        ):
+                            raise RuntimeError(
+                                "relationship stream exceeds output buffer"
+                            )
                     full_content += stream_chunk.content
                     chunk = ChatCompletionChunk(
                         id=chunk_id,
@@ -1769,18 +3121,29 @@ async def _handle_stream(
                             )
                         ],
                     )
-                    yield f"data: {chunk.model_dump_json()}\n\n"
+                    content_frame = f"data: {chunk.model_dump_json()}\n\n"
+                    if relationship_guard is None:
+                        yield content_frame
+                    else:
+                        buffered_bytes = _bounded_stream_append(
+                            buffered_frames,
+                            content_frame,
+                            buffered_bytes,
+                        )
                 if stream_chunk.finish_reason:
                     finish_reason = _motif_arret(
                         {"finish_reason": stream_chunk.finish_reason}
                     )
         except Exception:
-            import logging
-
-            logging.getLogger("openjarvis.server").error(
-                "Chat stream generation failed",
-                exc_info=True,
-            )
+            if relationship_guard is None:
+                logging.getLogger("openjarvis.server").error(
+                    "Chat stream generation failed",
+                    exc_info=True,
+                )
+            else:
+                logging.getLogger("openjarvis.server").error(
+                    "Relationship chat stream failed before emission"
+                )
             yield (
                 'data: {"error":{"type":"generation_error",'
                 '"message":"Chat generation failed"}}\n\n'
@@ -1796,28 +3159,65 @@ async def _handle_stream(
             yield "data: [DONE]\n\n"
             return
 
+        effective_content = full_content
+        if relationship_guard is not None:
+            try:
+                decision = _apply_relationship_guard(
+                    relationship_guard,
+                    full_content,
+                )
+                relationship_trace_metadata = relationship_guard.metadata()
+                if not isinstance(relationship_trace_metadata, dict):
+                    raise RuntimeError("relationship guard metadata is invalid")
+            except Exception:
+                logging.getLogger("openjarvis.server").error(
+                    "Relationship chat stream policy failed before emission"
+                )
+                yield (
+                    'data: {"error":{"type":"relationship_policy_error",'
+                    '"message":"Chat output policy unavailable"}}\n\n'
+                )
+                yield "data: [DONE]\n\n"
+                return
+            assert decision is not None
+            effective_content = decision.output_text
+            yield first_frame
+            if decision.action == "replace":
+                replacement_chunk = ChatCompletionChunk(
+                    id=chunk_id,
+                    model=model,
+                    choices=[
+                        StreamChoice(delta=DeltaMessage(content=effective_content))
+                    ],
+                )
+                yield f"data: {replacement_chunk.model_dump_json()}\n\n"
+            else:
+                for buffered_frame in buffered_frames:
+                    yield buffered_frame
+
         # Record a trace for the completed stream (best-effort; never breaks
         # the response). Mirrors the agent path so streamed chats also
         # populate traces.db.
-        if trace_store is not None and full_content:
+        if trace_store is not None and effective_content:
             from openjarvis.traces.collector import record_response_trace
 
             record_response_trace(
                 trace_store,
                 query=query_text,
-                result=full_content,
+                result=effective_content,
                 model=model,
                 engine="cloud" if use_cloud else "ollama",
                 started_at=started_at,
                 ended_at=time.time(),
                 provenance=principal_provenance,
+                metadata=(relationship_trace_metadata),
             )
 
-        if full_content:
+        if effective_content:
             _record_completed_exchange(
                 memory_service,
                 query_text,
-                full_content,
+                effective_content,
                 bus=bus,
                 source="server.chat.stream",
                 allow_legacy_memory=allow_legacy_memory,

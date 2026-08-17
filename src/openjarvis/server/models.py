@@ -48,6 +48,11 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int = Field(default=1024, ge=1, le=MAX_COMPLETION_TOKENS)
     stream: bool = False
     tools: Optional[List[Dict[str, Any]]] = None
+    # First-party Matrix metadata remains raw until the authenticated route can
+    # validate it against the boundary-issued Principal.  Excluding it from
+    # generic dumps preserves historical durable hashes; the route instead
+    # binds the validated, server-rendered fragment conditionally.
+    temporal_context: Optional[Any] = Field(default=None, exclude=True)
     #: ⚠ QUI POSE LA QUESTION — champ standard de l'API OpenAI, et le PRÉREQUIS de la
     #: mémoire épisodique. Mesure du 2026-08-07 : les 352 traces sont indiscernables
     #: entre elles (même `agent`, même `engine`, `messages` et `metadata` vides), alors

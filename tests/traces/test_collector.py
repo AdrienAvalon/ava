@@ -6,10 +6,12 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+import pytest
+
 from openjarvis.agents._stubs import AgentContext, AgentResult, BaseAgent
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.types import StepType, ToolResult
-from openjarvis.traces.collector import TraceCollector
+from openjarvis.traces.collector import TraceCollector, TraceContentFilterResult
 from openjarvis.traces.store import TraceStore
 
 
@@ -215,6 +217,55 @@ class TestTraceCollector:
         generate_steps = [s for s in trace.steps if s.step_type == StepType.GENERATE]
         assert len(generate_steps) == 1
         assert generate_steps[0].output.get("tokens") == 50
+        store.close()
+
+    @pytest.mark.parametrize("content", [None, {"provider": "rich"}])
+    def test_no_content_filter_preserves_inference_content(
+        self,
+        tmp_path: Path,
+        content: Any,
+    ) -> None:
+        bus = EventBus()
+        store = TraceStore(tmp_path / "unfiltered-content.db")
+
+        class _UnfilteredContentAgent(BaseAgent):
+            agent_id = "unfiltered_content"
+
+            def __init__(self) -> None:
+                self._bus = bus
+
+            def run(
+                self,
+                input: str,
+                context: Optional[AgentContext] = None,
+                **kwargs: Any,
+            ) -> AgentResult:
+                del input, context, kwargs
+                bus.publish(
+                    EventType.INFERENCE_START,
+                    {"model": "test-model", "engine": "test"},
+                )
+                bus.publish(
+                    EventType.INFERENCE_END,
+                    {"content": content, "total_tokens": 1},
+                )
+                return AgentResult(
+                    content="safe",
+                    turns=1,
+                    metadata={"finish_reason": "stop"},
+                )
+
+        TraceCollector(
+            _UnfilteredContentAgent(),
+            store=store,
+            bus=bus,
+        ).run("question")
+
+        trace = store.list_traces()[0]
+        generate_step = next(
+            step for step in trace.steps if step.step_type == StepType.GENERATE
+        )
+        assert generate_step.output["content"] == content
         store.close()
 
     def test_records_tool_steps(self, tmp_path: Path) -> None:
@@ -464,6 +515,397 @@ class TestRichTraceCollector:
         assert gen_steps[0].output["finish_reason"] == "tool_calls"
         assert gen_steps[1].output["content"] == "The answer is 4."
         assert gen_steps[1].output["finish_reason"] == "stop"
+        store.close()
+
+    def test_request_filter_scrubs_before_store_and_trace_complete(
+        self, tmp_path: Path
+    ) -> None:
+        canary = "CANARY-UNSAFE-OUTPUT"
+        replacement = "Safe replacement."
+        bus = EventBus()
+        store = TraceStore(tmp_path / "filtered.db")
+        published: list[object] = []
+        bus.subscribe(
+            EventType.TRACE_COMPLETE,
+            lambda event: published.append(event.data["trace"]),
+        )
+
+        class _UnsafeAgent(BaseAgent):
+            agent_id = "unsafe"
+
+            def __init__(self) -> None:
+                pass
+
+            def run(
+                self,
+                input: str,
+                context: Optional[AgentContext] = None,
+                **kwargs: Any,
+            ) -> AgentResult:
+                del input, context, kwargs
+                bus.publish(
+                    EventType.INFERENCE_START,
+                    {"model": "test-model", "engine": "test"},
+                )
+                bus.publish(
+                    EventType.INFERENCE_END,
+                    {
+                        "content": canary,
+                        "tool_calls": [
+                            {
+                                "id": "call-unsafe",
+                                "name": "probe",
+                                "arguments": f'{{"query":"{canary}"}}',
+                            }
+                        ],
+                        "tool_results": [{"content": canary}],
+                        "content_blocks": [{"text": canary}],
+                        "finish_reason": "tool_calls",
+                    },
+                )
+                bus.publish(
+                    EventType.TOOL_CALL_START,
+                    {"tool": "probe", "arguments": {"query": canary}},
+                )
+                bus.publish(
+                    EventType.TOOL_CALL_END,
+                    {"tool": "probe", "success": True, "result": canary},
+                )
+                return AgentResult(
+                    content=canary,
+                    tool_results=[
+                        ToolResult(tool_name="probe", content=canary, success=True)
+                    ],
+                    turns=1,
+                    metadata={
+                        "finish_reason": "tool_calls",
+                        "audio_path": f"/tmp/{canary}.wav",
+                        "content_blocks": [{"text": canary}],
+                        "messages": [
+                            {"role": "user", "content": "question"},
+                            {
+                                "role": "assistant",
+                                "content": canary,
+                                "tool_calls": [{"arguments": canary}],
+                                "content_blocks": [{"text": canary}],
+                            },
+                        ],
+                    },
+                )
+
+        def content_filter(
+            content: str,
+            structured_output_json: tuple[str, ...],
+            *,
+            allow_conversation_echo: bool,
+            final: bool,
+        ) -> TraceContentFilterResult:
+            del allow_conversation_echo, final
+            blocked = canary in content or any(
+                canary in item for item in structured_output_json
+            )
+            return TraceContentFilterResult(
+                content=replacement if blocked else content,
+                suppress_structured_output=blocked,
+                force_stop=blocked,
+            )
+
+        collector = TraceCollector(_UnsafeAgent(), store=store, bus=bus)
+        result = collector.run(
+            "question",
+            content_filter=content_filter,
+            trace_metadata_provider=lambda: {"filter_policy": "test-v1"},
+        )
+
+        assert result.content == replacement
+        assert result.tool_results == []
+        assert result.metadata["finish_reason"] == "stop"
+        assert "audio_path" not in result.metadata
+        assert "content_blocks" not in result.metadata
+        assert canary not in repr(result)
+        trace = store.list_traces()[0]
+        assert trace.result == replacement
+        assert trace.metadata["filter_policy"] == "test-v1"
+        assert all(step.step_type != StepType.TOOL_CALL for step in trace.steps)
+        assert canary not in repr(trace)
+        assert len(published) == 1
+        assert canary not in repr(published[0])
+        store.close()
+
+    def test_active_filter_always_drops_rich_content_blocks(
+        self, tmp_path: Path
+    ) -> None:
+        bus = EventBus()
+        store = TraceStore(tmp_path / "content-blocks.db")
+
+        class _ContentBlockAgent(_FakeAgent):
+            def run(self, *args: Any, **kwargs: Any) -> AgentResult:
+                bus.publish(
+                    EventType.INFERENCE_START,
+                    {"model": "test-model", "engine": "test"},
+                )
+                bus.publish(
+                    EventType.INFERENCE_END,
+                    {
+                        "content": "safe",
+                        "content_blocks": [{"text": "safe"}],
+                        "finish_reason": "stop",
+                    },
+                )
+                return AgentResult(
+                    content="safe",
+                    turns=1,
+                    metadata={"finish_reason": "stop"},
+                )
+
+        def allow(
+            content: str,
+            structured_output_json: tuple[str, ...],
+            *,
+            allow_conversation_echo: bool,
+            final: bool,
+        ) -> TraceContentFilterResult:
+            del structured_output_json, allow_conversation_echo, final
+            return TraceContentFilterResult(content=content)
+
+        TraceCollector(_ContentBlockAgent(), store=store, bus=bus).run(
+            "question",
+            content_filter=allow,
+        )
+
+        generate = next(
+            step
+            for step in store.list_traces()[0].steps
+            if step.step_type == StepType.GENERATE
+        )
+        assert "content_blocks" not in generate.output
+        store.close()
+
+    def test_active_filter_canonicalizes_divergent_messages_and_drops_system(
+        self, tmp_path: Path
+    ) -> None:
+        bus = EventBus()
+        store = TraceStore(tmp_path / "canonical-messages.db")
+        canary = "MESSAGE-CANARY Je suis jalouse."
+        private_prompt = "PRIVATE-RELATIONSHIP-OVERLAY-CANARY"
+        replacement = "Message assistant retire."
+
+        class _DivergentMessagesAgent(_FakeAgent):
+            def run(self, *args: Any, **kwargs: Any) -> AgentResult:
+                return AgentResult(
+                    content="Synthese finale sure.",
+                    turns=1,
+                    metadata={
+                        "finish_reason": "stop",
+                        "messages": [
+                            {"role": "system", "content": private_prompt},
+                            {
+                                "role": "user",
+                                "content": "question",
+                                "provider_field": "not persisted",
+                            },
+                            {
+                                "role": "assistant",
+                                "content": canary,
+                                "tool_calls": [{"arguments": "{}"}],
+                                "metadata": {"opaque": canary},
+                                "images": [canary],
+                            },
+                        ],
+                    },
+                )
+
+        def content_filter(
+            content: str,
+            structured_output_json: tuple[str, ...],
+            *,
+            allow_conversation_echo: bool,
+            final: bool,
+        ) -> TraceContentFilterResult:
+            del allow_conversation_echo, final
+            blocked = canary in content or any(
+                canary in item for item in structured_output_json
+            )
+            return TraceContentFilterResult(
+                content=replacement if blocked else content,
+                suppress_structured_output=blocked,
+                force_stop=blocked,
+            )
+
+        result = TraceCollector(_DivergentMessagesAgent(), store=store, bus=bus).run(
+            "question", content_filter=content_filter
+        )
+
+        assert result.content == "Synthese finale sure."
+        trace = store.list_traces()[0]
+        assert trace.result == "Synthese finale sure."
+        assert trace.messages == [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": replacement},
+        ]
+        assert canary not in repr(trace)
+        assert private_prompt not in repr(trace)
+        store.close()
+
+    def test_active_filter_rejects_unknown_message_role_without_raw_persistence(
+        self, tmp_path: Path
+    ) -> None:
+        bus = EventBus()
+        store = TraceStore(tmp_path / "unknown-message-role.db")
+        canary = "UNKNOWN-ROLE-CANARY Je suis jalouse."
+
+        class _UnknownRoleAgent(_FakeAgent):
+            def run(self, *args: Any, **kwargs: Any) -> AgentResult:
+                return AgentResult(
+                    content="Synthese finale sure.",
+                    turns=1,
+                    metadata={
+                        "finish_reason": "stop",
+                        "messages": [{"role": "model", "content": canary}],
+                    },
+                )
+
+        def allow(
+            content: str,
+            structured_output_json: tuple[str, ...],
+            *,
+            allow_conversation_echo: bool,
+            final: bool,
+        ) -> TraceContentFilterResult:
+            del structured_output_json, allow_conversation_echo, final
+            return TraceContentFilterResult(content=content)
+
+        with pytest.raises(RuntimeError, match="trace content filtering failed"):
+            TraceCollector(_UnknownRoleAgent(), store=store, bus=bus).run(
+                "question",
+                content_filter=allow,
+            )
+
+        traces = store.list_traces()
+        assert traces == []
+        assert canary not in repr(traces)
+        store.close()
+
+    def test_tool_start_arguments_never_use_conversation_echo(
+        self, tmp_path: Path
+    ) -> None:
+        copied_user_turn = "Une question substantielle avec plus de quatre mots."
+        bus = EventBus()
+        store = TraceStore(tmp_path / "tool-echo.db")
+
+        class _EchoingToolAgent(BaseAgent):
+            agent_id = "tool-echo"
+
+            def __init__(self) -> None:
+                pass
+
+            def run(self, *args: Any, **kwargs: Any) -> AgentResult:
+                bus.publish(
+                    EventType.TOOL_CALL_START,
+                    {"tool": "search", "arguments": {"query": copied_user_turn}},
+                )
+                bus.publish(
+                    EventType.TOOL_CALL_END,
+                    {"tool": "search", "success": True, "result": "safe page"},
+                )
+                return AgentResult(
+                    content="Synthese sure.",
+                    turns=1,
+                    metadata={"finish_reason": "stop"},
+                )
+
+        def echo_sensitive_filter(
+            content: str,
+            structured_output_json: tuple[str, ...],
+            *,
+            allow_conversation_echo: bool,
+            final: bool,
+        ) -> TraceContentFilterResult:
+            del final
+            echoed = allow_conversation_echo and any(
+                copied_user_turn in item for item in structured_output_json
+            )
+            return TraceContentFilterResult(
+                content="Blocked echo." if echoed else content,
+                suppress_structured_output=echoed,
+                force_stop=echoed,
+            )
+
+        result = TraceCollector(_EchoingToolAgent(), store=store, bus=bus).run(
+            "question", content_filter=echo_sensitive_filter
+        )
+
+        trace = store.list_traces()[0]
+        assert result.content == "Synthese sure."
+        assert trace.result == "Synthese sure."
+        assert trace.outcome == "completed"
+        assert any(step.step_type == StepType.TOOL_CALL for step in trace.steps)
+        store.close()
+
+    def test_unsafe_external_tool_result_is_scrubbed_without_sticky_replace(
+        self, tmp_path: Path
+    ) -> None:
+        canary = "EXTERNAL-CANARY Je suis jalouse."
+        replacement = "External content removed."
+        bus = EventBus()
+        store = TraceStore(tmp_path / "tool-result.db")
+
+        class _ExternalToolAgent(BaseAgent):
+            agent_id = "external-tool"
+
+            def __init__(self) -> None:
+                pass
+
+            def run(self, *args: Any, **kwargs: Any) -> AgentResult:
+                bus.publish(
+                    EventType.TOOL_CALL_START,
+                    {"tool": "search", "arguments": {"query": "safe"}},
+                )
+                bus.publish(
+                    EventType.TOOL_CALL_END,
+                    {"tool": "search", "success": True, "result": canary},
+                )
+                return AgentResult(
+                    content="Synthese finale sure.",
+                    tool_results=[
+                        ToolResult(tool_name="search", content=canary, success=True)
+                    ],
+                    turns=1,
+                    metadata={"finish_reason": "stop"},
+                )
+
+        def text_gate_filter(
+            content: str,
+            structured_output_json: tuple[str, ...],
+            *,
+            allow_conversation_echo: bool,
+            final: bool,
+        ) -> TraceContentFilterResult:
+            del allow_conversation_echo, final
+            blocked = canary in content or any(
+                canary in item for item in structured_output_json
+            )
+            return TraceContentFilterResult(
+                content=replacement if blocked else content,
+                suppress_structured_output=blocked,
+                force_stop=blocked,
+            )
+
+        result = TraceCollector(_ExternalToolAgent(), store=store, bus=bus).run(
+            "question", content_filter=text_gate_filter
+        )
+
+        trace = store.list_traces()[0]
+        assert result.content == "Synthese finale sure."
+        assert result.tool_results[0].content == replacement
+        assert result.metadata["finish_reason"] == "stop"
+        assert trace.result == "Synthese finale sure."
+        assert trace.outcome == "completed"
+        assert canary not in repr(trace)
+        tool_step = next(
+            step for step in trace.steps if step.step_type == StepType.TOOL_CALL
+        )
+        assert tool_step.output["result"] == replacement
         store.close()
 
     def test_captures_tool_arguments_and_result(self, tmp_path: Path) -> None:

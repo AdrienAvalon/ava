@@ -34,6 +34,7 @@ from openjarvis.agents._stubs import (
     BaseAgent,
     ToolUsingAgent,
 )
+from openjarvis.agents.orchestrator import OrchestratorAgent
 from openjarvis.core.config import JarvisConfig
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.types import Message, Role, ToolResult
@@ -99,23 +100,24 @@ class _SpyMemory:
         del timeout
 
 
-class _CapturingAgent(BaseAgent):
-    agent_id = "capture"
+def _capturing_agent(engine) -> OrchestratorAgent:
+    engine._publishes_events = False
+    agent = OrchestratorAgent(
+        engine,
+        "test-model",
+        max_turns=1,
+        parallel_tools=False,
+    )
+    agent.capabilities = ("tool-a", "tool-b")
+    agent.captured = []
 
-    def __init__(self, engine) -> None:
-        super().__init__(engine, "test-model")
-        self.capabilities = ("tool-a", "tool-b")
-        self.captured = []
+    def capture(messages, **_kwargs):
+        agent.captured.clear()
+        agent.captured.extend(messages)
+        return {"content": "ok", "finish_reason": "stop", "usage": {}}
 
-    def run(
-        self,
-        input: str,
-        context: AgentContext | None = None,
-        **_kwargs,
-    ) -> AgentResult:
-        self.captured.clear()
-        self.captured.extend(self._build_messages(input, context))
-        return AgentResult(content="ok", turns=1)
+    engine.generate.side_effect = capture
+    return agent
 
 
 class _NamedTool(BaseTool):
@@ -143,30 +145,25 @@ class _NamedTool(BaseTool):
         return ToolResult(tool_name=self._name, content="ok", success=True)
 
 
-class _ToolOfferAgent(ToolUsingAgent):
-    agent_id = "tool-offer"
+def _tool_offer_agent(engine) -> OrchestratorAgent:
+    engine._publishes_events = False
+    agent = OrchestratorAgent(
+        engine,
+        "test-model",
+        tools=[_NamedTool("memoire"), _NamedTool("calculator")],
+        max_turns=1,
+        parallel_tools=False,
+    )
+    agent._executor._capability_policy = _ToolSurfacePolicy({})
+    agent.offers = []
 
-    def __init__(self, engine) -> None:
-        super().__init__(
-            engine,
-            "test-model",
-            tools=[_NamedTool("memoire"), _NamedTool("calculator")],
-            capability_policy=_ToolSurfacePolicy({}),
-        )
-        self.offers: list[tuple[str, ...]] = []
+    def capture(messages, *, tools=(), **_kwargs):
+        del messages
+        agent.offers.append(tuple(item["function"]["name"] for item in tools))
+        return {"content": "ok", "finish_reason": "stop", "usage": {}}
 
-    def run(
-        self,
-        input: str,
-        context: AgentContext | None = None,
-        **_kwargs,
-    ) -> AgentResult:
-        del input, context
-        names = tuple(
-            item["function"]["name"] for item in self._executor.get_openai_tools()
-        )
-        self.offers.append(names)
-        return AgentResult(content="ok", turns=1)
+    engine.generate.side_effect = capture
+    return agent
 
 
 class _ToolSurfacePolicy:
@@ -326,7 +323,7 @@ def test_texte_champ_user_et_systeme_copie_ne_selectionnent_pas_le_profil(
 def test_agent_recoit_composition_sans_changer_ses_capacites(monkeypatch) -> None:
     _select(monkeypatch)
     engine = _engine()
-    agent = _CapturingAgent(engine)
+    agent = _capturing_agent(engine)
     before = agent.capabilities
     client = TestClient(create_app(engine, "test-model", agent=agent, config=_config()))
     response = client.post(
@@ -347,7 +344,7 @@ def test_agent_refuse_marker_et_demote_toute_instruction_systeme_client(
     monkeypatch,
 ) -> None:
     _select(monkeypatch)
-    agent = _CapturingAgent(_engine())
+    agent = _capturing_agent(_engine())
     client = TestClient(
         create_app(agent._engine, "test-model", agent=agent, config=_config())
     )
@@ -379,7 +376,7 @@ def test_agent_refuse_marker_et_demote_toute_instruction_systeme_client(
 def test_frontiere_http_retire_outil_memoire_sur_copie_par_requete(
     monkeypatch,
 ) -> None:
-    agent = _ToolOfferAgent(_engine())
+    agent = _tool_offer_agent(_engine())
     client = TestClient(
         create_app(agent._engine, "test-model", agent=agent, config=_config())
     )
@@ -633,7 +630,7 @@ def test_profil_relationnel_ne_lit_jamais_contexte_legacy_partage(
     config = _config()
     config.agent.context_from_memory = True
     engine = _engine()
-    agent = _CapturingAgent(engine) if agent_path else None
+    agent = _capturing_agent(engine) if agent_path else None
     client = TestClient(
         create_app(
             engine,
@@ -714,7 +711,7 @@ def test_owner_guest_et_anonyme_n_accedent_jamais_a_la_memoire_legacy(
     config = _config()
     config.agent.context_from_memory = True
     memory = _SpyMemory()
-    agent = _ToolOfferAgent(_engine())
+    agent = _tool_offer_agent(_engine())
     client = TestClient(
         create_app(
             agent._engine,
@@ -803,7 +800,7 @@ def test_identite_commune_indisponible_echoue_503_avant_backend(
 
     monkeypatch.setattr(system_prompt_loader, "load_common_persona", unavailable)
     engine = _engine()
-    agent = _CapturingAgent(engine) if mode == "agent" else None
+    agent = _capturing_agent(engine) if mode == "agent" else None
     client = TestClient(create_app(engine, "test-model", agent=agent, config=_config()))
     response = client.post(
         "/v1/chat/completions",
@@ -966,7 +963,7 @@ def test_contexte_interlocuteur_agent_vient_seulement_des_politiques_serveur(
     monkeypatch,
 ) -> None:
     engine = _engine()
-    agent = _CapturingAgent(engine)
+    agent = _capturing_agent(engine)
     client = TestClient(create_app(engine, "test-model", agent=agent, config=_config()))
     named_overlay = RelationshipOverlay(
         profile_id=OVERLAY.profile_id,

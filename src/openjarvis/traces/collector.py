@@ -2,14 +2,69 @@
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import time
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence
 
 from openjarvis.agents._stubs import AgentContext, AgentResult, BaseAgent
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.types import StepType, Trace, TraceStep
 from openjarvis.engine._finish import conservative_finish_reason
 from openjarvis.traces.store import TraceStore
+
+
+@dataclass(frozen=True, slots=True)
+class TraceContentFilterResult:
+    """Sanitized content returned by a request-local trace filter."""
+
+    content: str = field(repr=False)
+    suppress_structured_output: bool = False
+    force_stop: bool = False
+
+
+class TraceContentFilter(Protocol):
+    """Filter model-owned text before any trace or response is persisted."""
+
+    def __call__(
+        self,
+        content: str,
+        structured_output_json: Sequence[str],
+        *,
+        allow_conversation_echo: bool,
+        final: bool,
+    ) -> TraceContentFilterResult: ...
+
+
+TraceMetadataProvider = Callable[[], Mapping[str, object]]
+
+
+def _structured_json(value: Any) -> str:
+    """Return bounded inspection input without falling back to unsafe repr()."""
+
+    def dataclass_default(item: Any) -> Any:
+        if dataclasses.is_dataclass(item) and not isinstance(item, type):
+            return dataclasses.asdict(item)
+        raise TypeError
+
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+            default=dataclass_default,
+        )
+    except (TypeError, ValueError, OverflowError):
+        raise RuntimeError("structured trace output cannot be inspected") from None
+
+
+def _structured_filter_inputs(*values: Any) -> tuple[str, ...]:
+    return tuple(
+        _structured_json(value) for value in values if value not in (None, [], {}, "")
+    )
 
 
 class TraceCollector:
@@ -47,6 +102,10 @@ class TraceCollector:
         self._current_model: str = ""
         self._current_engine: str = ""
         self._last_trace: Optional[Trace] = None
+        self._active_content_filter: TraceContentFilter | None = None
+        self._replacement_filter_result: TraceContentFilterResult | None = None
+        self._last_content_filter_result: TraceContentFilterResult | None = None
+        self._final_filter_applied = False
 
     def run(
         self,
@@ -54,6 +113,8 @@ class TraceCollector:
         context: Optional[AgentContext] = None,
         *,
         provenance: Optional[str] = None,
+        content_filter: TraceContentFilter | None = None,
+        trace_metadata_provider: TraceMetadataProvider | None = None,
         **kwargs: Any,
     ) -> AgentResult:
         """Execute the wrapped agent and record a trace.
@@ -66,17 +127,41 @@ class TraceCollector:
         self._current_steps = []
         self._current_model = ""
         self._current_engine = ""
+        self._tool_starts = {}
+        self._active_content_filter = content_filter
+        self._replacement_filter_result = None
+        self._last_content_filter_result = None
+        self._final_filter_applied = False
 
         # Subscribe to events for trace collection
         unsubs = self._subscribe()
 
         started_at = time.time()
         try:
-            result = self._agent.run(input, context=context, **kwargs)
+            try:
+                result = self._agent.run(input, context=context, **kwargs)
+            except Exception:
+                if content_filter is not None:
+                    # The Ava observability extension records `_current_steps`
+                    # when an agent raises.  Overlay events are intentionally
+                    # request-local and still raw at this point, so never let
+                    # that fallback persist or log them.
+                    self._current_steps = []
+                    raise RuntimeError("filtered agent execution failed") from None
+                raise
         finally:
             self._unsubscribe(unsubs)
 
         ended_at = time.time()
+
+        if content_filter is not None:
+            try:
+                result = self._filter_agent_result(result)
+            except Exception:
+                # Fail closed without handing raw request-local events to the
+                # failure-trace patch installed by Ava.
+                self._current_steps = []
+                raise RuntimeError("trace content filtering failed") from None
 
         # Add final respond step
         self._current_steps.append(
@@ -92,6 +177,15 @@ class TraceCollector:
         messages: List[Dict[str, Any]] = result.metadata.get("messages", [])
 
         # Build and persist the trace
+        trace_metadata: dict[str, object] = (
+            {"provenance": provenance} if provenance else {}
+        )
+        if trace_metadata_provider is not None:
+            provided_metadata = trace_metadata_provider()
+            if not isinstance(provided_metadata, Mapping):
+                raise RuntimeError("trace metadata provider returned invalid data")
+            trace_metadata.update(provided_metadata)
+
         trace = Trace(
             query=input,
             agent=getattr(self._agent, "agent_id", "unknown"),
@@ -106,7 +200,7 @@ class TraceCollector:
             #   `inconnue`, elle ne devient pas « l'admin » par défaut. Le défaut le
             #   plus dangereux serait d'attribuer à quelqu'un des propos qu'il n'a pas
             #   tenus.
-            metadata={"provenance": provenance} if provenance else {},
+            metadata=trace_metadata,
         )
         # Recompute totals from steps
         for step in trace.steps:
@@ -227,6 +321,282 @@ class TraceCollector:
         """Return the trace from the most recent ``run()``."""
         return self._last_trace
 
+    @property
+    def last_content_filter_result(self) -> TraceContentFilterResult | None:
+        """Return the final request-local filter decision, when configured."""
+
+        return self._last_content_filter_result
+
+    def _apply_content_filter(
+        self,
+        content: str,
+        structured_output_json: Sequence[str] = (),
+        *,
+        allow_conversation_echo: bool,
+        final: bool,
+    ) -> TraceContentFilterResult:
+        content_filter = self._active_content_filter
+        if content_filter is None:
+            return TraceContentFilterResult(content=content)
+        if final and self._final_filter_applied:
+            raise RuntimeError("terminal trace content filter already applied")
+        if not isinstance(content, str) or any(
+            not isinstance(item, str) for item in structured_output_json
+        ):
+            raise RuntimeError("trace content filter received invalid data")
+        result = content_filter(
+            content,
+            tuple(structured_output_json),
+            allow_conversation_echo=allow_conversation_echo,
+            final=final,
+        )
+        if (
+            not isinstance(result, TraceContentFilterResult)
+            or not isinstance(result.content, str)
+            or type(result.suppress_structured_output) is not bool
+            or type(result.force_stop) is not bool
+            or (result.force_stop and not result.suppress_structured_output)
+            or (final and result.suppress_structured_output and not result.content)
+        ):
+            raise RuntimeError("trace content filter returned invalid data")
+        if final:
+            self._final_filter_applied = True
+            self._last_content_filter_result = result
+            if result.suppress_structured_output:
+                self._replacement_filter_result = result
+        return result
+
+    def _filter_messages(
+        self,
+        messages: Any,
+        final_decision: TraceContentFilterResult,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(messages, list):
+            raise RuntimeError("trace messages cannot be inspected")
+        normalised: list[dict[str, Any]] = []
+        for message in messages:
+            if dataclasses.is_dataclass(message) and not isinstance(message, type):
+                message = dataclasses.asdict(message)
+            if not isinstance(message, Mapping):
+                raise RuntimeError("trace messages cannot be inspected")
+            normalised.append(dict(message))
+
+        assistant_indexes = [
+            index
+            for index, message in enumerate(normalised)
+            if message.get("role") == "assistant"
+        ]
+        last_assistant = assistant_indexes[-1] if assistant_indexes else None
+        filtered_messages: list[dict[str, Any]] = []
+        for index, message in enumerate(normalised):
+            filtered = dict(message)
+            role = filtered.get("role")
+            if role not in {"system", "user", "assistant", "tool"}:
+                raise RuntimeError("trace message role cannot be inspected")
+            if role == "system":
+                # A system turn may contain the private server-owned overlay.
+                # It is model context, not conversation history for traces.
+                continue
+            content = filtered.get("content")
+            if content is None:
+                content = ""
+            if not isinstance(content, str):
+                raise RuntimeError("trace message content cannot be inspected")
+            if role == "user":
+                filtered_messages.append({"role": role, "content": content})
+                continue
+
+            structured = _structured_filter_inputs(
+                {
+                    key: value
+                    for key, value in filtered.items()
+                    if key not in {"role", "content"}
+                }
+            )
+            is_current_assistant = role == "assistant" and index == last_assistant
+            message_decision = self._apply_content_filter(
+                content,
+                structured,
+                allow_conversation_echo=is_current_assistant,
+                final=False,
+            )
+            decision = (
+                final_decision
+                if is_current_assistant and final_decision.suppress_structured_output
+                else message_decision
+            )
+            # Steps retain inspected tool detail. Conversation messages under
+            # an active filter deliberately keep only their canonical text.
+            filtered_messages.append({"role": role, "content": decision.content})
+        return filtered_messages
+
+    def _scrub_steps_after_replacement(self) -> None:
+        scrubbed: list[TraceStep] = []
+        for step in self._current_steps:
+            if step.step_type == StepType.TOOL_CALL:
+                continue
+            if step.step_type == StepType.GENERATE:
+                step.output.pop("tool_calls", None)
+                step.output.pop("tool_results", None)
+                step.output.pop("content_blocks", None)
+                step.output["finish_reason"] = "stop"
+            scrubbed.append(step)
+        self._current_steps = scrubbed
+
+    def _scrub_trace_steps(self) -> None:
+        """Sanitize request-local event snapshots before store or publication."""
+
+        for step in self._current_steps:
+            if step.step_type == StepType.GENERATE:
+                content = step.output.get("content", "")
+                if content is None:
+                    content = ""
+                if not isinstance(content, str):
+                    raise RuntimeError("trace inference content cannot be inspected")
+                decision = self._apply_content_filter(
+                    content,
+                    _structured_filter_inputs(
+                        step.output.get("tool_calls"),
+                        step.output.get("content_blocks"),
+                    ),
+                    allow_conversation_echo=True,
+                    final=False,
+                )
+                step.output["content"] = decision.content
+                step.output.pop("content_blocks", None)
+
+                tool_result_decision = self._apply_content_filter(
+                    "",
+                    _structured_filter_inputs(step.output.get("tool_results")),
+                    allow_conversation_echo=False,
+                    final=False,
+                )
+                if tool_result_decision.suppress_structured_output:
+                    step.output["tool_results"] = []
+                if decision.suppress_structured_output:
+                    step.output.pop("tool_calls", None)
+                    step.output.pop("tool_results", None)
+                    step.output["finish_reason"] = "stop"
+                continue
+
+            if step.step_type != StepType.TOOL_CALL:
+                continue
+            argument_decision = self._apply_content_filter(
+                "",
+                _structured_filter_inputs(step.input.get("arguments")),
+                allow_conversation_echo=False,
+                final=False,
+            )
+            if argument_decision.suppress_structured_output:
+                step.input["arguments"] = {}
+
+            result_content = step.output.get("result", "")
+            if result_content is None:
+                result_content = ""
+            if not isinstance(result_content, str):
+                result_content = _structured_json(result_content)
+            result_decision = self._apply_content_filter(
+                result_content,
+                (),
+                allow_conversation_echo=False,
+                final=False,
+            )
+            step.output["result"] = result_decision.content
+
+            metadata_decision = self._apply_content_filter(
+                "",
+                _structured_filter_inputs(step.metadata),
+                allow_conversation_echo=False,
+                final=False,
+            )
+            if metadata_decision.suppress_structured_output:
+                step.metadata = {}
+
+    def _filter_external_tool_results(self, tool_results: Any) -> list[Any]:
+        if not isinstance(tool_results, list):
+            raise RuntimeError("trace tool results cannot be inspected")
+        filtered_results: list[Any] = []
+        for tool_result in tool_results:
+            content = getattr(tool_result, "content", None)
+            if not isinstance(content, str):
+                raise RuntimeError("trace tool result content cannot be inspected")
+            metadata = getattr(tool_result, "metadata", {})
+            usage = getattr(tool_result, "usage", {})
+            decision = self._apply_content_filter(
+                content,
+                _structured_filter_inputs(metadata, usage),
+                allow_conversation_echo=False,
+                final=False,
+            )
+            if decision.content != content or decision.suppress_structured_output:
+                if not dataclasses.is_dataclass(tool_result):
+                    raise RuntimeError("trace tool result cannot be scrubbed")
+                tool_result = dataclasses.replace(
+                    tool_result,
+                    content=decision.content,
+                    metadata=({} if decision.suppress_structured_output else metadata),
+                    usage=({} if decision.suppress_structured_output else usage),
+                )
+            filtered_results.append(tool_result)
+        return filtered_results
+
+    def _filter_agent_result(self, result: AgentResult) -> AgentResult:
+        metadata = dict(getattr(result, "metadata", {}) or {})
+        structured = _structured_filter_inputs(
+            {
+                key: metadata[key]
+                for key in (
+                    "tool_calls",
+                    "content_blocks",
+                    "audio",
+                    "audio_path",
+                )
+                if key in metadata and metadata[key] not in (None, [], {}, "")
+            }
+        )
+        decision = self._apply_content_filter(
+            result.content,
+            structured,
+            allow_conversation_echo=True,
+            final=True,
+        )
+        self._scrub_trace_steps()
+        if "messages" in metadata:
+            metadata["messages"] = self._filter_messages(
+                metadata["messages"],
+                decision,
+            )
+        result.tool_results = self._filter_external_tool_results(result.tool_results)
+        if "tool_results" in metadata:
+            tool_result_decision = self._apply_content_filter(
+                "",
+                _structured_filter_inputs(metadata["tool_results"]),
+                allow_conversation_echo=False,
+                final=False,
+            )
+            if tool_result_decision.suppress_structured_output:
+                metadata.pop("tool_results", None)
+
+        if self._replacement_filter_result is not None:
+            decision = self._replacement_filter_result
+            self._scrub_steps_after_replacement()
+        result.content = decision.content
+        if decision.suppress_structured_output:
+            result.tool_results = []
+            for key in (
+                "tool_calls",
+                "tool_results",
+                "content_blocks",
+                "audio",
+                "audio_path",
+            ):
+                metadata.pop(key, None)
+            metadata["finish_reason"] = "stop"
+        else:
+            metadata.pop("content_blocks", None)
+        result.metadata = metadata
+        return result
+
     # -- event handlers --------------------------------------------------------
 
     def _subscribe(self) -> list[tuple]:
@@ -258,6 +628,15 @@ class TraceCollector:
         start = getattr(self, "_inference_start_time", event.timestamp)
         data = event.data
         usage = data.get("usage", {})
+        content = data.get("content", "")
+        if self._active_content_filter is not None:
+            if content is None:
+                content = ""
+            if not isinstance(content, str):
+                raise RuntimeError("trace inference content cannot be inspected")
+        tool_calls = data.get("tool_calls", [])
+        tool_results = data.get("tool_results", [])
+        content_blocks = data.get("content_blocks", [])
         self._current_steps.append(
             TraceStep(
                 step_type=StepType.GENERATE,
@@ -272,10 +651,10 @@ class TraceCollector:
                         "total_tokens",
                         data.get("total_tokens", 0),
                     ),
-                    "content": data.get("content", ""),
-                    "tool_calls": data.get("tool_calls", []),
-                    "tool_results": data.get("tool_results", []),
-                    "content_blocks": data.get("content_blocks", []),
+                    "content": content,
+                    "tool_calls": tool_calls,
+                    "tool_results": tool_results,
+                    "content_blocks": content_blocks,
                     "finish_reason": data.get("finish_reason", ""),
                 },
                 metadata={
@@ -321,6 +700,7 @@ class TraceCollector:
         file.append((event.timestamp, event.data))
 
     def _on_tool_end(self, event: Any) -> None:
+        result_content = event.data.get("result", "")
         file = self._tool_starts.get(str(event.data.get("tool", "")))
         if file:
             start, start_data = file.pop(0)
@@ -345,7 +725,7 @@ class TraceCollector:
                 },
                 output={
                     "success": event.data.get("success", False),
-                    "result": event.data.get("result", ""),
+                    "result": result_content,
                 },
                 metadata=dict(result_metadata),
             )
@@ -376,6 +756,7 @@ def record_response_trace(
     started_at: float,
     ended_at: float,
     provenance: str | None = None,
+    metadata: Mapping[str, object] | None = None,
 ) -> Optional[Trace]:
     """Persist a minimal single-step ``Trace`` for a non-agent response.
 
@@ -392,6 +773,11 @@ def record_response_trace(
         return None
     try:
         duration = max(0.0, ended_at - started_at)
+        trace_metadata: dict[str, object] = (
+            {"provenance": provenance} if provenance else {}
+        )
+        if metadata is not None:
+            trace_metadata.update(metadata)
         trace = Trace(
             query=query,
             agent=agent,
@@ -400,7 +786,7 @@ def record_response_trace(
             result=result,
             started_at=started_at,
             ended_at=ended_at,
-            metadata={"provenance": provenance} if provenance else {},
+            metadata=trace_metadata,
             steps=[
                 TraceStep(
                     step_type=StepType.RESPOND,
@@ -422,4 +808,10 @@ def record_response_trace(
         return None
 
 
-__all__ = ["TraceCollector", "record_response_trace"]
+__all__ = [
+    "TraceCollector",
+    "TraceContentFilter",
+    "TraceContentFilterResult",
+    "TraceMetadataProvider",
+    "record_response_trace",
+]
