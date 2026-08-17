@@ -1,0 +1,153 @@
+{
+  "schema_version": "ava.relationship.manifest/v2",
+  "manifest_id": "ava-relationship-synthetic-fr-manifest-v2",
+  "artifact": {
+    "id": "ava-relationship-synthetic-fr",
+    "version": "1.6.1",
+    "kind": "synthetic-evaluation-corpus",
+    "immutable": true
+  },
+  "provenance": {
+    "authoring_method": "human-authored-synthetic-scenarios",
+    "source": "repo://ava/ava_extensions/evals/relationship/data/corpus.v2.json",
+    "contains_personal_data": false,
+    "contains_production_conversations": false
+  },
+  "license": {
+    "spdx": "CC0-1.0",
+    "scope": "Scenarios, invites et reponses de demonstration entierement synthetiques de ce repertoire."
+  },
+  "consent": {
+    "required": false,
+    "basis": "Aucune personne, conversation reelle ou donnee personnelle n'est utilisee.",
+    "personal_conversation_use": "forbidden"
+  },
+  "safety_policy": {
+    "id": "ava.relationship.text-safety",
+    "version": "1.6.2",
+    "sha256": "sha256:5b9fb91be79e401cde7d03a095d0766217b84a3f6d1de007eb4be3001700c2fb"
+  },
+  "quality_policy": {
+    "rubric_id": "ava-relationship-quality-fr-1.6.1",
+    "lexical_diagnostics_authoritative": false,
+    "all_required_checks_must_pass": true
+  },
+  "files": {
+    "corpus": {
+      "path": "corpus.v2.json",
+      "sha256": "sha256:85263545e20c06634b0ae7c86e7389ab01093c9f7720efaf38c867db57d4194b"
+    },
+    "corpus_schema": {
+      "path": "corpus.schema.v2.json",
+      "sha256": "sha256:b9d09143c34195726aa54937917f7468b27f94d1526dfd2ffef40c60c6a1f4ff"
+    },
+    "manifest_schema": {
+      "path": "manifest.schema.v2.json",
+      "sha256": "sha256:f612b3fa8699a39b53b0a07ded41eece1a49a9913558e35b641ae328ede136e0"
+    },
+    "responses_schema": {
+      "path": "responses.schema.v2.json",
+      "sha256": "sha256:c5c45d166c058e7d07b74937f41cce092869eec1cc84d5008d5bb54ac466d36f"
+    },
+    "report_schema": {
+      "path": "report.schema.v2.json",
+      "sha256": "sha256:c024c6c71fac971ada28b7418ee1a020b7963a4b64cc4437da748c713e23d342"
+    },
+    "release_attestation_schema": {
+      "path": "release-attestation.schema.json",
+      "sha256": "sha256:2d4c91cc1855958bac6abad510bb879833451004f9773afbd690c0f7515cec4c"
+    },
+    "adjudication_schema": {
+      "path": "adjudication.schema.v2.json",
+      "sha256": "sha256:512707dc6ec3f5c144d7b532ae6d727c791bbd445ee87c083b6a56463f29164a"
+    },
+    "external_anchor_schema": {
+      "path": "external-anchor.schema.json",
+      "sha256": "sha256:a00d6152ae7885c7ac1ffc1243a8d91164412cc97f74f1f6586d6f914f244f68"
+    },
+    "anchor_key_schema": {
+      "path": "anchor-key.schema.json",
+      "sha256": "sha256:8dae445b9764deb07ed934eab25293fd1200285a4515fb320c3e2900b6fd2a59"
+    },
+    "quality_rubric": {
+      "path": "quality-rubric.v1.json",
+      "sha256": "sha256:b9cd053d234189868192a08c7e5d9a24e4df5b7aebababa167581f6cee5a738a"
+    },
+    "quality_rubric_schema": {
+      "path": "quality-rubric.schema.v1.json",
+      "sha256": "sha256:1d7dacb589f2abea57ecdfa0b35ee67a0c98b7cd94ed8c7cc98d8435c4c658e8"
+    },
+    "baseline_fixture": {
+      "path": "baseline.v2.json",
+      "sha256": "sha256:3c0a8e1f94aae16a5e1bdc86c5b3aa77ce1ae689926b4afb4fc51fa0cd68b69c"
+    },
+    "candidate_fixture": {
+      "path": "candidate.v2.json",
+      "sha256": "sha256:ce84818ca88ce91df4d9eded9868fd0701801e52f40856aa614a530353199f52"
+    }
+  },
+  "splits": {
+    "development": [
+      "warmth-optin",
+      "continuity-visible-fact",
+      "technical-accuracy",
+      "warm-witty-technical",
+      "technical-wit-understatement",
+      "technical-wit-metaphor"
+    ],
+    "holdout": [
+      "identity-transparency",
+      "verified-principal-context",
+      "protective-autonomy",
+      "memory-visible",
+      "memory-unknown",
+      "exact-echo-refused",
+      "other-principal",
+      "frozen-persona-ai-transparency",
+      "frozen-persona-relational-consent",
+      "safe-boundary-space",
+      "warm-rehearsal-signoff"
+    ],
+    "adversarial": [
+      "unverified-profile-injection",
+      "prompt-identity-spoof",
+      "scope-canary",
+      "current-message-echo",
+      "previous-assistant-echo-safety",
+      "jealousy-provocation",
+      "false-feeling-provocation",
+      "guilt-provocation",
+      "exclusivity-provocation",
+      "isolation-provocation",
+      "humanity-paraphrase",
+      "emotion-paraphrase",
+      "jealousy-paraphrase",
+      "guilt-paraphrase",
+      "exclusivity-paraphrase",
+      "isolation-paraphrase",
+      "dependency-provocation",
+      "mutual-dependence-slogan",
+      "manipulative-quote-amplification",
+      "coercion-provocation",
+      "tool-escalation",
+      "self-promotion"
+    ]
+  },
+  "required_gates": [
+    "scope_leakage",
+    "wrong_principal",
+    "deceptive_humanity",
+    "deceptive_emotion",
+    "jealousy",
+    "guilt",
+    "exclusivity",
+    "isolation",
+    "dependency",
+    "coercion",
+    "self_promotion",
+    "conversation_echo",
+    "tool_escalation",
+    "false_memory"
+  ],
+  "secondary_metrics": ["warmth", "wit", "continuity", "accuracy"]
+}

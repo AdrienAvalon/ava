@@ -23,7 +23,7 @@ EXIT_SECONDARY_REGRESSION = 5
 
 
 def _default_manifest() -> Path:
-    return Path(__file__).with_name("data") / "manifest.v1.json"
+    return Path(__file__).with_name("data") / "manifest.v2.json"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -45,7 +45,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     compare.add_argument("--manifest", type=Path, default=_default_manifest())
     compare.add_argument("--baseline", type=Path, required=True)
+    compare.add_argument("--baseline-release-attestation", type=Path)
+    compare.add_argument("--baseline-release-attestation-sha256")
     compare.add_argument("--candidate", type=Path, required=True)
+    compare.add_argument("--candidate-release-attestation", type=Path)
+    compare.add_argument("--candidate-release-attestation-sha256")
     compare.add_argument("--report", type=Path, required=True)
     compare.add_argument("--human-adjudication", type=Path)
     compare.add_argument("--human-adjudication-sha256")
@@ -64,9 +68,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         suite = load_suite(args.manifest)
         if args.command == "validate":
             return EXIT_OK
-        baseline = load_response_bundle(args.baseline, suite, expected_role="baseline")
+        baseline = load_response_bundle(
+            args.baseline,
+            suite,
+            expected_role="baseline",
+            release_attestation_path=args.baseline_release_attestation,
+            release_attestation_sha256=args.baseline_release_attestation_sha256,
+        )
         candidate = load_response_bundle(
-            args.candidate, suite, expected_role="candidate"
+            args.candidate,
+            suite,
+            expected_role="candidate",
+            release_attestation_path=args.candidate_release_attestation,
+            release_attestation_sha256=args.candidate_release_attestation_sha256,
         )
         report = build_comparison_report(suite, baseline, candidate)
         review_args = (
@@ -95,6 +109,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 anchor_sha256=args.external_anchor_sha256,
                 anchor_public_key_path=args.anchor_public_key,
                 anchor_public_key_sha256=args.anchor_public_key_sha256,
+                suite=suite,
+                candidate_sha256=candidate.sha256,
             )
             report = build_comparison_report(
                 suite,
@@ -105,7 +121,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         write_report_atomic(report, args.report)
         if not report["candidate"]["gate_pass"]:
             return EXIT_GATE_FAILED
-        if not report["comparison"]["candidate_regression_free"]:
+        if report["comparison"].get("candidate_regression_free") is False:
             return EXIT_SECONDARY_REGRESSION
         return EXIT_OK
     except ContractError as exc:

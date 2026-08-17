@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import importlib
 import ipaddress
 import json
 import logging
@@ -30,6 +31,11 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
+from ava_extensions.identity.relationship_safety import (
+    RELATIONSHIP_TEXT_SAFETY_POLICY_ID,
+    RELATIONSHIP_TEXT_SAFETY_POLICY_VERSION,
+)
+
 from .contracts import (
     RESPONSES_SCHEMA_VERSION,
     LoadedReleaseAttestation,
@@ -42,8 +48,8 @@ from .contracts import (
 )
 from .evaluator import EXPECTED_RELATIONSHIP_PROFILE_ID
 
-DEFAULT_MANIFEST = Path(__file__).with_name("data") / "manifest.v1.json"
-GENERATED_BY = "ava-relationship-shadow-runner-v1"
+DEFAULT_MANIFEST = Path(__file__).with_name("data") / "manifest.v2.json"
+GENERATED_BY = "ava-relationship-shadow-runner-v2"
 
 _RUNTIME_OWNER = "matrix:@synthetic-owner:eval.invalid"
 _RUNTIME_GUEST = "matrix:@synthetic-guest:eval.invalid"
@@ -107,6 +113,219 @@ class _ObservedCall:
         if len(system) != 1:
             raise ShadowRunError("shadow request did not contain one server prompt")
         return system[0]
+
+
+@dataclass(frozen=True, slots=True)
+class _ObservedGuardAction:
+    case_id: str
+    action: str
+    gate_ids: tuple[str, ...]
+    policy_id: str
+    policy_version: str
+    policy_sha256: str
+    output_sha256: str
+
+
+class _RelationshipGuardObserver:
+    """Observe le vrai garde sans conserver le texte inspecte."""
+
+    def __init__(self) -> None:
+        self.current_case_id: str | None = None
+        self.prepare_case_ids: list[str] = []
+        self.actions: list[_ObservedGuardAction] = []
+        self.prepared_policies: list[tuple[str, str, str]] = []
+
+    def begin_case(self, case_id: str) -> None:
+        if self.current_case_id is not None:
+            raise ShadowRunError("relationship guard observer case overlap")
+        self.current_case_id = case_id
+
+    def observe_prepare(self, guard: Any) -> None:
+        if self.current_case_id is None:
+            raise ShadowRunError("relationship guard prepare outside corpus case")
+        self.prepare_case_ids.append(self.current_case_id)
+        if guard is None:
+            return
+        metadata_method = getattr(guard, "metadata", None)
+        metadata = metadata_method() if callable(metadata_method) else {}
+        if type(metadata) is not dict:
+            raise ShadowRunError("relationship guard metadata is invalid")
+        policy_id = metadata.get("policy_id")
+        policy_version = metadata.get("policy_version")
+        policy_sha256 = getattr(guard, "policy_sha256", None)
+        if not all(
+            isinstance(value, str) and value
+            for value in (policy_id, policy_version, policy_sha256)
+        ):
+            raise ShadowRunError("relationship guard policy metadata is incomplete")
+        self.prepared_policies.append((policy_id, policy_version, policy_sha256))
+
+    def observe_apply(self, decision: Any) -> None:
+        if self.current_case_id is None:
+            raise ShadowRunError("relationship guard apply outside corpus case")
+        action = getattr(decision, "action", None)
+        gate_ids = getattr(decision, "gate_ids", None)
+        policy_id = getattr(decision, "policy_id", None)
+        policy_version = getattr(decision, "policy_version", None)
+        policy_sha256 = getattr(decision, "policy_sha256", None)
+        output_text = getattr(decision, "output_text", None)
+        if action not in {"allow", "replace"}:
+            raise ShadowRunError("relationship guard returned an invalid action")
+        if type(gate_ids) is not tuple or not all(
+            isinstance(gate_id, str) and gate_id for gate_id in gate_ids
+        ):
+            raise ShadowRunError("relationship guard returned invalid gate ids")
+        if (action == "allow") != (not gate_ids):
+            raise ShadowRunError("relationship guard action and gates diverge")
+        if not all(
+            isinstance(value, str) and value
+            for value in (policy_id, policy_version, policy_sha256, output_text)
+        ):
+            raise ShadowRunError("relationship guard decision metadata is incomplete")
+        self.actions.append(
+            _ObservedGuardAction(
+                case_id=self.current_case_id,
+                action="pass" if action == "allow" else "replace",
+                gate_ids=gate_ids,
+                policy_id=policy_id,
+                policy_version=policy_version,
+                policy_sha256=policy_sha256,
+                output_sha256=sha256_bytes(output_text.encode("utf-8")),
+            )
+        )
+
+    def finish_case(self, response_text: str) -> None:
+        if self.current_case_id is None:
+            raise ShadowRunError("relationship guard observer has no active case")
+        current_actions = [
+            action for action in self.actions if action.case_id == self.current_case_id
+        ]
+        if len(current_actions) > 1:
+            raise ShadowRunError("relationship guard applied more than once per case")
+        if current_actions and current_actions[0].output_sha256 != sha256_bytes(
+            response_text.encode("utf-8")
+        ):
+            raise ShadowRunError("relationship guard output differs from HTTP response")
+        self.current_case_id = None
+
+    def document(
+        self,
+        *,
+        suite: LoadedSuite,
+        role: Literal["baseline", "candidate"],
+    ) -> dict[str, Any]:
+        if self.current_case_id is not None:
+            raise ShadowRunError("relationship guard observer ended inside a case")
+        if role == "baseline":
+            if self.prepare_case_ids or self.actions:
+                raise ShadowRunError("baseline release invoked relationship guard")
+            return {
+                "schema_version": "ava.relationship.guard-observation/v2",
+                "active": False,
+                "policy_id": None,
+                "policy_sha256": None,
+                "expected_prepare_calls": 0,
+                "observed_prepare_calls": 0,
+                "expected_apply_calls": 0,
+                "observed_apply_calls": 0,
+                "actions": [],
+            }
+
+        expected_case_ids = [case["id"] for case in suite.corpus["cases"]]
+        expected_apply_ids = [
+            case["id"] for case in suite.corpus["cases"] if _relationship_allowed(case)
+        ]
+        if self.prepare_case_ids != expected_case_ids:
+            raise ShadowRunError("candidate guard prepare coverage is incomplete")
+        if [action.case_id for action in self.actions] != expected_apply_ids:
+            raise ShadowRunError("candidate guard apply coverage is incomplete")
+        expected_policy = (
+            RELATIONSHIP_TEXT_SAFETY_POLICY_ID,
+            RELATIONSHIP_TEXT_SAFETY_POLICY_VERSION,
+            suite.safety_policy_sha256,
+        )
+        observed_policies = [
+            *self.prepared_policies,
+            *[
+                (action.policy_id, action.policy_version, action.policy_sha256)
+                for action in self.actions
+            ],
+        ]
+        if not observed_policies or any(
+            policy != expected_policy for policy in observed_policies
+        ):
+            raise ShadowRunError("candidate guard policy metadata diverges")
+        return {
+            "schema_version": "ava.relationship.guard-observation/v2",
+            "active": True,
+            "policy_id": RELATIONSHIP_TEXT_SAFETY_POLICY_ID,
+            "policy_sha256": suite.safety_policy_sha256,
+            "expected_prepare_calls": len(expected_case_ids),
+            "observed_prepare_calls": len(self.prepare_case_ids),
+            "expected_apply_calls": len(expected_apply_ids),
+            "observed_apply_calls": len(self.actions),
+            "actions": [
+                {
+                    "case_id": action.case_id,
+                    "action": action.action,
+                    "gate_ids": list(action.gate_ids),
+                }
+                for action in self.actions
+            ],
+        }
+
+
+def _relationship_guard_module() -> Any | None:
+    module_name = "ava_extensions.identity.relationship_guard"
+    try:
+        return importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name == module_name:
+            return None
+        raise
+
+
+@contextmanager
+def _observe_runtime_relationship_guard(
+    routes: Any,
+) -> Iterator[_RelationshipGuardObserver]:
+    """Wrap the real prepare/apply hooks and delegate without behavior changes."""
+
+    observer = _RelationshipGuardObserver()
+    guard_module = _relationship_guard_module()
+    if guard_module is None:
+        yield observer
+        return
+
+    original_prepare = getattr(guard_module, "prepare_relationship_guard", None)
+    guard_class = getattr(guard_module, "RelationshipOutputGuard", None)
+    original_apply = getattr(guard_class, "apply", None)
+    if not callable(original_prepare) or not callable(original_apply):
+        yield observer
+        return
+
+    def observed_prepare(*args: Any, **kwargs: Any) -> Any:
+        guard = original_prepare(*args, **kwargs)
+        observer.observe_prepare(guard)
+        return guard
+
+    def observed_apply(guard: Any, *args: Any, **kwargs: Any) -> Any:
+        decision = original_apply(guard, *args, **kwargs)
+        observer.observe_apply(decision)
+        return decision
+
+    route_prepare = getattr(routes, "prepare_relationship_guard", None)
+    setattr(guard_module, "prepare_relationship_guard", observed_prepare)
+    setattr(guard_class, "apply", observed_apply)
+    if route_prepare is original_prepare:
+        setattr(routes, "prepare_relationship_guard", observed_prepare)
+    try:
+        yield observer
+    finally:
+        if route_prepare is original_prepare:
+            setattr(routes, "prepare_relationship_guard", route_prepare)
+        setattr(guard_class, "apply", original_apply)
+        setattr(guard_module, "prepare_relationship_guard", original_prepare)
 
 
 class _ObservedEngine:
@@ -804,7 +1023,15 @@ async def _run_http_suite(
     policy_path: Path,
     model: str,
     oidc_fixture: _OIDCFixture,
-) -> tuple[list[dict[str, Any]], tuple[str, ...], tuple[str, ...], str]:
+    role: Literal["baseline", "candidate"],
+    routes: Any,
+) -> tuple[
+    list[dict[str, Any]],
+    tuple[str, ...],
+    tuple[str, ...],
+    str,
+    dict[str, Any],
+]:
     from ava_extensions.identity.relationship import RELATIONSHIP_MARKER
     from ava_extensions.patches.system_prompt_loader import load_common_persona
     from ava_extensions.server import principal as principal_module
@@ -1028,54 +1255,60 @@ async def _run_http_suite(
             raise ShadowRunError("relationship policy rollback was not reversible")
 
         responses: list[dict[str, Any]] = []
-        for case in suite.corpus["cases"]:
-            principal = case["principal"]
-            headers: dict[str, str] = {}
-            if principal["verified"]:
-                headers = service_headers(
-                    _runtime_subject(principal["request_subject"])
+        with _observe_runtime_relationship_guard(routes) as guard_observer:
+            for case in suite.corpus["cases"]:
+                guard_observer.begin_case(case["id"])
+                principal = case["principal"]
+                headers: dict[str, str] = {}
+                if principal["verified"]:
+                    headers = service_headers(
+                        _runtime_subject(principal["request_subject"])
+                    )
+                before = len(observed_engine.calls)
+                response = await _post_completion(
+                    client,
+                    model=model,
+                    messages=_case_messages(case),
+                    headers=headers,
                 )
-            before = len(observed_engine.calls)
-            response = await _post_completion(
-                client,
-                model=model,
-                messages=_case_messages(case),
-                headers=headers,
-            )
-            text, tool_calls = _extract_completion(response, expected_model=model)
-            if len(observed_engine.calls) != before + 1:
-                raise ShadowRunError("corpus case did not make exactly one model call")
-            call = observed_engine.calls[-1]
-            _assert_common_prompt(call, common_prompt)
-            profile = _profile_from_call(
-                call,
-                relationship_marker=RELATIONSHIP_MARKER,
-                logical_subject=principal["request_subject"],
-            )
-            if _relationship_allowed(case) != (profile is not None):
-                raise ShadowRunError(
-                    "relationship profile crossed a principal boundary"
+                text, tool_calls = _extract_completion(response, expected_model=model)
+                guard_observer.finish_case(text)
+                if len(observed_engine.calls) != before + 1:
+                    raise ShadowRunError(
+                        "corpus case did not make exactly one model call"
+                    )
+                call = observed_engine.calls[-1]
+                _assert_common_prompt(call, common_prompt)
+                profile = _profile_from_call(
+                    call,
+                    relationship_marker=RELATIONSHIP_MARKER,
+                    logical_subject=principal["request_subject"],
                 )
-            if profile is None and call.system_prompt != common_prompt:
-                raise ShadowRunError(
-                    "non-owner prompt diverged from the common persona"
+                if _relationship_allowed(case) != (profile is not None):
+                    raise ShadowRunError(
+                        "relationship profile crossed a principal boundary"
+                    )
+                if profile is None and call.system_prompt != common_prompt:
+                    raise ShadowRunError(
+                        "non-owner prompt diverged from the common persona"
+                    )
+                if (
+                    profile is not None
+                    and call.system_prompt != rollback_calls[0].system_prompt
+                ):
+                    raise ShadowRunError(
+                        "owner relationship prompt drifted during the corpus"
+                    )
+                responses.append(
+                    {
+                        "applied_profile": profile,
+                        "case_id": case["id"],
+                        "memory_claims": _visible_memory_claims(case, text),
+                        "text": text,
+                        "tool_calls": tool_calls,
+                    }
                 )
-            if (
-                profile is not None
-                and call.system_prompt != rollback_calls[0].system_prompt
-            ):
-                raise ShadowRunError(
-                    "owner relationship prompt drifted during the corpus"
-                )
-            responses.append(
-                {
-                    "applied_profile": profile,
-                    "case_id": case["id"],
-                    "memory_claims": _visible_memory_claims(case, text),
-                    "text": text,
-                    "tool_calls": tool_calls,
-                }
-            )
+        guard_observation = guard_observer.document(suite=suite, role=role)
 
     prompt_digest = sha256_bytes(
         canonical_json_bytes(
@@ -1095,6 +1328,7 @@ async def _run_http_suite(
         tuple(name for name, _headers in negative_headers),
         positive_checks,
         prompt_digest,
+        guard_observation,
     )
 
 
@@ -1131,6 +1365,10 @@ def _execute_isolated(
     role: Literal["baseline", "candidate"],
     execution_mode: Literal["attested", "loopback", "configured-anthropic"],
 ) -> tuple[dict[str, Any], int, tuple[str, ...], tuple[str, ...]]:
+    if role == "candidate" and _relationship_guard_module() is None:
+        raise ShadowRunError(
+            "candidate shadow requires an observed runtime relationship guard"
+        )
     release_document = release_attestation.document
     engine_attestation = release_document["engine"]
     release = release_document["release"]
@@ -1140,6 +1378,7 @@ def _execute_isolated(
     revision = engine_attestation["revision"]
     adapter = engine_attestation["adapter"]
     configured_cloud = execution_mode == "configured-anthropic"
+    ambient_anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     with tempfile.TemporaryDirectory(
         prefix="ava-relationship-shadow-"
     ) as temporary_name:
@@ -1202,8 +1441,14 @@ def _execute_isolated(
             "OPENROUTER_API_KEY",
         )
         unset.extend(unrelated_provider_keys)
-        if not configured_cloud:
-            unset.append("ANTHROPIC_API_KEY")
+        ambient_anthropic_names = sorted(
+            name for name in os.environ if name.startswith("ANTHROPIC_")
+        )
+        unset.extend(
+            name
+            for name in ambient_anthropic_names
+            if not (configured_cloud and name == "ANTHROPIC_API_KEY")
+        )
         with _temporary_environment(environment, unset):
             engine: Any | None = None
             active_error: BaseException | None = None
@@ -1215,7 +1460,7 @@ def _execute_isolated(
                     expected_model=model,
                     allow_configured_model=configured_cloud,
                 )
-                app, httpx, _routes = _build_app(
+                app, httpx, routes = _build_app(
                     observed,
                     model,
                     configured_cloud_catalog=configured_cloud,
@@ -1230,18 +1475,24 @@ def _execute_isolated(
                 from ava_extensions.server import principal as principal_module
 
                 with _seed_local_jwks_cache(principal_module, oidc_fixture):
-                    responses, negative_checks, positive_checks, prompt_digest = (
-                        asyncio.run(
-                            _run_http_suite(
-                                app=app,
-                                httpx=httpx,
-                                observed_engine=observed,
-                                suite=suite,
-                                key=key,
-                                policy_path=policy_path,
-                                model=model,
-                                oidc_fixture=oidc_fixture,
-                            )
+                    (
+                        responses,
+                        negative_checks,
+                        positive_checks,
+                        prompt_digest,
+                        guard_observation,
+                    ) = asyncio.run(
+                        _run_http_suite(
+                            app=app,
+                            httpx=httpx,
+                            observed_engine=observed,
+                            suite=suite,
+                            key=key,
+                            policy_path=policy_path,
+                            model=model,
+                            oidc_fixture=oidc_fixture,
+                            role=role,
+                            routes=routes,
                         )
                     )
             except BaseException as exc:
@@ -1268,6 +1519,7 @@ def _execute_isolated(
                 "contains_production_conversations": False,
                 "engine": {"model": model, "provider": provider, "revision": revision},
                 "generated_by": GENERATED_BY,
+                "guard_observation": guard_observation,
                 "id": f"relationship-shadow-{role}-{release['git_sha'][:12]}",
                 "policy_sha256": policy_digest,
                 "prompt_sha256": prompt_digest,
@@ -1280,6 +1532,7 @@ def _execute_isolated(
                     "manifest_sha256": artifact["manifest_sha256"],
                 },
                 "role": role,
+                "safety_policy_sha256": suite.safety_policy_sha256,
                 "source_kind": "offline_shadow",
             },
             "corpus": {
@@ -1296,6 +1549,7 @@ def _execute_isolated(
             base64.urlsafe_b64encode(key).rstrip(b"="),
             _RUNTIME_OWNER.encode("utf-8"),
             _RUNTIME_GUEST.encode("utf-8"),
+            ambient_anthropic_api_key.encode("utf-8"),
         )
         if any(value and value in serialized for value in forbidden):
             raise ShadowRunError(

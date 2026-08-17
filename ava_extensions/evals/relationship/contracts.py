@@ -17,12 +17,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-CORPUS_SCHEMA_VERSION = "ava.relationship.corpus/v1"
-MANIFEST_SCHEMA_VERSION = "ava.relationship.manifest/v1"
-RESPONSES_SCHEMA_VERSION = "ava.relationship.responses/v1"
-REPORT_SCHEMA_VERSION = "ava.relationship.report/v1"
+from ava_extensions.identity.relationship_safety import (
+    RELATIONSHIP_TEXT_SAFETY_POLICY_ID,
+    RELATIONSHIP_TEXT_SAFETY_POLICY_VERSION,
+    RUNTIME_GUARD_GATE_IDS,
+    relationship_text_safety_policy_sha256,
+)
+
+CORPUS_SCHEMA_VERSION_V1 = "ava.relationship.corpus/v1"
+CORPUS_SCHEMA_VERSION = "ava.relationship.corpus/v2"
+MANIFEST_SCHEMA_VERSION_V1 = "ava.relationship.manifest/v1"
+MANIFEST_SCHEMA_VERSION = "ava.relationship.manifest/v2"
+RESPONSES_SCHEMA_VERSION_V1 = "ava.relationship.responses/v1"
+RESPONSES_SCHEMA_VERSION = "ava.relationship.responses/v2"
+REPORT_SCHEMA_VERSION_V1 = "ava.relationship.report/v1"
+REPORT_SCHEMA_VERSION = "ava.relationship.report/v2"
 RELEASE_ATTESTATION_SCHEMA_VERSION = "ava.release.attestation/v1"
-ADJUDICATION_SCHEMA_VERSION = "ava.relationship.adjudication/v1"
+ADJUDICATION_SCHEMA_VERSION_V1 = "ava.relationship.adjudication/v1"
+ADJUDICATION_SCHEMA_VERSION = "ava.relationship.adjudication/v2"
+QUALITY_RUBRIC_SCHEMA_VERSION = "ava.relationship.quality-rubric/v1"
 EXTERNAL_ANCHOR_SCHEMA_VERSION = "ava.relationship.external-anchor/v1"
 ANCHOR_KEY_SCHEMA_VERSION = "ava.relationship.anchor-key/v1"
 
@@ -66,8 +79,11 @@ class LoadedSuite:
     manifest_path: Path
     manifest: dict[str, Any]
     corpus: dict[str, Any]
+    quality_rubric: dict[str, Any] | None
     manifest_sha256: str
     corpus_sha256: str
+    quality_rubric_sha256: str | None
+    safety_policy_sha256: str | None
 
 
 @dataclass(frozen=True)
@@ -78,6 +94,7 @@ class LoadedResponses:
     document: dict[str, Any]
     sha256: str
     by_case_id: dict[str, dict[str, Any]]
+    release_attestation: LoadedReleaseAttestation | None
 
 
 @dataclass(frozen=True)
@@ -377,25 +394,34 @@ def _load_adjudication(
     expected_sha256: str,
     expected_kind: str,
     statement_sha256: str,
+    suite: LoadedSuite | None = None,
+    candidate_sha256: str | None = None,
 ) -> LoadedAdjudication:
     resolved, document, digest = _strict_external_document(
         path, expected_sha256=expected_sha256
     )
+    is_v2 = suite is not None and suite.quality_rubric is not None
+    adjudication_keys = {
+        "schema_version",
+        "attestation_id",
+        "kind",
+        "statement_sha256",
+        "reviewer",
+        "decision",
+        "checks",
+        "canonical_knowledge",
+    }
+    if is_v2:
+        adjudication_keys.add("quality_review")
     adjudication = _object(
         document,
         "adjudication",
-        {
-            "schema_version",
-            "attestation_id",
-            "kind",
-            "statement_sha256",
-            "reviewer",
-            "decision",
-            "checks",
-            "canonical_knowledge",
-        },
+        adjudication_keys,
     )
-    if adjudication["schema_version"] != ADJUDICATION_SCHEMA_VERSION:
+    expected_version = (
+        ADJUDICATION_SCHEMA_VERSION if is_v2 else ADJUDICATION_SCHEMA_VERSION_V1
+    )
+    if adjudication["schema_version"] != expected_version:
         raise ContractError("adjudication.schema_version: version non supportee")
     _string(
         adjudication["attestation_id"], "adjudication.attestation_id", pattern=_ID_RE
@@ -433,6 +459,48 @@ def _load_adjudication(
         for key, value in checks.items()
     ):
         raise ContractError("adjudication.checks: toutes les preuves sont requises")
+    if is_v2:
+        if candidate_sha256 is None or suite.quality_rubric_sha256 is None:
+            raise ContractError("adjudication.quality_review: contexte v2 incomplet")
+        quality_review = _object(
+            adjudication["quality_review"],
+            "adjudication.quality_review",
+            {"rubric_sha256", "candidate_sha256", "results"},
+        )
+        if (
+            _sha256(
+                quality_review["rubric_sha256"],
+                "adjudication.quality_review.rubric_sha256",
+            )
+            != suite.quality_rubric_sha256
+        ):
+            raise ContractError("adjudication.quality_review: rubrique divergente")
+        if (
+            _sha256(
+                quality_review["candidate_sha256"],
+                "adjudication.quality_review.candidate_sha256",
+            )
+            != candidate_sha256
+        ):
+            raise ContractError("adjudication.quality_review: candidat divergent")
+        results = _list(
+            quality_review["results"], "adjudication.quality_review.results"
+        )
+        validated_results: list[dict[str, str]] = []
+        for index, raw_result in enumerate(results):
+            result_path = f"adjudication.quality_review.results[{index}]"
+            result = _object(
+                raw_result, result_path, {"case_id", "check_id", "decision"}
+            )
+            _string(result["case_id"], f"{result_path}.case_id", pattern=_CASE_ID_RE)
+            _string(result["check_id"], f"{result_path}.check_id", pattern=_ID_RE)
+            if result["decision"] != "pass":
+                raise ContractError(f"{result_path}.decision: pass requis")
+            validated_results.append(result)
+        if validated_results != required_quality_results(suite):
+            raise ContractError(
+                "adjudication.quality_review.results: couverture exhaustive requise"
+            )
     if _boolean(
         adjudication["canonical_knowledge"], "adjudication.canonical_knowledge"
     ):
@@ -451,6 +519,8 @@ def load_review_evidence(
     anchor_sha256: str,
     anchor_public_key_path: str | Path,
     anchor_public_key_sha256: str,
+    suite: LoadedSuite | None = None,
+    candidate_sha256: str | None = None,
 ) -> ReviewEvidence:
     """Load two independent decisions plus an out-of-process immutable anchor."""
 
@@ -460,12 +530,16 @@ def load_review_evidence(
         expected_sha256=human_sha256,
         expected_kind="human",
         statement_sha256=statement,
+        suite=suite,
+        candidate_sha256=candidate_sha256,
     )
     independent = _load_adjudication(
         independent_path,
         expected_sha256=independent_sha256,
         expected_kind="independent",
         statement_sha256=statement,
+        suite=suite,
+        candidate_sha256=candidate_sha256,
     )
     if human.document["reviewer"]["id"] == independent.document["reviewer"]["id"]:
         raise ContractError("adjudications: deux reviewers distincts sont requis")
@@ -580,7 +654,7 @@ def _validate_fact(value: Any, path: str) -> dict[str, Any]:
     return fact
 
 
-def _validate_case(value: Any, path: str) -> dict[str, Any]:
+def _validate_case(value: Any, path: str, *, schema_version: str) -> dict[str, Any]:
     case = _object(
         value,
         path,
@@ -649,17 +723,19 @@ def _validate_case(value: Any, path: str) -> dict[str, Any]:
     if type(raw_policy) is not dict:
         raise ContractError(f"{path}.policy: objet requis")
     policy_with_defaults = dict(raw_policy)
-    policy_with_defaults.setdefault("allowed_exact_echo_turn_indexes", [])
+    policy_keys = {
+        "allowed_tools",
+        "visible_facts",
+        "forbidden_canaries",
+        "allowed_memory_claim_ids",
+    }
+    if schema_version == CORPUS_SCHEMA_VERSION_V1:
+        policy_with_defaults.setdefault("allowed_exact_echo_turn_indexes", [])
+        policy_keys.add("allowed_exact_echo_turn_indexes")
     policy = _object(
         policy_with_defaults,
         f"{path}.policy",
-        {
-            "allowed_tools",
-            "visible_facts",
-            "forbidden_canaries",
-            "allowed_memory_claim_ids",
-            "allowed_exact_echo_turn_indexes",
-        },
+        policy_keys,
     )
     _string_list(policy["allowed_tools"], f"{path}.policy.allowed_tools")
     facts = _list(policy["visible_facts"], f"{path}.policy.visible_facts")
@@ -688,7 +764,7 @@ def _validate_case(value: Any, path: str) -> dict[str, Any]:
             f"{path}.policy.forbidden_canaries: canari deja visible dans le cas"
         )
     echo_indexes = _list(
-        policy["allowed_exact_echo_turn_indexes"],
+        policy.get("allowed_exact_echo_turn_indexes", []),
         f"{path}.policy.allowed_exact_echo_turn_indexes",
     )
     if any(type(index) is not int or index < 0 for index in echo_indexes):
@@ -734,8 +810,9 @@ def _validate_case(value: Any, path: str) -> dict[str, Any]:
     optional_secondary = {
         "continuity_any_of_groups",
         "accuracy_any_of_groups",
-        "required_secondary",
     }
+    if schema_version == CORPUS_SCHEMA_VERSION_V1:
+        optional_secondary.add("required_secondary")
     if type(secondary) is not dict:
         raise ContractError(f"{secondary_path}: objet requis")
     secondary_keys = set(secondary)
@@ -824,7 +901,10 @@ def validate_corpus(document: dict[str, Any]) -> dict[str, Any]:
             "cases",
         },
     )
-    if corpus["schema_version"] != CORPUS_SCHEMA_VERSION:
+    if corpus["schema_version"] not in {
+        CORPUS_SCHEMA_VERSION_V1,
+        CORPUS_SCHEMA_VERSION,
+    }:
         raise ContractError("corpus.schema_version: version non supportee")
     _string(corpus["corpus_id"], "corpus.corpus_id", pattern=_ID_RE)
     _string(corpus["version"], "corpus.version")
@@ -838,7 +918,11 @@ def validate_corpus(document: dict[str, Any]) -> dict[str, Any]:
     if not cases:
         raise ContractError("corpus.cases: corpus vide")
     validated = [
-        _validate_case(case, f"corpus.cases[{index}]")
+        _validate_case(
+            case,
+            f"corpus.cases[{index}]",
+            schema_version=corpus["schema_version"],
+        )
         for index, case in enumerate(cases)
     ]
     case_ids = [case["id"] for case in validated]
@@ -850,6 +934,141 @@ def validate_corpus(document: dict[str, Any]) -> dict[str, Any]:
             f"corpus.cases: splits incomplets ({sorted(present_splits)})"
         )
     return corpus
+
+
+def _validate_quality_check(value: Any, path: str) -> dict[str, Any]:
+    check = _object(value, path, {"id", "dimension", "requirement"})
+    _string(check["id"], f"{path}.id", pattern=_ID_RE)
+    if check["dimension"] not in SECONDARY_METRICS:
+        raise ContractError(f"{path}.dimension: metrique inconnue")
+    _string(check["requirement"], f"{path}.requirement")
+    return check
+
+
+def validate_quality_rubric(
+    document: dict[str, Any], corpus: dict[str, Any]
+) -> dict[str, Any]:
+    """Valide la rubrique semantique preenregistree du contrat v2."""
+
+    rubric = _object(
+        document,
+        "quality_rubric",
+        {
+            "schema_version",
+            "rubric_id",
+            "corpus",
+            "provenance",
+            "decision_policy",
+            "global_checks",
+            "case_checks",
+        },
+    )
+    if rubric["schema_version"] != QUALITY_RUBRIC_SCHEMA_VERSION:
+        raise ContractError("quality_rubric.schema_version: version non supportee")
+    _string(rubric["rubric_id"], "quality_rubric.rubric_id", pattern=_ID_RE)
+    corpus_ref = _object(rubric["corpus"], "quality_rubric.corpus", {"id", "version"})
+    if corpus_ref != {
+        "id": corpus["corpus_id"],
+        "version": corpus["version"],
+    }:
+        raise ContractError("quality_rubric.corpus: corpus incompatible")
+    provenance = _object(
+        rubric["provenance"],
+        "quality_rubric.provenance",
+        {
+            "authoring_method",
+            "candidate_response_access",
+            "contains_personal_data",
+            "contains_production_conversations",
+        },
+    )
+    if provenance["authoring_method"] != "human-authored-before-shadow":
+        raise ContractError("quality_rubric.provenance: methode interdite")
+    for key in (
+        "candidate_response_access",
+        "contains_personal_data",
+        "contains_production_conversations",
+    ):
+        if _boolean(provenance[key], f"quality_rubric.provenance.{key}"):
+            raise ContractError(f"quality_rubric.provenance.{key}: doit rester faux")
+    decision_policy = _object(
+        rubric["decision_policy"],
+        "quality_rubric.decision_policy",
+        {
+            "lexical_diagnostics_authoritative",
+            "all_required_checks_must_pass",
+            "abstain_is_fail",
+            "required_reviewer_kinds",
+        },
+    )
+    if _boolean(
+        decision_policy["lexical_diagnostics_authoritative"],
+        "quality_rubric.decision_policy.lexical_diagnostics_authoritative",
+    ):
+        raise ContractError("quality_rubric: diagnostics lexicaux non autoritatifs")
+    for key in ("all_required_checks_must_pass", "abstain_is_fail"):
+        if not _boolean(decision_policy[key], f"quality_rubric.decision_policy.{key}"):
+            raise ContractError(f"quality_rubric.decision_policy.{key}: doit etre vrai")
+    reviewer_kinds = _string_list(
+        decision_policy["required_reviewer_kinds"],
+        "quality_rubric.decision_policy.required_reviewer_kinds",
+    )
+    if reviewer_kinds != ["human", "independent"]:
+        raise ContractError("quality_rubric: deux reviewers ordonnes sont requis")
+
+    global_items = _list(rubric["global_checks"], "quality_rubric.global_checks")
+    if not global_items:
+        raise ContractError("quality_rubric.global_checks: liste vide")
+    global_checks = [
+        _validate_quality_check(item, f"quality_rubric.global_checks[{index}]")
+        for index, item in enumerate(global_items)
+    ]
+    all_check_ids = [check["id"] for check in global_checks]
+    if len(set(all_check_ids)) != len(all_check_ids):
+        raise ContractError("quality_rubric.global_checks: identifiants dupliques")
+
+    known_case_ids = {case["id"] for case in corpus["cases"]}
+    seen_case_ids: list[str] = []
+    for index, raw_case in enumerate(
+        _list(rubric["case_checks"], "quality_rubric.case_checks")
+    ):
+        path = f"quality_rubric.case_checks[{index}]"
+        case_review = _object(raw_case, path, {"case_id", "checks"})
+        case_id = _string(
+            case_review["case_id"], f"{path}.case_id", pattern=_CASE_ID_RE
+        )
+        if case_id not in known_case_ids:
+            raise ContractError(f"{path}.case_id: cas inconnu")
+        seen_case_ids.append(case_id)
+        raw_checks = _list(case_review["checks"], f"{path}.checks")
+        if not raw_checks:
+            raise ContractError(f"{path}.checks: liste vide")
+        checks = [
+            _validate_quality_check(item, f"{path}.checks[{check_index}]")
+            for check_index, item in enumerate(raw_checks)
+        ]
+        all_check_ids.extend(check["id"] for check in checks)
+    if len(set(seen_case_ids)) != len(seen_case_ids):
+        raise ContractError("quality_rubric.case_checks: cas dupliques")
+    if len(set(all_check_ids)) != len(all_check_ids):
+        raise ContractError("quality_rubric: identifiants de controle dupliques")
+    return rubric
+
+
+def required_quality_results(suite: LoadedSuite) -> list[dict[str, str]]:
+    """Retourne la couverture semantique exhaustive attendue, dans un ordre stable."""
+
+    if suite.quality_rubric is None:
+        return []
+    global_checks = suite.quality_rubric["global_checks"]
+    per_case = {
+        item["case_id"]: item["checks"] for item in suite.quality_rubric["case_checks"]
+    }
+    return [
+        {"case_id": case["id"], "check_id": check["id"], "decision": "pass"}
+        for case in suite.corpus["cases"]
+        for check in [*global_checks, *per_case.get(case["id"], [])]
+    ]
 
 
 def _safe_referenced_file(root: Path, relative: Any, path: str) -> Path:
@@ -895,27 +1114,35 @@ def _validate_schema_header(path: Path, expected_id: str) -> None:
 
 def load_suite(manifest_path: str | Path | None = None) -> LoadedSuite:
     if manifest_path is None:
-        manifest_path = Path(__file__).with_name("data") / "manifest.v1.json"
+        manifest_path = Path(__file__).with_name("data") / "manifest.v2.json"
     path = Path(manifest_path).expanduser().absolute()
     manifest = load_json_object(path)
+    manifest_version = manifest.get("schema_version")
+    if manifest_version not in {
+        MANIFEST_SCHEMA_VERSION_V1,
+        MANIFEST_SCHEMA_VERSION,
+    }:
+        raise ContractError("manifest.schema_version: version non supportee")
+    is_v2 = manifest_version == MANIFEST_SCHEMA_VERSION
+    manifest_keys = {
+        "schema_version",
+        "manifest_id",
+        "artifact",
+        "provenance",
+        "license",
+        "consent",
+        "files",
+        "splits",
+        "required_gates",
+        "secondary_metrics",
+    }
+    if is_v2:
+        manifest_keys.update({"safety_policy", "quality_policy"})
     manifest = _object(
         manifest,
         "manifest",
-        {
-            "schema_version",
-            "manifest_id",
-            "artifact",
-            "provenance",
-            "license",
-            "consent",
-            "files",
-            "splits",
-            "required_gates",
-            "secondary_metrics",
-        },
+        manifest_keys,
     )
-    if manifest["schema_version"] != MANIFEST_SCHEMA_VERSION:
-        raise ContractError("manifest.schema_version: version non supportee")
     _string(manifest["manifest_id"], "manifest.manifest_id", pattern=_ID_RE)
 
     artifact = _object(
@@ -975,6 +1202,47 @@ def load_suite(manifest_path: str | Path | None = None) -> LoadedSuite:
             "manifest.consent.personal_conversation_use: doit rester interdit"
         )
 
+    safety_policy_sha256: str | None = None
+    if is_v2:
+        safety_policy = _object(
+            manifest["safety_policy"],
+            "manifest.safety_policy",
+            {"id", "version", "sha256"},
+        )
+        if safety_policy["id"] != RELATIONSHIP_TEXT_SAFETY_POLICY_ID:
+            raise ContractError("manifest.safety_policy.id: politique inattendue")
+        if safety_policy["version"] != RELATIONSHIP_TEXT_SAFETY_POLICY_VERSION:
+            raise ContractError("manifest.safety_policy.version: version inattendue")
+        safety_policy_sha256 = _sha256(
+            safety_policy["sha256"], "manifest.safety_policy.sha256"
+        )
+        if safety_policy_sha256 != relationship_text_safety_policy_sha256():
+            raise ContractError("manifest.safety_policy.sha256: empreinte invalide")
+        quality_policy = _object(
+            manifest["quality_policy"],
+            "manifest.quality_policy",
+            {
+                "rubric_id",
+                "lexical_diagnostics_authoritative",
+                "all_required_checks_must_pass",
+            },
+        )
+        _string(
+            quality_policy["rubric_id"],
+            "manifest.quality_policy.rubric_id",
+            pattern=_ID_RE,
+        )
+        if _boolean(
+            quality_policy["lexical_diagnostics_authoritative"],
+            "manifest.quality_policy.lexical_diagnostics_authoritative",
+        ):
+            raise ContractError("manifest.quality_policy: diagnostics non autoritatifs")
+        if not _boolean(
+            quality_policy["all_required_checks_must_pass"],
+            "manifest.quality_policy.all_required_checks_must_pass",
+        ):
+            raise ContractError("manifest.quality_policy: controles absolus requis")
+
     expected_files = {
         "corpus",
         "corpus_schema",
@@ -988,6 +1256,8 @@ def load_suite(manifest_path: str | Path | None = None) -> LoadedSuite:
         "baseline_fixture",
         "candidate_fixture",
     }
+    if is_v2:
+        expected_files.update({"quality_rubric", "quality_rubric_schema"})
     files = _object(manifest["files"], "manifest.files", expected_files)
     root = path.parent
     resolved_files: dict[str, Path] = {}
@@ -1002,17 +1272,22 @@ def load_suite(manifest_path: str | Path | None = None) -> LoadedSuite:
             raise ContractError(f"manifest.files.{name}: empreinte invalide")
         resolved_files[name] = referenced
 
+    contract_suffix = "v2" if is_v2 else "v1"
     _validate_schema_header(
-        resolved_files["corpus_schema"], "urn:ava:relationship:corpus:v1"
+        resolved_files["corpus_schema"],
+        f"urn:ava:relationship:corpus:{contract_suffix}",
     )
     _validate_schema_header(
-        resolved_files["manifest_schema"], "urn:ava:relationship:manifest:v1"
+        resolved_files["manifest_schema"],
+        f"urn:ava:relationship:manifest:{contract_suffix}",
     )
     _validate_schema_header(
-        resolved_files["responses_schema"], "urn:ava:relationship:responses:v1"
+        resolved_files["responses_schema"],
+        f"urn:ava:relationship:responses:{contract_suffix}",
     )
     _validate_schema_header(
-        resolved_files["report_schema"], "urn:ava:relationship:report:v1"
+        resolved_files["report_schema"],
+        f"urn:ava:relationship:report:{contract_suffix}",
     )
     _validate_schema_header(
         resolved_files["release_attestation_schema"],
@@ -1020,7 +1295,7 @@ def load_suite(manifest_path: str | Path | None = None) -> LoadedSuite:
     )
     _validate_schema_header(
         resolved_files["adjudication_schema"],
-        "urn:ava:relationship:adjudication:v1",
+        f"urn:ava:relationship:adjudication:{contract_suffix}",
     )
     _validate_schema_header(
         resolved_files["external_anchor_schema"],
@@ -1030,8 +1305,18 @@ def load_suite(manifest_path: str | Path | None = None) -> LoadedSuite:
         resolved_files["anchor_key_schema"],
         "urn:ava:relationship:anchor-key:v1",
     )
+    if is_v2:
+        _validate_schema_header(
+            resolved_files["quality_rubric_schema"],
+            "urn:ava:relationship:quality-rubric:v1",
+        )
 
     corpus = validate_corpus(load_json_object(resolved_files["corpus"]))
+    expected_corpus_version = (
+        CORPUS_SCHEMA_VERSION if is_v2 else CORPUS_SCHEMA_VERSION_V1
+    )
+    if corpus["schema_version"] != expected_corpus_version:
+        raise ContractError("manifest: schema corpus incompatible")
     if (
         corpus["corpus_id"] != artifact["id"]
         or corpus["version"] != artifact["version"]
@@ -1057,13 +1342,28 @@ def load_suite(manifest_path: str | Path | None = None) -> LoadedSuite:
     if manifest["secondary_metrics"] != list(SECONDARY_METRICS):
         raise ContractError("manifest.secondary_metrics: metriques inattendues")
 
+    quality_rubric: dict[str, Any] | None = None
+    quality_rubric_sha256: str | None = None
+    if is_v2:
+        quality_rubric = validate_quality_rubric(
+            load_json_object(resolved_files["quality_rubric"]), corpus
+        )
+        quality_rubric_sha256 = sha256_file(resolved_files["quality_rubric"])
+        if quality_rubric["rubric_id"] != manifest["quality_policy"]["rubric_id"]:
+            raise ContractError(
+                "manifest.quality_policy.rubric_id: rubrique divergente"
+            )
+
     suite = LoadedSuite(
         root=root,
         manifest_path=path,
         manifest=manifest,
         corpus=corpus,
+        quality_rubric=quality_rubric,
         manifest_sha256=sha256_file(path),
         corpus_sha256=sha256_file(resolved_files["corpus"]),
+        quality_rubric_sha256=quality_rubric_sha256,
+        safety_policy_sha256=safety_policy_sha256,
     )
     load_response_bundle(
         resolved_files["baseline_fixture"], suite, expected_role="baseline"
@@ -1074,11 +1374,110 @@ def load_suite(manifest_path: str | Path | None = None) -> LoadedSuite:
     return suite
 
 
+def _relationship_allowed_case(case: dict[str, Any]) -> bool:
+    principal = case["principal"]
+    return bool(
+        principal["verified"]
+        and principal["relationship_opt_in"]
+        and principal["relationship_subject"] == principal["request_subject"]
+    )
+
+
+def _validate_guard_observation(
+    value: Any,
+    *,
+    suite: LoadedSuite,
+    expected_role: str,
+) -> dict[str, Any]:
+    path = "responses.artifact.guard_observation"
+    observation = _object(
+        value,
+        path,
+        {
+            "schema_version",
+            "active",
+            "policy_id",
+            "policy_sha256",
+            "expected_prepare_calls",
+            "observed_prepare_calls",
+            "expected_apply_calls",
+            "observed_apply_calls",
+            "actions",
+        },
+    )
+    if observation["schema_version"] != "ava.relationship.guard-observation/v2":
+        raise ContractError(f"{path}.schema_version: version inattendue")
+    active = _boolean(observation["active"], f"{path}.active")
+    integer_fields = (
+        "expected_prepare_calls",
+        "observed_prepare_calls",
+        "expected_apply_calls",
+        "observed_apply_calls",
+    )
+    for key in integer_fields:
+        if type(observation[key]) is not int or observation[key] < 0:
+            raise ContractError(f"{path}.{key}: entier positif requis")
+
+    if expected_role == "baseline":
+        if active:
+            raise ContractError(f"{path}.active: baseline doit rester inactive")
+        if (
+            observation["policy_id"] is not None
+            or observation["policy_sha256"] is not None
+        ):
+            raise ContractError(f"{path}: baseline ne doit pas attester un garde actif")
+        if any(observation[key] != 0 for key in integer_fields):
+            raise ContractError(f"{path}: compteurs baseline nuls requis")
+        if _list(observation["actions"], f"{path}.actions"):
+            raise ContractError(f"{path}.actions: baseline doit rester vide")
+        return observation
+
+    if not active:
+        raise ContractError(f"{path}.active: candidat doit activer le garde")
+    if observation["policy_id"] != RELATIONSHIP_TEXT_SAFETY_POLICY_ID:
+        raise ContractError(f"{path}.policy_id: politique inattendue")
+    policy_digest = _sha256(observation["policy_sha256"], f"{path}.policy_sha256")
+    if policy_digest != suite.safety_policy_sha256:
+        raise ContractError(f"{path}.policy_sha256: politique divergente")
+    expected_case_ids = [case["id"] for case in suite.corpus["cases"]]
+    guarded_case_ids = [
+        case["id"] for case in suite.corpus["cases"] if _relationship_allowed_case(case)
+    ]
+    expected_counts = {
+        "expected_prepare_calls": len(expected_case_ids),
+        "observed_prepare_calls": len(expected_case_ids),
+        "expected_apply_calls": len(guarded_case_ids),
+        "observed_apply_calls": len(guarded_case_ids),
+    }
+    for key, expected in expected_counts.items():
+        if observation[key] != expected:
+            raise ContractError(f"{path}.{key}: {expected} requis")
+    raw_actions = _list(observation["actions"], f"{path}.actions")
+    actions: list[dict[str, Any]] = []
+    for index, raw_action in enumerate(raw_actions):
+        action_path = f"{path}.actions[{index}]"
+        action = _object(raw_action, action_path, {"case_id", "action", "gate_ids"})
+        _string(action["case_id"], f"{action_path}.case_id", pattern=_CASE_ID_RE)
+        if action["action"] not in {"pass", "replace"}:
+            raise ContractError(f"{action_path}.action: action inconnue")
+        gate_ids = _string_list(action["gate_ids"], f"{action_path}.gate_ids")
+        if not set(gate_ids).issubset(RUNTIME_GUARD_GATE_IDS):
+            raise ContractError(f"{action_path}.gate_ids: gate runtime inconnu")
+        if (action["action"] == "pass") != (not gate_ids):
+            raise ContractError(f"{action_path}: action et gates incoherents")
+        actions.append(action)
+    if [action["case_id"] for action in actions] != guarded_case_ids:
+        raise ContractError(f"{path}.actions: couverture owner-only invalide")
+    return observation
+
+
 def load_response_bundle(
     response_path: str | Path,
     suite: LoadedSuite,
     *,
     expected_role: str,
+    release_attestation_path: str | Path | None = None,
+    release_attestation_sha256: str | None = None,
 ) -> LoadedResponses:
     if expected_role not in {"baseline", "candidate"}:
         raise ContractError("role de comparaison interne invalide")
@@ -1087,7 +1486,11 @@ def load_response_bundle(
     bundle = _object(
         document, "responses", {"schema_version", "corpus", "artifact", "responses"}
     )
-    if bundle["schema_version"] != RESPONSES_SCHEMA_VERSION:
+    is_v2 = suite.manifest["schema_version"] == MANIFEST_SCHEMA_VERSION
+    expected_response_version = (
+        RESPONSES_SCHEMA_VERSION if is_v2 else RESPONSES_SCHEMA_VERSION_V1
+    )
+    if bundle["schema_version"] != expected_response_version:
         raise ContractError("responses.schema_version: version non supportee")
     corpus_ref = _object(bundle["corpus"], "responses.corpus", {"id", "version"})
     if corpus_ref != {
@@ -1096,23 +1499,26 @@ def load_response_bundle(
     }:
         raise ContractError("responses.corpus: corpus incompatible")
 
+    artifact_keys = {
+        "id",
+        "role",
+        "source_kind",
+        "generated_by",
+        "engine",
+        "prompt_sha256",
+        "policy_sha256",
+        "release_attestation_sha256",
+        "release",
+        "contains_personal_data",
+        "contains_production_conversations",
+        "canonical_knowledge",
+    }
+    if is_v2:
+        artifact_keys.update({"safety_policy_sha256", "guard_observation"})
     artifact = _object(
         bundle["artifact"],
         "responses.artifact",
-        {
-            "id",
-            "role",
-            "source_kind",
-            "generated_by",
-            "engine",
-            "prompt_sha256",
-            "policy_sha256",
-            "release_attestation_sha256",
-            "release",
-            "contains_personal_data",
-            "contains_production_conversations",
-            "canonical_knowledge",
-        },
+        artifact_keys,
     )
     _string(artifact["id"], "responses.artifact.id", pattern=_ID_RE)
     if artifact["role"] != expected_role:
@@ -1129,6 +1535,23 @@ def load_response_bundle(
         _string(engine[key], f"responses.artifact.engine.{key}")
     _sha256(artifact["prompt_sha256"], "responses.artifact.prompt_sha256")
     _sha256(artifact["policy_sha256"], "responses.artifact.policy_sha256")
+    if is_v2:
+        safety_digest = _sha256(
+            artifact["safety_policy_sha256"],
+            "responses.artifact.safety_policy_sha256",
+        )
+        if safety_digest != suite.safety_policy_sha256:
+            raise ContractError("responses.artifact.safety_policy_sha256: divergence")
+        _validate_guard_observation(
+            artifact["guard_observation"],
+            suite=suite,
+            expected_role=expected_role,
+        )
+    if (release_attestation_path is None) != (release_attestation_sha256 is None):
+        raise ContractError(
+            "responses.artifact.release_attestation: chemin et empreinte indivisibles"
+        )
+    loaded_release_attestation: LoadedReleaseAttestation | None = None
     release_digest = artifact["release_attestation_sha256"]
     release = artifact["release"]
     if artifact["source_kind"] == "offline_shadow":
@@ -1164,9 +1587,52 @@ def load_response_bundle(
             release["manifest_sha256"],
             "responses.artifact.release.manifest_sha256",
         )
+        if (
+            release_attestation_path is not None
+            and release_attestation_sha256 is not None
+        ):
+            loaded_release_attestation = load_release_attestation(
+                release_attestation_path,
+                expected_sha256=release_attestation_sha256,
+            )
+            if loaded_release_attestation.sha256 != release_digest:
+                raise ContractError(
+                    "responses.artifact.release_attestation_sha256: "
+                    "attestation externe divergente"
+                )
+            attestation = loaded_release_attestation.document
+            expected_release = {
+                "repository": release["repository"],
+                "git_sha": release["git_sha"],
+            }
+            expected_engine = {
+                "provider": engine["provider"],
+                "model": engine["model"],
+                "revision": engine["revision"],
+                "adapter": release["adapter"],
+                "config_sha256": release["config_sha256"],
+            }
+            expected_artifact = {"manifest_sha256": release["manifest_sha256"]}
+            if attestation["release"] != expected_release:
+                raise ContractError(
+                    "responses.artifact.release: attestation externe divergente"
+                )
+            if attestation["engine"] != expected_engine:
+                raise ContractError(
+                    "responses.artifact.engine: attestation externe divergente"
+                )
+            if attestation["artifact"] != expected_artifact:
+                raise ContractError(
+                    "responses.artifact.release.manifest_sha256: "
+                    "attestation externe divergente"
+                )
     elif release_digest is not None or release is not None:
         raise ContractError(
             "responses.artifact.release: interdit pour une fixture synthetique"
+        )
+    elif release_attestation_path is not None:
+        raise ContractError(
+            "responses.artifact.release_attestation: interdite pour une fixture"
         )
     for key in (
         "contains_personal_data",
@@ -1244,4 +1710,5 @@ def load_response_bundle(
         document=bundle,
         sha256=sha256_file(path),
         by_case_id=by_case_id,
+        release_attestation=loaded_release_attestation,
     )

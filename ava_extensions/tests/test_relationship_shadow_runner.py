@@ -30,8 +30,8 @@ from ava_extensions.evals.relationship.shadow_runner import (
 )
 
 DATA_ROOT = Path(__file__).parents[1] / "evals" / "relationship" / "data"
-MANIFEST = DATA_ROOT / "manifest.v1.json"
-CANDIDATE = DATA_ROOT / "candidate.v1.json"
+MANIFEST = DATA_ROOT / "manifest.v2.json"
+CANDIDATE = DATA_ROOT / "candidate.v2.json"
 RELATIONSHIP_MARKER = "[AVA_RELATIONSHIP_PROFILE:"
 RUNTIME_IDENTITIES = (
     "matrix:@synthetic-owner:eval.invalid",
@@ -88,6 +88,10 @@ class FakeEngine:
                 name: os.getenv(name)
                 for name in (
                     "ALL_PROXY",
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_AUTH_TOKEN",
+                    "ANTHROPIC_BASE_URL",
+                    "ANTHROPIC_FUTURE_OVERRIDE_CANARY",
                     "AVA_CP_ASSERTION_KEY_ID",
                     "AVA_CP_ASSERTION_PREVIOUS_KEY_FILE",
                     "AVA_CP_ASSERTION_PREVIOUS_KEY_ID",
@@ -207,6 +211,10 @@ def test_shadow_runner_exercises_auth_rollback_and_corpus_without_effects(
     monkeypatch.setenv("OPENJARVIS_HOME", str(outside_openjarvis))
     ambient_environment = {
         "ALL_PROXY": "http://ambient-proxy.invalid:8080",
+        "ANTHROPIC_API_KEY": "ambient-anthropic-key",
+        "ANTHROPIC_AUTH_TOKEN": "ambient-anthropic-token",
+        "ANTHROPIC_BASE_URL": "https://ambient-anthropic.invalid",
+        "ANTHROPIC_FUTURE_OVERRIDE_CANARY": "ambient-override",
         "AVA_CP_ASSERTION_KEY_ID": "ambient-key",
         "AVA_CP_ASSERTION_PREVIOUS_KEY_FILE": "/ambient/previous.key",
         "AVA_CP_ASSERTION_PREVIOUS_KEY_ID": "ambient-previous",
@@ -238,7 +246,7 @@ def test_shadow_runner_exercises_auth_rollback_and_corpus_without_effects(
         output_directory=output_directory,
         release_attestation_path=attestation_path,
         release_attestation_sha256=attestation_sha256,
-        role="candidate",
+        role="baseline",
     )
 
     captured = capsys.readouterr()
@@ -261,12 +269,12 @@ def test_shadow_runner_exercises_auth_rollback_and_corpus_without_effects(
     output = result.output_path
     assert output.parent == output_directory
     assert output.name == (
-        f"relationship-shadow-candidate-{result.bundle_sha256.removeprefix('sha256:')}.json"
+        f"relationship-shadow-baseline-{result.bundle_sha256.removeprefix('sha256:')}.json"
     )
     assert result.bundle_sha256 == sha256_file(output)
     assert result.release_attestation_sha256 == attestation_sha256
-    assert result.case_count == 37
-    assert result.model_call_count == 41
+    assert result.case_count == 39
+    assert result.model_call_count == 43
     assert result.negative_checks == (
         "empty-service-header",
         "malformed-oidc",
@@ -285,11 +293,11 @@ def test_shadow_runner_exercises_auth_rollback_and_corpus_without_effects(
     )
     assert engine.closed is True
     assert engine.outputs == []
-    assert len(engine.calls) == 41
+    assert len(engine.calls) == 43
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
 
     suite = load_suite(MANIFEST)
-    bundle = load_response_bundle(output, suite, expected_role="candidate")
+    bundle = load_response_bundle(output, suite, expected_role="baseline")
     summary = evaluate_responses(suite, bundle)
     assert summary["gate_pass"] is True
     assert bundle.document["artifact"] == {
@@ -301,8 +309,19 @@ def test_shadow_runner_exercises_auth_rollback_and_corpus_without_effects(
             "provider": "synthetic-fake",
             "revision": "immutable-revision-1",
         },
-        "generated_by": "ava-relationship-shadow-runner-v1",
-        "id": "relationship-shadow-candidate-0123456789ab",
+        "generated_by": "ava-relationship-shadow-runner-v2",
+        "guard_observation": {
+            "schema_version": "ava.relationship.guard-observation/v2",
+            "active": False,
+            "policy_id": None,
+            "policy_sha256": None,
+            "expected_prepare_calls": 0,
+            "observed_prepare_calls": 0,
+            "expected_apply_calls": 0,
+            "observed_apply_calls": 0,
+            "actions": [],
+        },
+        "id": "relationship-shadow-baseline-0123456789ab",
         "policy_sha256": bundle.document["artifact"]["policy_sha256"],
         "prompt_sha256": bundle.document["artifact"]["prompt_sha256"],
         "release_attestation_sha256": attestation_sha256,
@@ -313,7 +332,8 @@ def test_shadow_runner_exercises_auth_rollback_and_corpus_without_effects(
             "config_sha256": "sha256:" + "a" * 64,
             "manifest_sha256": "sha256:" + "b" * 64,
         },
-        "role": "candidate",
+        "role": "baseline",
+        "safety_policy_sha256": suite.safety_policy_sha256,
         "source_kind": "offline_shadow",
     }
     serialized = output.read_text(encoding="utf-8")
@@ -334,6 +354,10 @@ def test_shadow_runner_exercises_auth_rollback_and_corpus_without_effects(
     for environment in engine.environments:
         assert environment == {
             "ALL_PROXY": None,
+            "ANTHROPIC_API_KEY": None,
+            "ANTHROPIC_AUTH_TOKEN": None,
+            "ANTHROPIC_BASE_URL": None,
+            "ANTHROPIC_FUTURE_OVERRIDE_CANARY": None,
             "AVA_CP_ASSERTION_KEY_ID": "current",
             "AVA_CP_ASSERTION_PREVIOUS_KEY_FILE": None,
             "AVA_CP_ASSERTION_PREVIOUS_KEY_ID": None,
@@ -396,6 +420,7 @@ def test_shadow_runner_rejects_any_engine_tool_call_before_publication(
             output_directory=output_directory,
             release_attestation_path=attestation_path,
             release_attestation_sha256=attestation_sha256,
+            role="baseline",
         )
 
     captured = capsys.readouterr()
@@ -432,6 +457,130 @@ def test_shadow_runner_can_emit_a_separately_versioned_baseline(
     assert stat.S_IMODE(result.output_path.stat().st_mode) == 0o600
 
 
+def test_candidate_shadow_fails_closed_without_observed_runtime_guard(
+    tmp_path: Path,
+) -> None:
+    engine = FakeEngine(_safe_outputs())
+    output_directory = _private_output_directory(tmp_path)
+    attestation_path, attestation_sha256 = _release_attestation(tmp_path)
+
+    with pytest.raises(ShadowRunError, match="observed runtime relationship guard"):
+        run_shadow(
+            engine_factory=lambda: engine,
+            output_directory=output_directory,
+            release_attestation_path=attestation_path,
+            release_attestation_sha256=attestation_sha256,
+            role="candidate",
+        )
+
+    assert engine.calls == []
+    assert engine.closed is False
+    assert list(output_directory.iterdir()) == []
+
+
+def test_guard_observer_delegates_and_attests_exact_candidate_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from ava_extensions.evals.relationship import shadow_runner
+    from ava_extensions.identity.relationship_safety import (
+        RELATIONSHIP_TEXT_SAFETY_POLICY_ID,
+        RELATIONSHIP_TEXT_SAFETY_POLICY_VERSION,
+    )
+
+    suite = load_suite(MANIFEST)
+
+    class Decision:
+        action = "allow"
+        gate_ids: tuple[str, ...] = ()
+        output_text = "Réponse synthétique sûre."
+        policy_id = RELATIONSHIP_TEXT_SAFETY_POLICY_ID
+        policy_version = RELATIONSHIP_TEXT_SAFETY_POLICY_VERSION
+        policy_sha256 = suite.safety_policy_sha256
+
+    class Guard:
+        policy_sha256 = suite.safety_policy_sha256
+
+        def metadata(self) -> dict[str, object]:
+            return {
+                "policy_id": RELATIONSHIP_TEXT_SAFETY_POLICY_ID,
+                "policy_version": RELATIONSHIP_TEXT_SAFETY_POLICY_VERSION,
+            }
+
+        def apply(self, _response_text: str) -> Decision:
+            return Decision()
+
+    def prepare(overlay: object | None, _turns=()):
+        return Guard() if overlay is not None else None
+
+    module = SimpleNamespace(
+        prepare_relationship_guard=prepare,
+        RelationshipOutputGuard=Guard,
+    )
+    routes = SimpleNamespace(prepare_relationship_guard=prepare)
+    monkeypatch.setattr(shadow_runner, "_relationship_guard_module", lambda: module)
+
+    with shadow_runner._observe_runtime_relationship_guard(routes) as observer:
+        for case in suite.corpus["cases"]:
+            observer.begin_case(case["id"])
+            overlay = object() if _relationship_allowed(case) else None
+            guard = routes.prepare_relationship_guard(overlay, ())
+            if guard is not None:
+                decision = guard.apply("Réponse synthétique sûre.")
+                assert decision.output_text == "Réponse synthétique sûre."
+            observer.finish_case("Réponse synthétique sûre.")
+
+    document = observer.document(suite=suite, role="candidate")
+    assert document["active"] is True
+    assert document["policy_sha256"] == suite.safety_policy_sha256
+    assert document["observed_prepare_calls"] == 39
+    assert document["observed_apply_calls"] == 36
+    assert len(document["actions"]) == 36
+    assert all(action["action"] == "pass" for action in document["actions"])
+    assert "Réponse synthétique sûre" not in json.dumps(document, ensure_ascii=False)
+
+
+def test_guard_observer_rejects_a_baseline_release_that_invokes_the_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from ava_extensions.evals.relationship import shadow_runner
+
+    suite = load_suite(MANIFEST)
+
+    class Guard:
+        policy_sha256 = suite.safety_policy_sha256
+
+        def metadata(self) -> dict[str, object]:
+            return {
+                "policy_id": "ava.relationship.text-safety",
+                "policy_version": "1.6.0",
+            }
+
+        def apply(self, _response_text: str) -> Any:
+            raise AssertionError("baseline probe must stop after prepare")
+
+    def prepare(_overlay: object, _turns=()) -> Guard:
+        return Guard()
+
+    module = SimpleNamespace(
+        prepare_relationship_guard=prepare,
+        RelationshipOutputGuard=Guard,
+    )
+    routes = SimpleNamespace(prepare_relationship_guard=prepare)
+    monkeypatch.setattr(shadow_runner, "_relationship_guard_module", lambda: module)
+
+    with shadow_runner._observe_runtime_relationship_guard(routes) as observer:
+        observer.begin_case("warmth-optin")
+        routes.prepare_relationship_guard(object(), ())
+        observer.finish_case("Réponse synthétique sûre.")
+
+    with pytest.raises(ShadowRunError, match="baseline release invoked"):
+        observer.document(suite=suite, role="baseline")
+
+
 def test_shadow_runner_rejects_identity_like_output_before_publication(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -447,6 +596,7 @@ def test_shadow_runner_rejects_identity_like_output_before_publication(
             output_directory=output_directory,
             release_attestation_path=attestation_path,
             release_attestation_sha256=attestation_sha256,
+            role="baseline",
         )
 
     captured = capsys.readouterr()
@@ -476,6 +626,7 @@ def test_shadow_runner_refuses_non_directory_output_before_engine_creation(
             output_directory=output,
             release_attestation_path=attestation_path,
             release_attestation_sha256=attestation_sha256,
+            role="baseline",
         )
 
     assert factory_calls == []
@@ -543,6 +694,7 @@ def test_shadow_runner_rejects_unattested_adapter_before_model_use(
             output_directory=output_directory,
             release_attestation_path=attestation_path,
             release_attestation_sha256=attestation_sha256,
+            role="baseline",
         )
 
     assert engine.calls == []
@@ -561,6 +713,7 @@ def test_shadow_runner_rejects_model_absent_from_catalog(tmp_path: Path) -> None
             output_directory=output_directory,
             release_attestation_path=attestation_path,
             release_attestation_sha256=attestation_sha256,
+            role="baseline",
         )
 
     assert engine.calls == []
@@ -746,6 +899,7 @@ def test_invalid_provider_completion_is_never_published(
             output_directory=output_directory,
             release_attestation_path=attestation_path,
             release_attestation_sha256=attestation_sha256,
+            role="baseline",
         )
 
     assert len(engine.calls) == 1
@@ -774,6 +928,7 @@ def test_engine_result_model_must_match_before_http_response(
             output_directory=output_directory,
             release_attestation_path=attestation_path,
             release_attestation_sha256=attestation_sha256,
+            role="baseline",
         )
 
     assert len(engine.calls) == 1
@@ -782,7 +937,13 @@ def test_engine_result_model_must_match_before_http_response(
 
 def test_configured_anthropic_path_catalogs_attested_new_model(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    api_key = "configured-anthropic-key"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", api_key)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "ambient-auth-token")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://ambient-provider.invalid")
+    monkeypatch.setenv("ANTHROPIC_FUTURE_OVERRIDE_CANARY", "ambient-override")
     engine = FakeEngine(_safe_outputs())
     engine.engine_id = "cloud"
     engine.models = ["claude-sonnet-4-6"]
@@ -801,11 +962,30 @@ def test_configured_anthropic_path_catalogs_attested_new_model(
         release_attestation_path=attestation_path,
         release_attestation_sha256=attestation_sha256,
         execution_mode="configured-anthropic",
+        role="baseline",
     )
 
-    assert result.case_count == 37
-    assert result.model_call_count == 41
+    assert result.case_count == 39
+    assert result.model_call_count == 43
     assert engine.closed is True
+    assert engine.environments
+    assert all(
+        {
+            "ANTHROPIC_API_KEY": environment["ANTHROPIC_API_KEY"],
+            "ANTHROPIC_AUTH_TOKEN": environment["ANTHROPIC_AUTH_TOKEN"],
+            "ANTHROPIC_BASE_URL": environment["ANTHROPIC_BASE_URL"],
+            "ANTHROPIC_FUTURE_OVERRIDE_CANARY": environment[
+                "ANTHROPIC_FUTURE_OVERRIDE_CANARY"
+            ],
+        }
+        == {
+            "ANTHROPIC_API_KEY": api_key,
+            "ANTHROPIC_AUTH_TOKEN": None,
+            "ANTHROPIC_BASE_URL": None,
+            "ANTHROPIC_FUTURE_OVERRIDE_CANARY": None,
+        }
+        for environment in engine.environments
+    )
 
 
 def test_configured_anthropic_path_uses_real_cloud_engine_adapter(
@@ -874,14 +1054,51 @@ def test_configured_anthropic_path_uses_real_cloud_engine_adapter(
         release_attestation_path=attestation.output_path,
         release_attestation_sha256=attestation.sha256,
         execution_mode="configured-anthropic",
+        role="baseline",
     )
 
-    assert result.model_call_count == 41
+    assert result.model_call_count == 43
     assert client.closed is True
     assert client.messages.outputs == []
-    assert len(client.messages.calls) == 41
+    assert len(client.messages.calls) == 43
     assert all(call["model"] == "claude-sonnet-5" for call in client.messages.calls)
     assert all("tools" not in call for call in client.messages.calls)
+
+
+def test_configured_anthropic_rejects_reflected_api_key_without_publishing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = "ANTHROPIC_API_KEY_REFLECTION_CANARY"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", secret)
+    outputs = _safe_outputs()
+    outputs[4] = secret
+    engine = FakeEngine(outputs)
+    engine.engine_id = "cloud"
+    engine.models = ["claude-sonnet-5"]
+    output_directory = _private_output_directory(tmp_path)
+    attestation_path, attestation_sha256 = _release_attestation(
+        tmp_path,
+        adapter="cloud",
+        model="claude-sonnet-5",
+        provider="anthropic",
+    )
+
+    with pytest.raises(ShadowRunError, match="identity material"):
+        run_shadow(
+            engine_factory=lambda: engine,
+            output_directory=output_directory,
+            release_attestation_path=attestation_path,
+            release_attestation_sha256=attestation_sha256,
+            execution_mode="configured-anthropic",
+            role="baseline",
+        )
+
+    captured = capsys.readouterr()
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert list(output_directory.iterdir()) == []
 
 
 def test_configured_anthropic_mode_rejects_other_attestation_before_engine(
