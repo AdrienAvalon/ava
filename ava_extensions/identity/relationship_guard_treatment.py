@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
-RELATIONSHIP_GUARD_TREATMENT = "shadow-baseline-only-v1"
+RELATIONSHIP_GUARD_TREATMENT = "runtime-enforced-v1"
 
 __all__ = ("RELATIONSHIP_GUARD_TREATMENT",)
 
