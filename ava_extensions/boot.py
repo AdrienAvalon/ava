@@ -32,6 +32,7 @@ OpenJarvis générique.
 
 from __future__ import annotations
 
+import importlib
 import logging
 import sys
 
@@ -99,6 +100,23 @@ def _safety_guards() -> None:
         learning_guard,
         system_prompt_loader,
     )
+
+
+def _relationship_guard_treatment() -> None:
+    """Require the causal treatment marker while allowing either release role."""
+
+    module = importlib.import_module(
+        "ava_extensions.identity.relationship_guard_treatment"
+    )
+    treatment = getattr(module, "RELATIONSHIP_GUARD_TREATMENT", None)
+    if type(treatment) is not str or treatment not in {
+        "shadow-baseline-only-v1",
+        "runtime-enforced-v1",
+    }:
+        raise RuntimeError("relationship guard treatment invalide")
+    validate = getattr(module, "_validate_relationship_guard_treatment", None)
+    if not callable(validate) or validate() != treatment:
+        raise RuntimeError("validation du relationship guard treatment absente")
 
 
 def finalize_security_guards() -> None:
@@ -244,6 +262,9 @@ def _sonde_routage() -> None:
 #   groupes suivants. Un `_charger` qui journalise un warning que personne ne voit
 #   equivaut a un echec silencieux.
 _charger("journalisation", _journalisation)
+_charger_obligatoire(
+    "traitement causal du garde relationnel", _relationship_guard_treatment
+)
 _charger_obligatoire("gardes de securite", _safety_guards)
 _charger("backends voix (TTS/STT)", _backends)
 _charger("patches SDK Anthropic", _patches)

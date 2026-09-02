@@ -108,6 +108,11 @@ def serve(
     agent_name: str | None,
 ) -> None:
     """Start the OpenAI-compatible API server."""
+    from ava_extensions.identity.relationship_guard_treatment import (
+        _assert_active_runtime_treatment,
+    )
+
+    _assert_active_runtime_treatment()
     print_banner(quiet=(ctx.obj or {}).get("quiet", False))
     console = Console(stderr=True)
 

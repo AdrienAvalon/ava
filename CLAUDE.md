@@ -27,12 +27,13 @@
 
 > **Claude Code : mets cette section à jour à la fin de chaque session.**
 
-- **Dernier état relu** : 2026-08-16 (avant commits d'intégration)
+- **Dernier état relu** : 2026-09-02 (release immuable et preuves relationnelles v3)
 - **Branche active** : `ava-main`
-- **Jalon en cours** : identité HTTP, conversations durables, overlay relationnel et
-  évaluations adversariales avant activation
-- **Prochaine étape** : suites globales, release immuable attestée, shadow avec le moteur
-  effectivement déployé, puis activation GitOps séparée si tous les gates passent
+- **Jalon en cours** : runtime Python/Rust/frontend reproductible et scellé, identité HTTP,
+  conversations durables, overlay relationnel et évaluations adversariales avant activation
+- **Prochaine étape** : publier la paire causale A/B (A préparée et non servable, B enfant
+  direct avec le seul traitement runtime), déployer B, puis produire les shadows avec le
+  moteur effectivement déployé avant toute activation GitOps de l'overlay
 - **Questions en suspens** : aucune décision produit bloquante ; l'activation reste
   volontairement `enabled: false` jusqu'aux preuves E2E
 

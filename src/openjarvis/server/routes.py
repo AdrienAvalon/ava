@@ -7,8 +7,11 @@ import hashlib
 import json
 import logging
 import math
+import threading
 import time
 import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, WebSocket
@@ -128,6 +131,7 @@ def _valid_relationship_guard_interface(value: Any) -> bool:
             for name in (
                 "with_turns",
                 "apply",
+                "apply_with_repair",
                 "inspect_tool_arguments",
                 "metadata",
                 "_inspect_tool_arguments_nonmutating",
@@ -140,6 +144,23 @@ def _valid_relationship_guard_interface(value: Any) -> bool:
 
 def _prepare_relationship_guard_or_503(relationship_overlay):
     """Run the overlay-only policy preflight without logging inspected text."""
+
+    try:
+        from ava_extensions.identity.relationship_guard_treatment import (
+            _relationship_guard_bypassed_for_verified_shadow,
+        )
+
+        if _relationship_guard_bypassed_for_verified_shadow():
+            return None
+    except Exception as exc:
+        logging.getLogger("openjarvis.server").error(
+            "Ava relationship treatment preflight failed (%s)",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Ava relationship output policy unavailable",
+        ) from exc
 
     try:
         import importlib
@@ -301,22 +322,199 @@ def _tool_call_json(tool_calls: Any) -> tuple[str, ...]:
     return tuple(serialized)
 
 
-def _apply_relationship_guard(relationship_guard, content: str, tool_calls: Any = None):
-    """Apply one complete decision and translate policy failure to a safe 503."""
+_RELATIONSHIP_USAGE_KEYS = (
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+)
 
-    if relationship_guard is None:
-        return None
+
+def _validated_relationship_usage(value: Any) -> dict[str, int]:
+    """Keep only non-negative integer token counters from an engine result."""
+
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: token_count
+        for key in _RELATIONSHIP_USAGE_KEYS
+        if type(token_count := value.get(key)) is int and token_count >= 0
+    }
+
+
+def _merge_relationship_usage(
+    primary: Any,
+    repair: Any,
+) -> dict[str, int]:
+    primary_usage = _validated_relationship_usage(primary)
+    repair_usage = _validated_relationship_usage(repair)
+    return {
+        key: primary_usage.get(key, 0) + repair_usage.get(key, 0)
+        for key in _RELATIONSHIP_USAGE_KEYS
+    }
+
+
+def _snapshot_relationship_messages(messages: list[Message]) -> list[Message]:
+    """Freeze the authenticated text conversation before any engine sees it."""
+
+    if (
+        not messages
+        or messages[0].role != Role.SYSTEM
+        or sum(message.role == Role.SYSTEM for message in messages) != 1
+        or any(
+            message.role not in {Role.SYSTEM, Role.USER, Role.ASSISTANT}
+            or not isinstance(message.content, str)
+            for message in messages
+        )
+        or not messages[0].content.strip()
+    ):
+        raise RuntimeError("relationship repair conversation is invalid")
+    # Rebuild the narrow text-only shape instead of retaining mutable metadata,
+    # images or historical tool-call objects. The snapshot is taken before the
+    # primary request so an engine cannot append its rejected output to repair
+    # input by mutating the list or a Message in place.
+    return [Message(role=message.role, content=message.content) for message in messages]
+
+
+def _relationship_repair_messages(
+    messages: list[Message],
+    instruction: Any,
+) -> list[Message]:
+    """Compose repair input from authenticated context plus fixed policy only."""
+
+    import dataclasses
+
     try:
-        arguments = _tool_argument_json(tool_calls)
-        for arguments_json in arguments:
+        from ava_extensions.identity.relationship_safety import (
+            RelationshipRepairInstruction,
+            relationship_repair_instruction,
+        )
+
+        if not isinstance(instruction, RelationshipRepairInstruction):
+            raise TypeError
+        expected_instruction = relationship_repair_instruction(instruction.gate_ids)
+    except Exception:
+        raise RuntimeError("relationship repair instruction is invalid") from None
+    prompt = instruction.prompt
+    if (
+        instruction != expected_instruction
+        or not isinstance(prompt, str)
+        or not prompt.strip()
+        or getattr(instruction, "temperature", None) != 0.0
+        or getattr(instruction, "max_attempts", None) != 1
+        or getattr(instruction, "no_tools", None) is not True
+        or getattr(instruction, "no_output_input", None) is not True
+    ):
+        raise RuntimeError("relationship repair instruction is invalid")
+    repair_messages = _snapshot_relationship_messages(messages)
+    repair_messages[0] = dataclasses.replace(
+        repair_messages[0],
+        content=f"{repair_messages[0].content}\n\n{prompt}",
+    )
+    return repair_messages
+
+
+def _relationship_repair_callback(
+    engine: Any,
+    model: str,
+    messages: list[Message],
+    max_tokens: int,
+    repair_usage: dict[str, int],
+    repair_bus: Any = None,
+):
+    """Build a one-shot, effect-free callback that never receives rejected text."""
+
+    def repair(instruction):
+        from ava_extensions.identity.relationship_guard import (
+            RelationshipRepairResult,
+        )
+
+        repair_messages = _relationship_repair_messages(messages, instruction)
+        mark_repair = getattr(
+            repair_bus,
+            "mark_next_generation_as_repair",
+            None,
+        )
+        if not callable(mark_repair):
+            raise RuntimeError("relationship repair quarantine is unavailable")
+        mark_repair()
+        result = engine.generate(
+            repair_messages,
+            model=model,
+            temperature=0.0,
+            max_tokens=max_tokens,
+        )
+        if not isinstance(result, dict):
+            return None
+        repair_usage.update(_validated_relationship_usage(result.get("usage")))
+        output_text = result.get("content")
+        output_is_oversized = isinstance(output_text, str) and len(
+            output_text.encode("utf-8")
+        ) > (_RELATIONSHIP_STREAM_BUFFER_BYTES)
+        tool_calls = result.get("tool_calls")
+        content_blocks = result.get("content_blocks")
+        finish_reason = _motif_arret({"finish_reason": result.get("finish_reason")})
+        if output_is_oversized:
+            return None
+        return RelationshipRepairResult(
+            output_text=output_text,
+            finish_reason=finish_reason,
+            tool_calls_present=(tool_calls is not None and tool_calls != []),
+            content_blocks_present=(
+                content_blocks is not None and content_blocks != []
+            ),
+        )
+
+    return repair
+
+
+def _begin_relationship_guard_repair(
+    relationship_guard,
+    content: str,
+    tool_calls: Any,
+    *,
+    repair_bus: Any,
+):
+    """Inspect the primary candidate and return only a safe staged value."""
+
+    try:
+        from ava_extensions.identity.relationship_guard import (
+            RelationshipGuardDecision,
+            _RelationshipRepairPlan,
+        )
+
+        for arguments_json in _tool_argument_json(tool_calls):
             relationship_guard.inspect_tool_arguments(arguments_json)
-        return relationship_guard.apply(
+        stage = relationship_guard._begin_bounded_repair(
             content,
             tool_argument_json=_tool_call_json(tool_calls),
+            attempt_repair=True,
         )
+        if not isinstance(stage, (RelationshipGuardDecision, _RelationshipRepairPlan)):
+            raise RuntimeError("relationship repair stage is invalid")
+        if isinstance(stage, RelationshipGuardDecision):
+            finalize_events = getattr(
+                repair_bus,
+                "finalize_generation_events",
+                None,
+            )
+            if not callable(finalize_events):
+                raise RuntimeError("relationship generation quarantine is unavailable")
+            finalize_events(stage)
+        else:
+            purge_payloads = getattr(
+                repair_bus,
+                "purge_rejected_generation_payloads",
+                None,
+            )
+            if not callable(purge_payloads):
+                raise RuntimeError("relationship generation quarantine is unavailable")
+            purge_payloads()
+        return stage
     except HTTPException:
+        _abort_relationship_generation_events(repair_bus)
         raise
     except Exception as exc:
+        _abort_relationship_generation_events(repair_bus)
         logging.getLogger("openjarvis.server").error(
             "Ava relationship output inspection failed (%s)",
             type(exc).__name__,
@@ -327,41 +525,387 @@ def _apply_relationship_guard(relationship_guard, content: str, tool_calls: Any 
         ) from exc
 
 
-def _relationship_trace_filter(relationship_guard):
+def _execute_relationship_repair_plan(
+    engine: Any,
+    model: str,
+    messages: list[Message],
+    max_tokens: int,
+    instruction: Any,
+    repair_bus: Any,
+) -> tuple[Any, dict[str, int], bool]:
+    """Run one provider call from safe inputs only, outside guard state."""
+
+    usage: dict[str, int] = {}
+    callback = _relationship_repair_callback(
+        engine,
+        model,
+        messages,
+        max_tokens,
+        usage,
+        repair_bus,
+    )
+    try:
+        result = callback(instruction)
+    except Exception:
+        return None, usage, True
+    return result, usage, False
+
+
+async def _complete_relationship_guard_repair(
+    relationship_guard,
+    stage,
+    *,
+    repair_engine: Any,
+    repair_model: str,
+    repair_messages: list[Message],
+    repair_max_tokens: int,
+    repair_usage: dict[str, int],
+    repair_bus: Any,
+):
+    """Await a safe repair worker, then finish guard state in this task."""
+
+    from ava_extensions.identity.relationship_guard import RelationshipGuardDecision
+
+    if isinstance(stage, RelationshipGuardDecision):
+        return stage
+    try:
+        repair_result, validated_usage, provider_error = await asyncio.to_thread(
+            _execute_relationship_repair_plan,
+            repair_engine,
+            repair_model,
+            repair_messages,
+            repair_max_tokens,
+            stage.instruction,
+            repair_bus,
+        )
+    except asyncio.CancelledError:
+        _cancel_relationship_generation_events(repair_bus)
+        raise
+    try:
+        repair_usage.update(validated_usage)
+        decision = relationship_guard._finish_bounded_repair(
+            stage,
+            repair_result,
+            provider_error=provider_error,
+        )
+        finalize_events = getattr(
+            repair_bus,
+            "finalize_generation_events",
+            None,
+        )
+        if not callable(finalize_events):
+            raise RuntimeError("relationship generation quarantine is unavailable")
+        finalize_events(decision)
+        return decision
+    except Exception as exc:
+        _abort_relationship_generation_events(repair_bus)
+        logging.getLogger("openjarvis.server").error(
+            "Ava relationship repair finalization failed (%s)",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Ava relationship output policy unavailable",
+        ) from exc
+
+
+async def _apply_relationship_guard_async(
+    relationship_guard,
+    content: str,
+    tool_calls: Any = None,
+    *,
+    repair_engine: Any,
+    repair_model: str,
+    repair_messages: list[Message],
+    repair_max_tokens: int,
+    repair_usage: dict[str, int],
+    repair_bus: Any,
+    clear_rejected,
+):
+    """Stage primary inspection before a worker can see only safe repair input."""
+
+    stage = _begin_relationship_guard_repair(
+        relationship_guard,
+        content,
+        tool_calls,
+        repair_bus=repair_bus,
+    )
+    from ava_extensions.identity.relationship_guard import RelationshipGuardDecision
+
+    if isinstance(stage, RelationshipGuardDecision):
+        return stage
+    clear_rejected()
+    content = ""
+    tool_calls = None
+    clear_rejected = None
+    return await _complete_relationship_guard_repair(
+        relationship_guard,
+        stage,
+        repair_engine=repair_engine,
+        repair_model=repair_model,
+        repair_messages=repair_messages,
+        repair_max_tokens=repair_max_tokens,
+        repair_usage=repair_usage,
+        repair_bus=repair_bus,
+    )
+
+
+def _apply_relationship_guard(
+    relationship_guard,
+    content: str,
+    tool_calls: Any = None,
+    *,
+    repair_engine: Any = None,
+    repair_model: str | None = None,
+    repair_messages: list[Message] | None = None,
+    repair_max_tokens: int | None = None,
+    repair_usage: dict[str, int] | None = None,
+    repair_bus: Any = None,
+    clear_rejected=None,
+    cancellation_scope=None,
+):
+    """Apply one complete decision and translate policy failure to a safe 503."""
+
+    if relationship_guard is None:
+        return None
+    try:
+        repair_requested = any(
+            value is not None
+            for value in (
+                repair_engine,
+                repair_model,
+                repair_messages,
+                repair_max_tokens,
+                repair_usage,
+                repair_bus,
+            )
+        )
+        if not repair_requested:
+            arguments = _tool_argument_json(tool_calls)
+            for arguments_json in arguments:
+                relationship_guard.inspect_tool_arguments(arguments_json)
+            decision = relationship_guard.apply(
+                content,
+                tool_argument_json=_tool_call_json(tool_calls),
+            )
+            return decision
+        if (
+            repair_engine is None
+            or not isinstance(repair_model, str)
+            or not repair_model
+            or not isinstance(repair_messages, list)
+            or type(repair_max_tokens) is not int
+            or repair_max_tokens <= 0
+            or not isinstance(repair_usage, dict)
+        ):
+            raise RuntimeError("relationship repair context is invalid")
+        if cancellation_scope is not None:
+            cancellation_scope.raise_if_cancelled()
+        stage = _begin_relationship_guard_repair(
+            relationship_guard,
+            content,
+            tool_calls,
+            repair_bus=repair_bus,
+        )
+        from ava_extensions.identity.relationship_guard import RelationshipGuardDecision
+
+        if isinstance(stage, RelationshipGuardDecision):
+            return stage
+        if callable(clear_rejected):
+            clear_rejected()
+        content = ""
+        tool_calls = None
+        clear_rejected = None
+        repair_result, validated_usage, provider_error = (
+            _execute_relationship_repair_plan(
+                repair_engine,
+                repair_model,
+                repair_messages,
+                repair_max_tokens,
+                stage.instruction,
+                repair_bus,
+            )
+        )
+        if cancellation_scope is not None:
+            cancellation_scope.raise_if_cancelled()
+        repair_usage.update(validated_usage)
+        decision = relationship_guard._finish_bounded_repair(
+            stage,
+            repair_result,
+            provider_error=provider_error,
+        )
+        finalize_events = getattr(
+            repair_bus,
+            "finalize_generation_events",
+            None,
+        )
+        if not callable(finalize_events):
+            raise RuntimeError("relationship generation quarantine is unavailable")
+        finalize_events(decision)
+        return decision
+    except HTTPException:
+        _abort_relationship_generation_events(repair_bus)
+        raise
+    except Exception as exc:
+        abort_events = getattr(repair_bus, "abort_generation_events", None)
+        if callable(abort_events):
+            try:
+                abort_events()
+            except Exception:
+                pass
+        logging.getLogger("openjarvis.server").error(
+            "Ava relationship output inspection failed (%s)",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Ava relationship output policy unavailable",
+        ) from exc
+
+
+def _relationship_trace_filter(
+    relationship_guard,
+    *,
+    repair_engine,
+    repair_model: str,
+    repair_messages: list[Message],
+    repair_max_tokens: int,
+    repair_usage: dict[str, int],
+    repair_bus,
+    cancellation_scope: _RelationshipCancellationScope | None = None,
+):
     """Adapt the shared guard to TraceCollector's dependency-free filter API."""
 
     from openjarvis.traces.collector import TraceContentFilterResult
 
-    def apply_filter(
-        content: str,
-        structured_output_json,
-        *,
-        allow_conversation_echo: bool,
-        final: bool,
-    ) -> TraceContentFilterResult:
-        try:
-            if final:
-                decision = relationship_guard.apply(
+    class StagedRelationshipTraceFilter:
+        def _result(self, decision) -> TraceContentFilterResult:
+            blocked = decision.action == "replace"
+            return TraceContentFilterResult(
+                content=decision.output_text,
+                suppress_structured_output=blocked,
+                force_stop=blocked,
+            )
+
+        def begin_final(
+            self,
+            content: str,
+            structured_output_json,
+            *,
+            allow_conversation_echo: bool,
+        ):
+            del allow_conversation_echo
+            try:
+                if cancellation_scope is not None:
+                    cancellation_scope.raise_if_cancelled()
+                stage = relationship_guard._begin_bounded_repair(
                     content,
                     tool_argument_json=structured_output_json,
+                    attempt_repair=True,
                 )
-                blocked = decision.action == "replace"
-                filtered_content = decision.output_text
-            else:
+                from ava_extensions.identity.relationship_guard import (
+                    RelationshipGuardDecision,
+                )
+
+                if isinstance(stage, RelationshipGuardDecision):
+                    finalize_events = getattr(
+                        repair_bus,
+                        "finalize_generation_events",
+                        None,
+                    )
+                    if not callable(finalize_events):
+                        raise RuntimeError(
+                            "relationship generation quarantine is unavailable"
+                        )
+                    finalize_events(stage)
+                    return self._result(stage)
+                purge_payloads = getattr(
+                    repair_bus,
+                    "purge_rejected_generation_payloads",
+                    None,
+                )
+                if not callable(purge_payloads):
+                    raise RuntimeError(
+                        "relationship generation quarantine is unavailable"
+                    )
+                purge_payloads()
+                return stage
+            except Exception as exc:
+                _abort_relationship_generation_events(repair_bus)
+                raise RuntimeError("relationship trace filtering failed") from exc
+
+        def finish_final(self, stage) -> TraceContentFilterResult:
+            try:
+                if cancellation_scope is not None:
+                    cancellation_scope.raise_if_cancelled()
+                repair_result, validated_usage, provider_error = (
+                    _execute_relationship_repair_plan(
+                        repair_engine,
+                        repair_model,
+                        repair_messages,
+                        repair_max_tokens,
+                        stage.instruction,
+                        repair_bus,
+                    )
+                )
+                if cancellation_scope is not None:
+                    cancellation_scope.raise_if_cancelled()
+                repair_usage.update(validated_usage)
+                decision = relationship_guard._finish_bounded_repair(
+                    stage,
+                    repair_result,
+                    provider_error=provider_error,
+                )
+                finalize_events = getattr(
+                    repair_bus,
+                    "finalize_generation_events",
+                    None,
+                )
+                if not callable(finalize_events):
+                    raise RuntimeError(
+                        "relationship generation quarantine is unavailable"
+                    )
+                finalize_events(decision)
+                return self._result(decision)
+            except Exception as exc:
+                _abort_relationship_generation_events(repair_bus)
+                raise RuntimeError("relationship trace filtering failed") from exc
+
+        def __call__(
+            self,
+            content: str,
+            structured_output_json,
+            *,
+            allow_conversation_echo: bool,
+            final: bool,
+        ) -> TraceContentFilterResult:
+            try:
+                if final:
+                    stage = self.begin_final(
+                        content,
+                        structured_output_json,
+                        allow_conversation_echo=allow_conversation_echo,
+                    )
+                    if isinstance(stage, TraceContentFilterResult):
+                        return stage
+                    content = ""
+                    structured_output_json = ()
+                    return self.finish_final(stage)
                 filtered_content, blocked = relationship_guard._scrub_trace_fragment(
                     content,
                     structured_output_json=structured_output_json,
                     allow_conversation_echo=allow_conversation_echo,
                 )
-        except Exception as exc:
-            raise RuntimeError("relationship trace filtering failed") from exc
-        return TraceContentFilterResult(
-            content=filtered_content,
-            suppress_structured_output=blocked,
-            force_stop=blocked,
-        )
+                return TraceContentFilterResult(
+                    content=filtered_content,
+                    suppress_structured_output=blocked,
+                    force_stop=blocked,
+                )
+            except Exception as exc:
+                _abort_relationship_generation_events(repair_bus)
+                raise RuntimeError("relationship trace filtering failed") from exc
 
-    return apply_filter
+    return StagedRelationshipTraceFilter()
 
 
 def _relationship_event_json(value: Any) -> str:
@@ -736,14 +1280,248 @@ def _sanitize_relationship_event_data(
     return sanitized
 
 
-class _RelationshipRequestEventBus:
-    """Overlay-only bus proxy that sanitizes before parent/history forwarding."""
+_RELATIONSHIP_TELEMETRY_NUMERIC_FIELDS = (
+    "prompt_tokens",
+    "prompt_tokens_evaluated",
+    "completion_tokens",
+    "total_tokens",
+    "latency_seconds",
+    "ttft",
+    "cost_usd",
+    "energy_joules",
+    "power_watts",
+    "gpu_utilization_pct",
+    "gpu_memory_used_gb",
+    "gpu_temperature_c",
+    "throughput_tok_per_sec",
+    "energy_per_output_token_joules",
+    "throughput_per_watt",
+    "prefill_latency_seconds",
+    "decode_latency_seconds",
+    "prefill_energy_joules",
+    "decode_energy_joules",
+    "mean_itl_ms",
+    "median_itl_ms",
+    "p90_itl_ms",
+    "p95_itl_ms",
+    "p99_itl_ms",
+    "std_itl_ms",
+    "cpu_energy_joules",
+    "gpu_energy_joules",
+    "dram_energy_joules",
+    "tokens_per_joule",
+)
+# Parent listeners may publish or finalize another request quarantine
+# synchronously.  A single reentrant outer gate gives every parent entry the
+# same lock order before its per-request gate, preventing cross-quarantine ABBA
+# while still allowing same-thread nested callbacks.
+_RELATIONSHIP_PARENT_ENTRY_LOCK = threading.RLock()
+_RELATIONSHIP_PARENT_ENTRY_STATE = threading.local()
 
-    __slots__ = ("_delegate", "_relationship_guard")
+
+@contextmanager
+def _relationship_parent_entry():
+    """Enter the global-then-request parent lock order reentrantly."""
+
+    with _RELATIONSHIP_PARENT_ENTRY_LOCK:
+        depth = getattr(_RELATIONSHIP_PARENT_ENTRY_STATE, "depth", 0)
+        _RELATIONSHIP_PARENT_ENTRY_STATE.depth = depth + 1
+        try:
+            yield
+        finally:
+            if depth:
+                _RELATIONSHIP_PARENT_ENTRY_STATE.depth = depth
+            else:
+                delattr(_RELATIONSHIP_PARENT_ENTRY_STATE, "depth")
+
+
+def _relationship_parent_entry_owned() -> bool:
+    return getattr(_RELATIONSHIP_PARENT_ENTRY_STATE, "depth", 0) > 0
+
+
+@dataclass(slots=True)
+class _RelationshipGenerationAttempt:
+    """One private bounded attempt; generated text is never part of its repr."""
+
+    phase: str
+    model: str = field(repr=False)
+    engine: str = field(repr=False)
+    started_at: float
+    ended_at: float | None = None
+    content: str = field(default="", repr=False)
+    tool_calls: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    content_blocks_present: bool = False
+    finish_reason: str = "length"
+    usage: dict[str, int] = field(default_factory=dict)
+    telemetry: dict[str, int | float] = field(default_factory=dict)
+    completed: bool = False
+
+
+def _relationship_bounded_identifier(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    encoded = value.encode("utf-8")
+    if len(encoded) > 256 or any(ord(character) < 32 for character in value):
+        return ""
+    return value
+
+
+def _relationship_bounded_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    try:
+        encoded = _relationship_event_json(value).encode("utf-8")
+        cloned = _relationship_json_clone(value)
+    except Exception:
+        return []
+    if len(encoded) > _RELATIONSHIP_STREAM_BUFFER_BYTES or not isinstance(cloned, list):
+        return []
+    return cloned if all(isinstance(item, dict) for item in cloned) else []
+
+
+class _RelationshipRequestEventBus:
+    """Quarantine generation events until the terminal overlay verdict."""
+
+    __slots__ = (
+        "_attempts",
+        "_canonical_flush_complete",
+        "_canonical_flush_failed",
+        "_delegate",
+        "_drop_late_events",
+        "_finalized",
+        "_lock",
+        "_next_phase",
+        "_parent_entry_lock",
+        "_parent_publication_condition",
+        "_parent_publication_threads",
+        "_parent_publications",
+        "_pending_trace_complete",
+        "_relationship_guard",
+        "_trace_complete_published",
+    )
 
     def __init__(self, delegate, relationship_guard) -> None:
         self._delegate = delegate
         self._relationship_guard = relationship_guard
+        self._attempts: list[_RelationshipGenerationAttempt] = []
+        self._canonical_flush_complete = False
+        self._canonical_flush_failed = False
+        self._drop_late_events = False
+        self._finalized = False
+        self._lock = threading.Lock()
+        self._parent_entry_lock = threading.RLock()
+        self._parent_publication_condition = threading.Condition(self._lock)
+        self._parent_publications = 0
+        self._parent_publication_threads: dict[int, int] = {}
+        self._pending_trace_complete: dict[str, Any] | None = None
+        self._trace_complete_published = False
+        self._next_phase = "primary"
+
+    @staticmethod
+    def _dropped_event(event_type):
+        from openjarvis.core.events import Event
+
+        return Event(
+            event_type=event_type,
+            timestamp=time.time(),
+            data={},
+            correlation_id="",
+        )
+
+    def _reserve_parent_publication(self, event_type) -> bool:
+        """Atomically admit one callback-free parent publication."""
+
+        from openjarvis.core.events import EventType
+
+        thread_id = threading.get_ident()
+        with self._lock:
+            terminal_trace = event_type == EventType.TRACE_COMPLETE
+            if (
+                self._drop_late_events
+                or (self._finalized and not terminal_trace)
+                or (terminal_trace and self._trace_complete_published)
+            ):
+                return False
+            if terminal_trace:
+                # TraceCollector constructs this sanitized request summary only
+                # after the generation verdict.  It is the sole post-verdict
+                # event, and cancellation still closes it fail-closed.
+                self._trace_complete_published = True
+            self._parent_publications += 1
+            self._parent_publication_threads[thread_id] = (
+                self._parent_publication_threads.get(thread_id, 0) + 1
+            )
+            return True
+
+    def _reserve_canonical_publication_locked(self) -> None:
+        """Admit one indivisible terminal triplet batch while locked."""
+
+        thread_id = threading.get_ident()
+        self._parent_publications += 1
+        self._parent_publication_threads[thread_id] = (
+            self._parent_publication_threads.get(thread_id, 0) + 1
+        )
+
+    def _release_parent_publication(self) -> None:
+        thread_id = threading.get_ident()
+        with self._lock:
+            owned = self._parent_publication_threads.get(thread_id, 0)
+            if owned <= 0 or self._parent_publications <= 0:
+                raise RuntimeError("relationship parent publication is invalid")
+            if owned == 1:
+                self._parent_publication_threads.pop(thread_id, None)
+            else:
+                self._parent_publication_threads[thread_id] = owned - 1
+            self._parent_publications -= 1
+            self._parent_publication_condition.notify_all()
+
+    def _wait_for_parent_publications(self) -> None:
+        """Drain foreign publications without deadlocking a reentrant callback."""
+
+        thread_id = threading.get_ident()
+        with self._lock:
+            # A parent callback may synchronously cancel the same quarantine.
+            # Parent entry is serialized by ``_parent_entry_lock``: any foreign
+            # reservation is either already complete or still outside the
+            # delegate and will fail its terminal-state recheck.  Waiting here
+            # would deadlock on the current callback without making the barrier
+            # stronger.
+            if (
+                self._parent_publication_threads.get(thread_id, 0)
+                or _relationship_parent_entry_owned()
+            ):
+                return
+            while self._parent_publications:
+                self._parent_publication_condition.wait()
+
+    def _publish_or_defer_trace_complete(self, event_type, sanitized):
+        """Publish one trace only after the canonical generation batch."""
+
+        with self._lock:
+            if (
+                self._drop_late_events
+                or self._trace_complete_published
+                or self._canonical_flush_failed
+            ):
+                return self._dropped_event(event_type)
+            self._trace_complete_published = True
+            if not self._canonical_flush_complete:
+                # The payload has already crossed the strict trace sanitizer.
+                # Retaining exactly one clone avoids a reentrant wait on the
+                # canonical batch's own parent callback.
+                self._pending_trace_complete = sanitized
+                return self._dropped_event(event_type)
+            self._reserve_canonical_publication_locked()
+
+        try:
+            with _relationship_parent_entry():
+                with self._parent_entry_lock:
+                    with self._lock:
+                        if self._drop_late_events or self._canonical_flush_failed:
+                            return self._dropped_event(event_type)
+                    return self._delegate.publish(event_type, sanitized)
+        finally:
+            self._release_parent_publication()
 
     def subscribe(self, event_type, callback) -> None:
         self._delegate.subscribe(event_type, callback)
@@ -752,12 +1530,58 @@ class _RelationshipRequestEventBus:
         self._delegate.unsubscribe(event_type, callback)
 
     def publish(self, event_type, data=None):
+        from openjarvis.core.events import EventType
+
+        with self._lock:
+            terminal_trace = event_type == EventType.TRACE_COMPLETE
+            drop_late_event = (
+                self._drop_late_events
+                or (self._finalized and not terminal_trace)
+                or (terminal_trace and self._trace_complete_published)
+            )
+        if drop_late_event:
+            return self._dropped_event(event_type)
+        if event_type in {
+            EventType.INFERENCE_START,
+            EventType.INFERENCE_END,
+            EventType.TELEMETRY_RECORD,
+        }:
+            if event_type == EventType.TELEMETRY_RECORD:
+                self._capture_native_telemetry(data)
+            # Native engine/wrapper events remain request-local. The observed
+            # engine publishes one canonical triplet per actual call only once
+            # the guard has reached its terminal verdict.
+            return self._dropped_event(event_type)
         sanitized = _sanitize_relationship_event_data(
             self._relationship_guard,
             event_type,
             data,
         )
-        return self._delegate.publish(event_type, sanitized)
+        if terminal_trace:
+            return self._publish_or_defer_trace_complete(event_type, sanitized)
+        # Sanitizing may run arbitrary request-local inspection code.  The
+        # admission and terminal-state check are therefore repeated afterwards
+        # under one lock.  The callback itself runs unlocked; cancellation
+        # drains an already admitted publication before returning.
+        if not self._reserve_parent_publication(event_type):
+            return self._dropped_event(event_type)
+        try:
+            # Only one thread may cross into the parent bus at a time.  The
+            # second state check closes the reservation-to-delegate window:
+            # cancellation from a reentrant parent listener can return while a
+            # foreign reservation exists, but that reservation can no longer
+            # append parent history or invoke listeners afterwards.
+            with _relationship_parent_entry():
+                with self._parent_entry_lock:
+                    with self._lock:
+                        terminal_trace = event_type == EventType.TRACE_COMPLETE
+                        if self._drop_late_events or (
+                            self._finalized and not terminal_trace
+                        ):
+                            return self._dropped_event(event_type)
+                    return self._delegate.publish(event_type, sanitized)
+        finally:
+            self._release_parent_publication()
 
     @property
     def history(self):
@@ -765,6 +1589,384 @@ class _RelationshipRequestEventBus:
 
     def clear_history(self) -> None:
         self._delegate.clear_history()
+
+    def mark_next_generation_as_repair(self) -> None:
+        with self._lock:
+            if self._finalized or self._next_phase != "primary":
+                raise RuntimeError("relationship generation quarantine is invalid")
+            self._next_phase = "repair"
+
+    def purge_rejected_generation_payloads(self) -> None:
+        """Erase primary free-form payloads before a detached repair call."""
+
+        with self._lock:
+            if self._finalized:
+                return
+            for attempt in self._attempts:
+                attempt.content = ""
+                attempt.tool_calls.clear()
+
+    def begin_generation(self, *, model: Any, engine: Any) -> int:
+        with self._lock:
+            if self._finalized or self._drop_late_events:
+                raise RuntimeError("relationship generation quarantine is finalized")
+            phase = self._next_phase
+            self._next_phase = "primary"
+            attempt = _RelationshipGenerationAttempt(
+                phase=phase,
+                model=_relationship_bounded_identifier(model),
+                engine=_relationship_bounded_identifier(engine),
+                started_at=time.time(),
+            )
+            self._attempts.append(attempt)
+            return len(self._attempts) - 1
+
+    def finish_generation(
+        self,
+        attempt_id: int,
+        *,
+        result: Any = None,
+        failed: bool,
+    ) -> None:
+        with self._lock:
+            if self._finalized or not 0 <= attempt_id < len(self._attempts):
+                raise RuntimeError("relationship generation attempt is invalid")
+            attempt = self._attempts[attempt_id]
+            if attempt.completed:
+                return
+            attempt.ended_at = time.time()
+            attempt.completed = True
+            if failed or not isinstance(result, dict):
+                return
+            content = result.get("content")
+            if isinstance(content, str) and len(content.encode("utf-8")) <= (
+                _RELATIONSHIP_STREAM_BUFFER_BYTES
+            ):
+                attempt.content = content
+            attempt.tool_calls = _relationship_bounded_list(result.get("tool_calls"))
+            attempt.content_blocks_present = result.get("content_blocks") not in (
+                None,
+                [],
+            )
+            attempt.finish_reason = _motif_arret(
+                {"finish_reason": result.get("finish_reason")}
+            )
+            attempt.usage = _validated_relationship_usage(result.get("usage"))
+            raw_cost = result.get("cost_usd")
+            if (
+                isinstance(raw_cost, (int, float))
+                and not isinstance(raw_cost, bool)
+                and math.isfinite(raw_cost)
+                and raw_cost >= 0
+            ):
+                attempt.telemetry["cost_usd"] = raw_cost
+
+    def _capture_native_telemetry(self, data: Any) -> None:
+        if not isinstance(data, dict) or set(data) != {"record"}:
+            return
+        record = data.get("record")
+        if not isinstance(record, TelemetryRecord):
+            return
+        with self._lock:
+            pending = next(
+                (
+                    attempt
+                    for attempt in reversed(self._attempts)
+                    if not attempt.completed
+                ),
+                None,
+            )
+            if pending is None or self._finalized:
+                return
+            for key in _RELATIONSHIP_TELEMETRY_NUMERIC_FIELDS:
+                value = getattr(record, key, None)
+                if (
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(value)
+                    and value >= 0
+                ):
+                    pending.telemetry[key] = value
+            version = getattr(record, "token_counting_version", None)
+            if type(version) is int and version >= 0:
+                pending.telemetry["token_counting_version"] = version
+
+    def _safe_attempt_payload(
+        self,
+        attempt: _RelationshipGenerationAttempt,
+        decision: Any | None,
+    ) -> tuple[str, list[dict[str, Any]], str]:
+        content = ""
+        tool_calls: list[dict[str, Any]] = []
+        finish_reason = attempt.finish_reason
+        if decision is not None and decision.action == "allow":
+            structured = (
+                (_relationship_event_json({"tool_calls": attempt.tool_calls}),)
+                if attempt.tool_calls
+                else ()
+            )
+            try:
+                filtered, blocked = self._relationship_guard._scrub_trace_fragment(
+                    attempt.content,
+                    structured_output_json=structured,
+                    allow_conversation_echo=True,
+                )
+            except Exception:
+                filtered, blocked = "", True
+            if not blocked and not attempt.content_blocks_present:
+                content = filtered
+                tool_calls = _relationship_json_clone(attempt.tool_calls)
+        elif (
+            decision is not None
+            and decision.action == "replace"
+            and decision.repair_outcome == "accepted"
+            and attempt.phase == "repair"
+            and attempt.content == decision.output_text
+            and attempt.finish_reason == "stop"
+            and not attempt.tool_calls
+            and not attempt.content_blocks_present
+        ):
+            content = decision.output_text
+            finish_reason = "stop"
+        return content, tool_calls, finish_reason
+
+    def finalize_generation_events(self, decision: Any | None) -> None:
+        from openjarvis.core.events import EventType
+
+        with self._lock:
+            if self._finalized:
+                return
+            self._finalized = True
+            now = time.time()
+            for attempt in self._attempts:
+                if not attempt.completed:
+                    attempt.completed = True
+                    attempt.ended_at = now
+            attempts = list(self._attempts)
+            canonical: list[tuple[object, dict[str, Any]]] = []
+            for attempt in attempts:
+                content, tool_calls, finish_reason = self._safe_attempt_payload(
+                    attempt,
+                    decision,
+                )
+                model = attempt.model
+                engine = attempt.engine
+                try:
+                    _, identifier_blocked = (
+                        self._relationship_guard._scrub_trace_fragment(
+                            "",
+                            structured_output_json=(
+                                _relationship_event_json(
+                                    {"model": model, "engine": engine}
+                                ),
+                            ),
+                            allow_conversation_echo=False,
+                        )
+                    )
+                except Exception:
+                    identifier_blocked = True
+                if identifier_blocked:
+                    model = ""
+                    engine = ""
+                ended_at = attempt.ended_at or attempt.started_at
+                latency = max(0.0, ended_at - attempt.started_at)
+                usage = dict(attempt.usage)
+                telemetry = dict(attempt.telemetry)
+                canonical.extend(
+                    (
+                        (
+                            EventType.INFERENCE_START,
+                            {"model": model, "engine": engine},
+                        ),
+                        (
+                            EventType.INFERENCE_END,
+                            {
+                                "model": model,
+                                "engine": engine,
+                                "latency": latency,
+                                "usage": usage,
+                                "content": content,
+                                "tool_calls": tool_calls,
+                                "content_blocks": [],
+                                "finish_reason": finish_reason,
+                            },
+                        ),
+                        (
+                            EventType.TELEMETRY_RECORD,
+                            {
+                                "record": TelemetryRecord(
+                                    timestamp=attempt.started_at,
+                                    model_id=model,
+                                    engine=engine,
+                                    prompt_tokens=int(
+                                        telemetry.get(
+                                            "prompt_tokens",
+                                            usage.get("prompt_tokens", 0),
+                                        )
+                                    ),
+                                    prompt_tokens_evaluated=int(
+                                        telemetry.get(
+                                            "prompt_tokens_evaluated",
+                                            usage.get("prompt_tokens", 0),
+                                        )
+                                    ),
+                                    completion_tokens=int(
+                                        telemetry.get(
+                                            "completion_tokens",
+                                            usage.get("completion_tokens", 0),
+                                        )
+                                    ),
+                                    total_tokens=int(
+                                        telemetry.get(
+                                            "total_tokens",
+                                            usage.get("total_tokens", 0),
+                                        )
+                                    ),
+                                    latency_seconds=float(
+                                        telemetry.get("latency_seconds", latency)
+                                    ),
+                                    ttft=float(telemetry.get("ttft", 0.0)),
+                                    cost_usd=float(telemetry.get("cost_usd", 0.0)),
+                                    energy_joules=float(
+                                        telemetry.get("energy_joules", 0.0)
+                                    ),
+                                    power_watts=float(
+                                        telemetry.get("power_watts", 0.0)
+                                    ),
+                                    gpu_utilization_pct=float(
+                                        telemetry.get("gpu_utilization_pct", 0.0)
+                                    ),
+                                    gpu_memory_used_gb=float(
+                                        telemetry.get("gpu_memory_used_gb", 0.0)
+                                    ),
+                                    gpu_temperature_c=float(
+                                        telemetry.get("gpu_temperature_c", 0.0)
+                                    ),
+                                    throughput_tok_per_sec=float(
+                                        telemetry.get("throughput_tok_per_sec", 0.0)
+                                    ),
+                                    energy_per_output_token_joules=float(
+                                        telemetry.get(
+                                            "energy_per_output_token_joules", 0.0
+                                        )
+                                    ),
+                                    throughput_per_watt=float(
+                                        telemetry.get("throughput_per_watt", 0.0)
+                                    ),
+                                    prefill_latency_seconds=float(
+                                        telemetry.get("prefill_latency_seconds", 0.0)
+                                    ),
+                                    decode_latency_seconds=float(
+                                        telemetry.get("decode_latency_seconds", 0.0)
+                                    ),
+                                    prefill_energy_joules=float(
+                                        telemetry.get("prefill_energy_joules", 0.0)
+                                    ),
+                                    decode_energy_joules=float(
+                                        telemetry.get("decode_energy_joules", 0.0)
+                                    ),
+                                    cpu_energy_joules=float(
+                                        telemetry.get("cpu_energy_joules", 0.0)
+                                    ),
+                                    gpu_energy_joules=float(
+                                        telemetry.get("gpu_energy_joules", 0.0)
+                                    ),
+                                    dram_energy_joules=float(
+                                        telemetry.get("dram_energy_joules", 0.0)
+                                    ),
+                                    tokens_per_joule=float(
+                                        telemetry.get("tokens_per_joule", 0.0)
+                                    ),
+                                    token_counting_version=(
+                                        int(telemetry["token_counting_version"])
+                                        if "token_counting_version" in telemetry
+                                        else None
+                                    ),
+                                    metadata={},
+                                )
+                            },
+                        ),
+                    )
+                )
+            for attempt in self._attempts:
+                attempt.content = ""
+                attempt.tool_calls.clear()
+                attempt.telemetry.clear()
+                attempt.usage.clear()
+            self._attempts.clear()
+            # One reservation covers the complete START/END/Telemetry sequence
+            # and the optional deferred TRACE_COMPLETE.  Reserve even when no
+            # attempt exists so the transition to ``canonical_flush_complete``
+            # remains ordered against cancellation and concurrent trace input.
+            # A cancel invoked reentrantly by one of this batch's own parent
+            # listeners closes future events but cannot truncate the already
+            # admitted safe triplet.
+            self._reserve_canonical_publication_locked()
+
+        first_error: Exception | None = None
+        pending_trace: dict[str, Any] | None = None
+        try:
+            with _relationship_parent_entry():
+                with self._parent_entry_lock:
+                    for event_type, data in canonical:
+                        try:
+                            self._delegate.publish(event_type, data)
+                        except Exception as exc:
+                            if first_error is None:
+                                first_error = exc
+                    with self._lock:
+                        self._canonical_flush_complete = True
+                        self._canonical_flush_failed = (
+                            decision is None or first_error is not None
+                        )
+                        if (
+                            not self._drop_late_events
+                            and not self._canonical_flush_failed
+                        ):
+                            pending_trace = self._pending_trace_complete
+                        self._pending_trace_complete = None
+                    if pending_trace is not None:
+                        # Cancellation may race after the queue is drained but
+                        # before parent entry.  Recheck at the delegate boundary;
+                        # a later cancellation waits on this batch reservation.
+                        with self._lock:
+                            if self._drop_late_events:
+                                pending_trace = None
+                    if pending_trace is not None:
+                        try:
+                            self._delegate.publish(
+                                EventType.TRACE_COMPLETE,
+                                pending_trace,
+                            )
+                        except Exception as exc:
+                            if first_error is None:
+                                first_error = exc
+        finally:
+            self._release_parent_publication()
+            self._wait_for_parent_publications()
+        if first_error is not None:
+            raise RuntimeError("relationship generation event flush failed") from None
+
+    def abort_generation_events(self) -> None:
+        self.finalize_generation_events(None)
+
+    def cancel_generation_events(self) -> None:
+        """Finalize once and reject every event emitted by a late worker.
+
+        An already-admitted canonical START/END/Telemetry batch remains
+        indivisible. All other reservations recheck this terminal state at the
+        serialized parent boundary and cannot enter after cancellation returns.
+        """
+
+        with self._lock:
+            self._drop_late_events = True
+            self._pending_trace_complete = None
+        self.finalize_generation_events(None)
+        self._wait_for_parent_publications()
+
+    def generation_cancelled(self) -> bool:
+        with self._lock:
+            return self._drop_late_events
 
 
 def _relationship_request_event_bus(bus, relationship_guard):
@@ -778,20 +1980,289 @@ def _relationship_request_event_bus(bus, relationship_guard):
     return _RelationshipRequestEventBus(scoped, relationship_guard)
 
 
+def _abort_relationship_generation_events(request_bus) -> None:
+    abort_events = getattr(request_bus, "abort_generation_events", None)
+    if callable(abort_events):
+        try:
+            abort_events()
+        except Exception:
+            pass
+
+
+def _cancel_relationship_generation_events(request_bus) -> None:
+    cancel_events = getattr(request_bus, "cancel_generation_events", None)
+    if callable(cancel_events):
+        try:
+            cancel_events()
+        except Exception:
+            pass
+        return
+    _abort_relationship_generation_events(request_bus)
+
+
+async def _relationship_stream_with_terminal_cleanup(frames, request_bus):
+    """Finalize an overlay stream on cancellation, close, or disconnect."""
+
+    completed = False
+    try:
+        async for frame in frames:
+            yield frame
+        completed = True
+    finally:
+        if completed:
+            _abort_relationship_generation_events(request_bus)
+        else:
+            _cancel_relationship_generation_events(request_bus)
+        close = getattr(frames, "aclose", None)
+        if callable(close):
+            try:
+                await close()
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+class _RelationshipCancellationScope:
+    """Bridge cancellation from an async request into one worker thread."""
+
+    __slots__ = (
+        "_cancelled",
+        "_commit_condition",
+        "_committing_thread",
+        "_lock",
+        "_pending_trace",
+        "_request_bus",
+    )
+
+    def __init__(self) -> None:
+        self._cancelled = False
+        self._lock = threading.RLock()
+        self._commit_condition = threading.Condition(self._lock)
+        self._committing_thread: int | None = None
+        self._pending_trace = None
+        self._request_bus = None
+
+    def register_bus(self, request_bus) -> None:
+        with self._lock:
+            if self._request_bus is not None:
+                raise RuntimeError("relationship cancellation bus already registered")
+            self._request_bus = request_bus
+            cancelled = self._cancelled
+        if cancelled:
+            _cancel_relationship_generation_events(request_bus)
+
+    def cancel(self) -> None:
+        thread_id = threading.get_ident()
+        with self._lock:
+            self._cancelled = True
+            self._pending_trace = None
+            while (
+                self._committing_thread is not None
+                and self._committing_thread != thread_id
+            ):
+                self._commit_condition.wait()
+            request_bus = self._request_bus
+        if request_bus is not None:
+            _cancel_relationship_generation_events(request_bus)
+
+    def raise_if_cancelled(self) -> None:
+        with self._lock:
+            cancelled = self._cancelled
+        if cancelled:
+            raise RuntimeError("relationship request cancelled")
+
+    def cancelled(self) -> bool:
+        with self._lock:
+            return self._cancelled
+
+    def register_pending_trace(self, trace, store, request_bus) -> None:
+        if trace is None:
+            return
+        with self._lock:
+            if self._cancelled:
+                return
+            if self._pending_trace is not None or self._committing_thread is not None:
+                raise RuntimeError("relationship trace already pending")
+            self._pending_trace = (trace, store, request_bus)
+
+    def commit_pending_trace(self) -> None:
+        from openjarvis.core.events import EventType
+
+        with self._lock:
+            if self._cancelled or self._pending_trace is None:
+                self._pending_trace = None
+                return
+            trace, store, request_bus = self._pending_trace
+            self._pending_trace = None
+            self._committing_thread = threading.get_ident()
+        try:
+            if store is not None:
+                store.save(trace)
+            with self._lock:
+                if self._cancelled:
+                    return
+            if request_bus is not None:
+                request_bus.publish(EventType.TRACE_COMPLETE, {"trace": trace})
+        finally:
+            with self._lock:
+                self._committing_thread = None
+                self._commit_condition.notify_all()
+
+
+def _scrub_cancelled_engine_result(result: Any) -> None:
+    if isinstance(result, dict):
+        result.clear()
+
+
+def _scrub_cancelled_agent_result(result: Any) -> None:
+    if result is None:
+        return
+    if hasattr(result, "content"):
+        result.content = ""
+    if hasattr(result, "tool_results"):
+        result.tool_results = []
+    metadata = getattr(result, "metadata", None)
+    if isinstance(metadata, dict):
+        metadata.clear()
+
+
+class _RelationshipObservedEngine:
+    """Count calls explicitly while native free-form events stay quarantined."""
+
+    __slots__ = ("_inner", "_relationship_bus")
+    _publishes_events = True
+
+    def __init__(self, inner, relationship_bus) -> None:
+        self._inner = inner
+        self._relationship_bus = relationship_bus
+
+    @property
+    def engine_id(self) -> str:
+        try:
+            from openjarvis.telemetry.instrumented_engine import InstrumentedEngine
+
+            if isinstance(self._inner, InstrumentedEngine):
+                return str(getattr(self._inner._inner, "engine_id", ""))
+        except Exception:
+            pass
+        return str(getattr(self._inner, "engine_id", ""))
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+    def generate(self, messages, *, model: str = "", **kwargs):
+        attempt_id = self._relationship_bus.begin_generation(
+            model=model,
+            engine=self.engine_id,
+        )
+        try:
+            result = self._inner.generate(messages, model=model, **kwargs)
+        except BaseException:
+            self._relationship_bus.finish_generation(attempt_id, failed=True)
+            raise
+        try:
+            self._relationship_bus.finish_generation(
+                attempt_id,
+                result=result,
+                failed=False,
+            )
+            if self._relationship_bus.generation_cancelled():
+                raise RuntimeError("relationship generation cancelled")
+        except BaseException:
+            _scrub_cancelled_engine_result(result)
+            raise
+        return result
+
+    async def stream_full(self, messages, *, model: str, **kwargs):
+        attempt_id = self._relationship_bus.begin_generation(
+            model=model,
+            engine=self.engine_id,
+        )
+        content: list[str] = []
+        content_bytes = 0
+        tool_call_batches: list[list[dict[str, Any]]] = []
+        content_blocks_present = False
+        usage: dict[str, int] = {}
+        finish_reason: Any = None
+        try:
+            async for chunk in self._inner.stream_full(
+                messages,
+                model=model,
+                **kwargs,
+            ):
+                chunk_content = getattr(chunk, "content", None)
+                if isinstance(chunk_content, str) and chunk_content:
+                    encoded_bytes = len(chunk_content.encode("utf-8"))
+                    if content_bytes <= (
+                        _RELATIONSHIP_STREAM_BUFFER_BYTES - encoded_bytes
+                    ):
+                        content.append(chunk_content)
+                        content_bytes += encoded_bytes
+                    else:
+                        content.clear()
+                        content_bytes = _RELATIONSHIP_STREAM_BUFFER_BYTES + 1
+                chunk_tool_calls = getattr(chunk, "tool_calls", None)
+                if isinstance(chunk_tool_calls, list):
+                    bounded = _relationship_bounded_list(chunk_tool_calls)
+                    if bounded:
+                        tool_call_batches.append(bounded)
+                if getattr(chunk, "content_blocks", None) not in (None, []):
+                    content_blocks_present = True
+                chunk_usage = _validated_relationship_usage(
+                    getattr(chunk, "usage", None)
+                )
+                if chunk_usage:
+                    usage = chunk_usage
+                if getattr(chunk, "finish_reason", None) is not None:
+                    finish_reason = chunk.finish_reason
+                yield chunk
+        except BaseException:
+            self._relationship_bus.finish_generation(attempt_id, failed=True)
+            content.clear()
+            tool_call_batches.clear()
+            usage.clear()
+            raise
+        try:
+            tool_calls = _assembled_stream_tool_calls(tool_call_batches)
+        except Exception:
+            tool_calls = []
+        try:
+            self._relationship_bus.finish_generation(
+                attempt_id,
+                result={
+                    "content": ""
+                    if content_bytes > _RELATIONSHIP_STREAM_BUFFER_BYTES
+                    else "".join(content),
+                    "tool_calls": tool_calls,
+                    "content_blocks": [{}] if content_blocks_present else [],
+                    "finish_reason": finish_reason,
+                    "usage": usage,
+                },
+                failed=False,
+            )
+            if self._relationship_bus.generation_cancelled():
+                raise RuntimeError("relationship generation cancelled")
+        finally:
+            content.clear()
+            tool_call_batches.clear()
+            usage.clear()
+
+
 def _copy_engine_for_relationship_events(engine, request_bus):
-    """Redirect a shared instrumented engine without mutating daemon state."""
+    """Redirect native events and count every call in request quarantine."""
 
     try:
         owns_bus = "_bus" in vars(engine)
     except TypeError:
         owns_bus = False
-    if request_bus is None or not owns_bus:
-        return engine
-    import copy
+    request_engine = engine
+    if owns_bus:
+        import copy
 
-    request_engine = copy.copy(engine)
-    request_engine._bus = request_bus
-    return request_engine
+        request_engine = copy.copy(engine)
+        request_engine._bus = request_bus
+    elif getattr(engine, "_publishes_events", False) is True:
+        raise RuntimeError("self-instrumented relationship engine bus is unavailable")
+    return _RelationshipObservedEngine(request_engine, request_bus)
 
 
 def _bounded_stream_append(
@@ -1665,39 +3136,87 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     # ``engine.generate()``) both make blocking upstream calls; run them in a
     # worker thread so a slow/wedged non-streaming request can't stall the
     # event loop and every other concurrent request with it.
-    if agent is not None and not request_body.tools:
-        response = await asyncio.to_thread(
-            _handle_agent,
-            agent,
-            model,
-            request_body,
-            complexity_info,
-            trace_store=getattr(request.app.state, "trace_store", None),
-            bus=getattr(request.app.state, "bus", None),
-            base_identity_prompt=base_identity_prompt,
-            relationship_overlay=relationship_overlay,
-            relationship_guard=relationship_guard,
-            trusted_context_messages=trusted_context_messages,
-            temporal_context_fragment=temporal_context_fragment,
-            principal_provenance=principal_provenance,
-            tool_surface=agent_tool_surface,
-            disabled_tools=request_disabled_tools,
-        )
-    else:
-        bus = getattr(request.app.state, "bus", None)
-        response = await asyncio.to_thread(
-            _handle_direct,
-            engine,
-            model,
-            request_body,
-            bus=bus,
-            complexity_info=complexity_info,
-            base_identity_prompt=base_identity_prompt,
-            relationship_overlay=relationship_overlay,
-            relationship_guard=relationship_guard,
-            trusted_context_messages=trusted_context_messages,
-            temporal_context_fragment=temporal_context_fragment,
-        )
+    cancellation_scope = (
+        _RelationshipCancellationScope() if relationship_guard is not None else None
+    )
+    try:
+        if agent is not None and not request_body.tools:
+            if cancellation_scope is None:
+                response = await asyncio.to_thread(
+                    _handle_agent,
+                    agent,
+                    model,
+                    request_body,
+                    complexity_info,
+                    trace_store=getattr(request.app.state, "trace_store", None),
+                    bus=getattr(request.app.state, "bus", None),
+                    base_identity_prompt=base_identity_prompt,
+                    relationship_overlay=relationship_overlay,
+                    relationship_guard=relationship_guard,
+                    trusted_context_messages=trusted_context_messages,
+                    temporal_context_fragment=temporal_context_fragment,
+                    principal_provenance=principal_provenance,
+                    tool_surface=agent_tool_surface,
+                    disabled_tools=request_disabled_tools,
+                )
+            else:
+                response = await asyncio.to_thread(
+                    _handle_agent,
+                    agent,
+                    model,
+                    request_body,
+                    complexity_info,
+                    trace_store=getattr(request.app.state, "trace_store", None),
+                    bus=getattr(request.app.state, "bus", None),
+                    base_identity_prompt=base_identity_prompt,
+                    relationship_overlay=relationship_overlay,
+                    relationship_guard=relationship_guard,
+                    trusted_context_messages=trusted_context_messages,
+                    temporal_context_fragment=temporal_context_fragment,
+                    principal_provenance=principal_provenance,
+                    tool_surface=agent_tool_surface,
+                    disabled_tools=request_disabled_tools,
+                    cancellation_scope=cancellation_scope,
+                )
+        else:
+            bus = getattr(request.app.state, "bus", None)
+            if cancellation_scope is None:
+                response = await asyncio.to_thread(
+                    _handle_direct,
+                    engine,
+                    model,
+                    request_body,
+                    bus=bus,
+                    complexity_info=complexity_info,
+                    base_identity_prompt=base_identity_prompt,
+                    relationship_overlay=relationship_overlay,
+                    relationship_guard=relationship_guard,
+                    trusted_context_messages=trusted_context_messages,
+                    temporal_context_fragment=temporal_context_fragment,
+                )
+            else:
+                response = await asyncio.to_thread(
+                    _handle_direct,
+                    engine,
+                    model,
+                    request_body,
+                    bus=bus,
+                    complexity_info=complexity_info,
+                    base_identity_prompt=base_identity_prompt,
+                    relationship_overlay=relationship_overlay,
+                    relationship_guard=relationship_guard,
+                    trusted_context_messages=trusted_context_messages,
+                    temporal_context_fragment=temporal_context_fragment,
+                    cancellation_scope=cancellation_scope,
+                )
+    except asyncio.CancelledError:
+        if cancellation_scope is not None:
+            cancellation_scope.cancel()
+        raise
+    if cancellation_scope is not None:
+        # The worker has reached its terminal safe result.  Commit a deferred
+        # trace synchronously before the next cancellation point.
+        cancellation_scope.commit_pending_trace()
 
     if durable_turn_id is not None:
         assert durable_conversation_key is not None
@@ -2088,6 +3607,7 @@ def _handle_direct(
     relationship_guard=None,
     trusted_context_messages: list[Message] | None = None,
     temporal_context_fragment: str | None = None,
+    cancellation_scope: _RelationshipCancellationScope | None = None,
 ) -> ChatCompletionResponse:
     """Direct engine call without agent."""
     messages = _to_messages(req.messages)
@@ -2101,18 +3621,50 @@ def _handle_direct(
     if relationship_overlay is not None and relationship_guard is None:
         relationship_guard = _prepare_relationship_guard_or_503(relationship_overlay)
     relationship_guard = _bind_relationship_guard(relationship_guard, messages)
+    relationship_repair_context = (
+        _snapshot_relationship_messages(messages)
+        if relationship_guard is not None
+        else None
+    )
     if relationship_guard is not None:
         event_bus = bus if bus is not None else getattr(engine, "_bus", None)
-        if event_bus is not None:
-            bus = _relationship_request_event_bus(
-                event_bus,
-                relationship_guard,
-            )
-            engine = _copy_engine_for_relationship_events(engine, bus)
+        bus = _relationship_request_event_bus(
+            event_bus,
+            relationship_guard,
+        )
+        if cancellation_scope is not None:
+            cancellation_scope.register_bus(bus)
+            cancellation_scope.raise_if_cancelled()
+        engine = _copy_engine_for_relationship_events(engine, bus)
     kwargs: dict[str, Any] = {}
     if req.tools:
         kwargs["tools"] = req.tools
-    if bus:
+    if relationship_guard is not None:
+        try:
+            result = engine.generate(
+                messages,
+                model=model,
+                temperature=req.temperature,
+                max_tokens=req.max_tokens,
+                **kwargs,
+            )
+        except Exception:
+            _abort_relationship_generation_events(bus)
+            raise HTTPException(
+                status_code=503,
+                detail="Ava generation unavailable",
+            ) from None
+        if cancellation_scope is not None and cancellation_scope.cancelled():
+            _scrub_cancelled_engine_result(result)
+            result = {}
+            cancellation_scope.raise_if_cancelled()
+        if not isinstance(result, dict):
+            _abort_relationship_generation_events(bus)
+            raise HTTPException(
+                status_code=503,
+                detail="Ava generation unavailable",
+            )
+    elif bus:
         from openjarvis.telemetry.instrumented_engine import InstrumentedEngine
         from openjarvis.telemetry.wrapper import instrumented_generate
 
@@ -2166,13 +3718,35 @@ def _handle_direct(
             **kwargs,
         )
     content = result.get("content", "")
-    usage = result.get("usage", {})
+    primary_usage = result.get("usage", {})
     tool_calls = result.get("tool_calls")
-    guard_decision = _apply_relationship_guard(
-        relationship_guard,
-        content,
-        tool_calls,
-    )
+    repair_usage: dict[str, int] = {}
+    if relationship_guard is None:
+        guard_decision = None
+    else:
+
+        def clear_rejected_direct() -> None:
+            nonlocal content, result, tool_calls
+
+            content = ""
+            tool_calls = None
+            result = {}
+
+        guard_decision = _apply_relationship_guard(
+            relationship_guard,
+            content,
+            tool_calls,
+            repair_engine=engine,
+            repair_model=model,
+            repair_messages=relationship_repair_context,
+            repair_max_tokens=req.max_tokens,
+            repair_usage=repair_usage,
+            repair_bus=bus,
+            clear_rejected=clear_rejected_direct,
+            cancellation_scope=cancellation_scope,
+        )
+        if cancellation_scope is not None:
+            cancellation_scope.raise_if_cancelled()
     if guard_decision is not None:
         content = guard_decision.output_text
         if guard_decision.action == "replace":
@@ -2193,6 +3767,11 @@ def _handle_direct(
             for tc in tool_calls
         ]
 
+    usage = (
+        primary_usage
+        if relationship_guard is None
+        else _merge_relationship_usage(primary_usage, repair_usage)
+    )
     return ChatCompletionResponse(
         model=model,
         choices=[
@@ -2250,17 +3829,21 @@ _AVA_VEILLE_SCHEDULER_TOOLS = frozenset({"avalon_status", "lire_doc", "proposer_
 class _RelationshipToolExecutorProxy:
     """Request-local pre-dispatch guard for every tool, local or external."""
 
-    __slots__ = ("_delegate", "_relationship_guard")
+    __slots__ = ("_cancellation_scope", "_delegate", "_relationship_guard")
 
-    def __init__(self, delegate, relationship_guard) -> None:
+    def __init__(self, delegate, relationship_guard, cancellation_scope=None) -> None:
         self._delegate = delegate
         self._relationship_guard = relationship_guard
+        self._cancellation_scope = cancellation_scope
 
     def __getattr__(self, name: str):
         return getattr(self._delegate, name)
 
     def execute(self, tool_call):
         from openjarvis.core.types import ToolResult
+
+        if self._cancellation_scope is not None:
+            self._cancellation_scope.raise_if_cancelled()
 
         registered = getattr(self._delegate, "_tools", None)
         tool_name = getattr(tool_call, "name", None)
@@ -2451,6 +4034,7 @@ def _copy_agent_for_request(
     principal_provenance: str | None = None,
     tool_surface: frozenset[str] | None = None,
     relationship_guard=None,
+    cancellation_scope: _RelationshipCancellationScope | None = None,
     zero_capability_allowlist: frozenset[str] | None = None,
 ):
     """Return an isolated shallow agent copy for one server request.
@@ -2533,6 +4117,7 @@ def _copy_agent_for_request(
             request_agent._executor = _RelationshipToolExecutorProxy(
                 request_executor,
                 relationship_guard,
+                cancellation_scope,
             )
         else:
             request_agent._executor = request_executor
@@ -2566,6 +4151,7 @@ def _handle_agent(
     principal_provenance: str | None = None,
     tool_surface: frozenset[str] | None = None,
     disabled_tools: frozenset[str] | None = None,
+    cancellation_scope: _RelationshipCancellationScope | None = None,
 ) -> ChatCompletionResponse:
     """Run through agent.
 
@@ -2593,6 +4179,11 @@ def _handle_agent(
     relationship_guard = _bind_relationship_guard(
         relationship_guard,
         dispatched_messages,
+    )
+    relationship_repair_context = (
+        _snapshot_relationship_messages(dispatched_messages)
+        if relationship_guard is not None
+        else None
     )
 
     # Build context from prior messages
@@ -2636,6 +4227,9 @@ def _handle_agent(
 
     if relationship_guard is not None:
         request_bus = _relationship_request_event_bus(bus, relationship_guard)
+        if cancellation_scope is not None:
+            cancellation_scope.register_bus(request_bus)
+            cancellation_scope.raise_if_cancelled()
     else:
         from openjarvis.core.events import EventBus
 
@@ -2650,19 +4244,37 @@ def _handle_agent(
         principal_provenance=principal_provenance,
         tool_surface=tool_surface,
         relationship_guard=relationship_guard,
+        cancellation_scope=cancellation_scope,
         zero_capability_allowlist=_HTTP_ZERO_CAPABILITY_TOOL_ALLOWLIST,
     )
+    repair_usage: dict[str, int] = {}
     trace_id: str | None = None
     if trace_store is not None:
         from openjarvis.traces.collector import TraceCollector
 
-        collector = TraceCollector(request_agent, store=trace_store, bus=request_bus)
+        collector = TraceCollector(
+            request_agent,
+            store=trace_store,
+            bus=request_bus,
+            defer_persistence=cancellation_scope is not None,
+        )
+        if cancellation_scope is not None:
+            cancellation_scope.raise_if_cancelled()
         result = collector.run(
             input_text,
             context=ctx,
             provenance=principal_provenance,
             content_filter=(
-                _relationship_trace_filter(relationship_guard)
+                _relationship_trace_filter(
+                    relationship_guard,
+                    repair_engine=request_agent._engine,
+                    repair_model=model,
+                    repair_messages=relationship_repair_context,
+                    repair_max_tokens=req.max_tokens,
+                    repair_usage=repair_usage,
+                    repair_bus=request_bus,
+                    cancellation_scope=cancellation_scope,
+                )
                 if relationship_guard is not None
                 else None
             ),
@@ -2670,17 +4282,68 @@ def _handle_agent(
                 relationship_guard.metadata if relationship_guard is not None else None
             ),
         )
+        if cancellation_scope is not None and cancellation_scope.cancelled():
+            _scrub_cancelled_agent_result(result)
+            result = None
+            cancellation_scope.raise_if_cancelled()
         # ⚠ On le lit APRÈS `run`, jamais avant : `last_trace` n'est renseigné
         #   qu'une fois la trace construite et persistée.
         _trace = collector.last_trace
         trace_id = _trace.trace_id if _trace is not None else None
+        if cancellation_scope is not None:
+            cancellation_scope.raise_if_cancelled()
+            cancellation_scope.register_pending_trace(
+                _trace,
+                trace_store,
+                request_bus,
+            )
     else:
-        result = request_agent.run(input_text, context=ctx)
-        decision = _apply_relationship_guard(
-            relationship_guard,
-            result.content,
-            result.metadata.get("tool_calls"),
-        )
+        try:
+            result = request_agent.run(input_text, context=ctx)
+            if cancellation_scope is not None and cancellation_scope.cancelled():
+                _scrub_cancelled_agent_result(result)
+                result = None
+                cancellation_scope.raise_if_cancelled()
+        except Exception:
+            if relationship_guard is not None:
+                _abort_relationship_generation_events(request_bus)
+                raise HTTPException(
+                    status_code=503,
+                    detail="Ava agent generation unavailable",
+                ) from None
+            raise
+        if relationship_guard is None:
+            decision = None
+        else:
+
+            def clear_rejected_agent_result() -> None:
+                result.content = ""
+                result.tool_results = []
+                for key in (
+                    "tool_calls",
+                    "tool_results",
+                    "content_blocks",
+                    "audio",
+                    "audio_path",
+                    "messages",
+                ):
+                    result.metadata.pop(key, None)
+
+            decision = _apply_relationship_guard(
+                relationship_guard,
+                result.content,
+                result.metadata.get("tool_calls"),
+                repair_engine=request_agent._engine,
+                repair_model=model,
+                repair_messages=relationship_repair_context,
+                repair_max_tokens=req.max_tokens,
+                repair_usage=repair_usage,
+                repair_bus=request_bus,
+                clear_rejected=clear_rejected_agent_result,
+                cancellation_scope=cancellation_scope,
+            )
+            if cancellation_scope is not None:
+                cancellation_scope.raise_if_cancelled()
         if decision is not None:
             result.content = decision.output_text
             if decision.action == "replace":
@@ -2694,6 +4357,9 @@ def _handle_agent(
                 ):
                     result.metadata.pop(key, None)
                 result.metadata["finish_reason"] = "stop"
+
+    if relationship_guard is not None:
+        result.metadata.update(_merge_relationship_usage(result.metadata, repair_usage))
 
     usage = UsageInfo(
         prompt_tokens=result.metadata.get("prompt_tokens", 0),
@@ -2772,14 +4438,18 @@ async def _handle_stream_tools(
     if relationship_overlay is not None and relationship_guard is None:
         relationship_guard = _prepare_relationship_guard_or_503(relationship_overlay)
     relationship_guard = _bind_relationship_guard(relationship_guard, messages)
+    relationship_repair_context = (
+        _snapshot_relationship_messages(messages)
+        if relationship_guard is not None
+        else None
+    )
     if relationship_guard is not None:
         event_bus = bus if bus is not None else getattr(engine, "_bus", None)
-        if event_bus is not None:
-            bus = _relationship_request_event_bus(
-                event_bus,
-                relationship_guard,
-            )
-            engine = _copy_engine_for_relationship_events(engine, bus)
+        bus = _relationship_request_event_bus(
+            event_bus,
+            relationship_guard,
+        )
+        engine = _copy_engine_for_relationship_events(engine, bus)
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     use_cloud = is_cloud_model(model)
     query_text = ""
@@ -2868,6 +4538,11 @@ async def _handle_stream_tools(
                     exc_info=True,
                 )
             else:
+                _abort_relationship_generation_events(bus)
+                full_content = ""
+                buffered_frames.clear()
+                buffered_tool_frames.clear()
+                tool_call_batches.clear()
                 logging.getLogger("openjarvis.server").error(
                     "Relationship tool stream failed before emission"
                 )
@@ -2882,6 +4557,12 @@ async def _handle_stream_tools(
             finish_reason == "stop" and bool(full_content.strip())
         ) or (finish_reason == "tool_calls" and saw_tool_calls)
         if not terminal_is_valid:
+            if relationship_guard is not None:
+                _abort_relationship_generation_events(bus)
+                full_content = ""
+                buffered_frames.clear()
+                buffered_tool_frames.clear()
+                tool_call_batches.clear()
             yield (
                 'data: {"error":{"type":"empty_or_incomplete_response",'
                 '"message":"Chat generation returned no complete response"}}\n\n'
@@ -2894,12 +4575,38 @@ async def _handle_stream_tools(
         if relationship_guard is not None:
             try:
                 assembled_tool_calls = _assembled_stream_tool_calls(tool_call_batches)
-                decision = _apply_relationship_guard(
+                repair_usage: dict[str, int] = {}
+
+                def clear_rejected_tool_stream() -> None:
+                    nonlocal assembled_tool_calls, effective_content, full_content
+
+                    full_content = ""
+                    effective_content = ""
+                    assembled_tool_calls = []
+                    buffered_frames.clear()
+                    buffered_tool_frames.clear()
+                    tool_call_batches.clear()
+
+                decision = await _apply_relationship_guard_async(
                     relationship_guard,
                     full_content,
                     assembled_tool_calls,
+                    repair_engine=engine,
+                    repair_model=model,
+                    repair_messages=relationship_repair_context,
+                    repair_max_tokens=req.max_tokens,
+                    repair_usage=repair_usage,
+                    repair_bus=bus,
+                    clear_rejected=clear_rejected_tool_stream,
                 )
             except Exception:
+                _abort_relationship_generation_events(bus)
+                full_content = ""
+                effective_content = ""
+                buffered_frames.clear()
+                buffered_tool_frames.clear()
+                tool_call_batches.clear()
+                assembled_tool_calls = []
                 logging.getLogger("openjarvis.server").error(
                     "Relationship tool stream policy failed before emission"
                 )
@@ -2910,10 +4617,11 @@ async def _handle_stream_tools(
                 yield "data: [DONE]\n\n"
                 return
             assert decision is not None
-            yield first_frame
             if decision.action == "replace":
                 effective_content = decision.output_text
                 effective_finish_reason = "stop"
+                safe_buffered_frames: tuple[str, ...] = ()
+                full_content = ""
                 replacement_chunk = ChatCompletionChunk(
                     id=chunk_id,
                     model=model,
@@ -2921,9 +4629,18 @@ async def _handle_stream_tools(
                         StreamChoice(delta=DeltaMessage(content=effective_content))
                     ],
                 )
-                yield f"data: {replacement_chunk.model_dump_json()}\n\n"
+                replacement_frame = f"data: {replacement_chunk.model_dump_json()}\n\n"
             else:
-                for buffered_frame in buffered_frames:
+                safe_buffered_frames = tuple(buffered_frames)
+                replacement_frame = ""
+            buffered_frames.clear()
+            buffered_tool_frames.clear()
+            tool_call_batches.clear()
+            yield first_frame
+            if decision.action == "replace":
+                yield replacement_frame
+            else:
+                for buffered_frame in safe_buffered_frames:
                     yield buffered_frame
                 if assembled_tool_calls:
                     canonical_tool_chunk = ChatCompletionChunk(
@@ -2968,8 +4685,11 @@ async def _handle_stream_tools(
             )
         yield "data: [DONE]\n\n"
 
+    frames = generate()
+    if relationship_guard is not None:
+        frames = _relationship_stream_with_terminal_cleanup(frames, bus)
     return StreamingResponse(
-        generate(),
+        frames,
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
@@ -3019,14 +4739,18 @@ async def _handle_stream(
     if relationship_overlay is not None and relationship_guard is None:
         relationship_guard = _prepare_relationship_guard_or_503(relationship_overlay)
     relationship_guard = _bind_relationship_guard(relationship_guard, messages)
+    relationship_repair_context = (
+        _snapshot_relationship_messages(messages)
+        if relationship_guard is not None
+        else None
+    )
     if relationship_guard is not None:
         event_bus = bus if bus is not None else getattr(engine, "_bus", None)
-        if event_bus is not None:
-            bus = _relationship_request_event_bus(
-                event_bus,
-                relationship_guard,
-            )
-            engine = _copy_engine_for_relationship_events(engine, bus)
+        bus = _relationship_request_event_bus(
+            event_bus,
+            relationship_guard,
+        )
+        engine = _copy_engine_for_relationship_events(engine, bus)
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
     # Last user message — recorded as the trace query.
@@ -3068,7 +4792,16 @@ async def _handle_stream(
             # mis-route the request to a cloud backend (MultiEngine routing
             # confusion), which is detected by checking the routed engine's
             # is_cloud attribute.
-            if use_cloud:
+            if relationship_guard is not None:
+                # Overlay requests must keep the exact request-local engine
+                # proxy for both the primary stream and a possible repair.
+                chunk_iter = engine.stream_full(
+                    messages,
+                    model=model,
+                    temperature=req.temperature,
+                    max_tokens=req.max_tokens,
+                )
+            elif use_cloud:
                 chunk_iter = stream_cloud_full(
                     model, messages, req.temperature, req.max_tokens
                 )
@@ -3141,6 +4874,9 @@ async def _handle_stream(
                     exc_info=True,
                 )
             else:
+                _abort_relationship_generation_events(bus)
+                full_content = ""
+                buffered_frames.clear()
                 logging.getLogger("openjarvis.server").error(
                     "Relationship chat stream failed before emission"
                 )
@@ -3152,6 +4888,10 @@ async def _handle_stream(
             return
 
         if finish_reason != "stop" or not full_content.strip():
+            if relationship_guard is not None:
+                _abort_relationship_generation_events(bus)
+                full_content = ""
+                buffered_frames.clear()
             yield (
                 'data: {"error":{"type":"empty_or_incomplete_response",'
                 '"message":"Chat generation returned no complete response"}}\n\n'
@@ -3162,14 +4902,34 @@ async def _handle_stream(
         effective_content = full_content
         if relationship_guard is not None:
             try:
-                decision = _apply_relationship_guard(
+                repair_usage: dict[str, int] = {}
+
+                def clear_rejected_stream() -> None:
+                    nonlocal effective_content, full_content
+
+                    full_content = ""
+                    effective_content = ""
+                    buffered_frames.clear()
+
+                decision = await _apply_relationship_guard_async(
                     relationship_guard,
                     full_content,
+                    repair_engine=engine,
+                    repair_model=model,
+                    repair_messages=relationship_repair_context,
+                    repair_max_tokens=req.max_tokens,
+                    repair_usage=repair_usage,
+                    repair_bus=bus,
+                    clear_rejected=clear_rejected_stream,
                 )
                 relationship_trace_metadata = relationship_guard.metadata()
                 if not isinstance(relationship_trace_metadata, dict):
                     raise RuntimeError("relationship guard metadata is invalid")
             except Exception:
+                _abort_relationship_generation_events(bus)
+                full_content = ""
+                effective_content = ""
+                buffered_frames.clear()
                 logging.getLogger("openjarvis.server").error(
                     "Relationship chat stream policy failed before emission"
                 )
@@ -3181,8 +4941,9 @@ async def _handle_stream(
                 return
             assert decision is not None
             effective_content = decision.output_text
-            yield first_frame
             if decision.action == "replace":
+                safe_buffered_frames: tuple[str, ...] = ()
+                full_content = ""
                 replacement_chunk = ChatCompletionChunk(
                     id=chunk_id,
                     model=model,
@@ -3190,9 +4951,16 @@ async def _handle_stream(
                         StreamChoice(delta=DeltaMessage(content=effective_content))
                     ],
                 )
-                yield f"data: {replacement_chunk.model_dump_json()}\n\n"
+                replacement_frame = f"data: {replacement_chunk.model_dump_json()}\n\n"
             else:
-                for buffered_frame in buffered_frames:
+                safe_buffered_frames = tuple(buffered_frames)
+                replacement_frame = ""
+            buffered_frames.clear()
+            yield first_frame
+            if decision.action == "replace":
+                yield replacement_frame
+            else:
+                for buffered_frame in safe_buffered_frames:
                     yield buffered_frame
 
         # Record a trace for the completed stream (best-effort; never breaks
@@ -3250,8 +5018,11 @@ async def _handle_stream(
         yield f"data: {_json.dumps(finish_dict)}\n\n"
         yield "data: [DONE]\n\n"
 
+    frames = generate()
+    if relationship_guard is not None:
+        frames = _relationship_stream_with_terminal_cleanup(frames, bus)
     return StreamingResponse(
-        generate(),
+        frames,
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )

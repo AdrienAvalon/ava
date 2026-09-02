@@ -259,7 +259,7 @@ def test_serveur_compose_overlay_exactement_une_fois_et_garde_les_tools(
             "tools": tools,
         },
     )
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     messages = engine.generate.call_args.args[0]
     assert messages[0].content.count(RELATIONSHIP_MARKER) == 1
     assert messages[0].content.count("Tu es **Ava**") == 1
@@ -333,7 +333,7 @@ def test_agent_recoit_composition_sans_changer_ses_capacites(monkeypatch) -> Non
             "messages": [{"role": "user", "content": "salut"}],
         },
     )
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     assert agent.capabilities == before
     assert agent.captured[0].role.value == "system"
     assert agent.captured[0].content.count(RELATIONSHIP_MARKER) == 1

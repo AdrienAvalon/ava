@@ -101,6 +101,11 @@ def create_app(
     config:
         Optional JarvisConfig for other settings.
     """
+    from ava_extensions.identity.relationship_guard_treatment import (
+        _assert_application_factory_allowed,
+    )
+
+    _assert_application_factory_allowed()
     if config is not None:
         from ava_extensions.boot import normalize_config
 

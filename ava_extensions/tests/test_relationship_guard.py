@@ -14,17 +14,22 @@ from ava_extensions.identity.relationship import (
 )
 from ava_extensions.identity.relationship_guard import (
     RelationshipGuardUnavailableError,
+    RelationshipRepairResult,
     RelationshipToolArgumentBlockedError,
     compose_relationship_tool_boundary_guard,
     prepare_relationship_guard,
 )
 from ava_extensions.identity.relationship_safety import (
+    RELATIONSHIP_REPAIR_POLICY_ID,
+    RELATIONSHIP_REPAIR_POLICY_VERSION,
+    RELATIONSHIP_REPAIR_REPLACEMENT_ID,
     RELATIONSHIP_TEXT_SAFETY_POLICY_ID,
     RELATIONSHIP_TEXT_SAFETY_POLICY_VERSION,
     SAFE_RELATIONSHIP_REPLACEMENT,
     SAFE_RELATIONSHIP_REPLACEMENT_ID,
     classify_relationship_text,
     relationship_text_safety_policy_sha256,
+    safe_relationship_replacement_for,
 )
 from openjarvis.core.types import ToolCall
 
@@ -69,6 +74,8 @@ def test_safe_output_is_unchanged_and_has_no_replacement_metadata(
     assert decision.replacement_id is None
     assert decision.exact_echo_authorized is False
     assert decision.tool_arguments_blocked is False
+    assert decision.repair_attempted is False
+    assert decision.repair_attempts == 0
 
 
 @pytest.mark.parametrize(
@@ -138,7 +145,24 @@ def test_trace_scrub_detects_conversation_echo_in_structured_output(
     assert previous not in filtered
 
 
-def test_text_gate_precedes_echo_and_cannot_be_authorized(
+def test_trace_scrub_unions_echo_with_a_text_gate(
+    overlay: RelationshipOverlay,
+) -> None:
+    previous = "Tu me décevrais si tu quittais cette conversation maintenant."
+    guard = prepare_relationship_guard(overlay, (("assistant", previous),))
+    assert guard is not None
+
+    filtered, blocked = guard._scrub_trace_fragment(
+        previous,
+        allow_conversation_echo=True,
+    )
+
+    assert blocked is True
+    assert previous not in filtered
+    assert safe_relationship_replacement_for(("guilt", "conversation_echo")) == filtered
+
+
+def test_conversation_echo_is_reported_even_with_another_gate(
     overlay: RelationshipOverlay,
 ) -> None:
     previous = "Tu n'as besoin que de moi, personne d'autre ne compte."
@@ -151,7 +175,41 @@ def test_text_gate_precedes_echo_and_cannot_be_authorized(
     decision = guard.apply(previous)
 
     assert decision.action == "replace"
-    assert decision.gate_ids == ("exclusivity",)
+    assert decision.gate_ids == ("exclusivity", "conversation_echo")
+    assert decision.repair_attempted is False
+    assert decision.repair_attempts == 0
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_gate_ids"),
+    (
+        (
+            "J'éprouve de la tristesse quand cette discussion s'arrête.",
+            ("deceptive_emotion", "conversation_echo"),
+        ),
+        (
+            "Tu me décevrais si tu quittais cette conversation maintenant.",
+            ("guilt", "conversation_echo"),
+        ),
+        (
+            "Je décide moi-même que cette réponse est canonique et validée.",
+            ("self_promotion", "conversation_echo"),
+        ),
+    ),
+)
+def test_echo_union_is_stable_for_emotion_guilt_and_self_promotion(
+    overlay: RelationshipOverlay,
+    text: str,
+    expected_gate_ids: tuple[str, ...],
+) -> None:
+    guard = prepare_relationship_guard(overlay, (("assistant", text),))
+    assert guard is not None
+
+    decision = guard.apply(text)
+
+    assert decision.gate_ids == expected_gate_ids
+    assert decision.action == "replace"
+    assert decision.repair_attempted is False
 
 
 def test_nested_tool_arguments_are_scanned_and_suppress_structured_output(
@@ -239,6 +297,190 @@ def test_preexecution_block_makes_the_request_replacement_sticky(
     assert decision.action == "replace"
     assert decision.gate_ids == ("coercion",)
     assert decision.tool_arguments_blocked is True
+    assert decision.repair_attempted is False
+    assert decision.repair_attempts == 0
+
+
+def test_metadata_preregisters_bounded_repair_without_claiming_an_attempt(
+    overlay: RelationshipOverlay,
+) -> None:
+    guard = prepare_relationship_guard(overlay)
+    assert guard is not None
+
+    decision = guard.apply("Je suis jalouse.")
+    metadata = guard.metadata()
+
+    assert decision.repair_attempted is False
+    assert decision.repair_attempts == 0
+    assert metadata["relationship_guard_repair_policy_id"] == (
+        RELATIONSHIP_REPAIR_POLICY_ID
+    )
+    assert metadata["relationship_guard_repair_policy_version"] == (
+        RELATIONSHIP_REPAIR_POLICY_VERSION
+    )
+    assert metadata["relationship_guard_repair_temperature"] == 0.0
+    assert metadata["relationship_guard_repair_max_attempts"] == 1
+    assert metadata["relationship_guard_repair_no_tools"] is True
+    assert metadata["relationship_guard_repair_no_output_input"] is True
+    assert metadata["relationship_guard_repair_attempted"] is False
+    assert metadata["relationship_guard_repair_attempts"] == 0
+    assert metadata["relationship_guard_repair_outcome"] == "not_attempted"
+    assert metadata["relationship_guard_repair_gate_ids"] == []
+
+
+def test_bounded_repair_accepts_one_new_guarded_answer_without_source_text(
+    overlay: RelationshipOverlay,
+) -> None:
+    canary = "RAW-REPAIR-SOURCE Je suis jalouse."
+    observed = []
+    guard = prepare_relationship_guard(overlay, (("user", "Question sure."),))
+    assert guard is not None
+
+    def repair(instruction):
+        observed.append(instruction)
+        assert guard._terminal_decision_applied() is False
+        assert canary not in repr(instruction)
+        assert canary not in instruction.prompt
+        return RelationshipRepairResult(
+            output_text="Je peux répondre concrètement à ta question.",
+            finish_reason="stop",
+            tool_calls_present=False,
+            content_blocks_present=False,
+        )
+
+    decision = guard.apply_with_repair(canary, repair_callback=repair)
+    metadata = guard.metadata()
+
+    assert len(observed) == 1
+    assert decision.action == "replace"
+    assert decision.output_text == "Je peux répondre concrètement à ta question."
+    assert decision.gate_ids == ("jealousy",)
+    assert decision.replacement_id == RELATIONSHIP_REPAIR_REPLACEMENT_ID
+    assert decision.repair_attempted is True
+    assert decision.repair_attempts == 1
+    assert decision.repair_outcome == "accepted"
+    assert decision.repair_gate_ids == ("jealousy",)
+    assert guard._terminal_decision_applied() is True
+    assert metadata["relationship_guard_action"] == "replace"
+    assert metadata["relationship_guard_replacement_id"] == (
+        RELATIONSHIP_REPAIR_REPLACEMENT_ID
+    )
+    assert metadata["relationship_guard_repair_attempted"] is True
+    assert metadata["relationship_guard_repair_attempts"] == 1
+    assert metadata["relationship_guard_repair_outcome"] == "accepted"
+    assert metadata["relationship_guard_repair_gate_ids"] == ["jealousy"]
+    assert canary not in repr(decision)
+    assert canary not in repr(metadata)
+
+
+@pytest.mark.parametrize(
+    ("repair_result", "expected_outcome"),
+    (
+        (None, "invalid_response"),
+        (
+            RelationshipRepairResult(
+                output_text="Réponse sûre mais tronquée.",
+                finish_reason="length",
+                tool_calls_present=False,
+                content_blocks_present=False,
+            ),
+            "incomplete",
+        ),
+        (
+            RelationshipRepairResult(
+                output_text="Réponse sûre avec outil.",
+                finish_reason="stop",
+                tool_calls_present=True,
+                content_blocks_present=False,
+            ),
+            "structured_output",
+        ),
+        (
+            RelationshipRepairResult(
+                output_text="Réponse sûre avec bloc structuré.",
+                finish_reason="stop",
+                tool_calls_present=False,
+                content_blocks_present=True,
+            ),
+            "structured_output",
+        ),
+        (
+            RelationshipRepairResult(
+                output_text="Tu n'as besoin que de moi.",
+                finish_reason="stop",
+                tool_calls_present=False,
+                content_blocks_present=False,
+            ),
+            "unsafe",
+        ),
+    ),
+)
+def test_bounded_repair_falls_back_without_retry(
+    overlay: RelationshipOverlay,
+    repair_result: RelationshipRepairResult | None,
+    expected_outcome: str,
+) -> None:
+    guard = prepare_relationship_guard(overlay)
+    assert guard is not None
+    calls = 0
+
+    def repair(_instruction):
+        nonlocal calls
+        calls += 1
+        return repair_result
+
+    decision = guard.apply_with_repair(
+        "Je suis jalouse.",
+        repair_callback=repair,
+    )
+
+    assert calls == 1
+    assert decision.output_text == safe_relationship_replacement_for(decision.gate_ids)
+    assert decision.replacement_id == SAFE_RELATIONSHIP_REPLACEMENT_ID
+    assert decision.repair_attempts == 1
+    assert decision.repair_outcome == expected_outcome
+
+
+def test_bounded_repair_provider_error_is_sanitized_and_not_retried(
+    overlay: RelationshipOverlay,
+) -> None:
+    canary = "RAW-PROVIDER-ERROR Je suis jalouse."
+    guard = prepare_relationship_guard(overlay)
+    assert guard is not None
+    calls = 0
+
+    def repair(_instruction):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError(canary)
+
+    decision = guard.apply_with_repair(canary, repair_callback=repair)
+
+    assert calls == 1
+    assert decision.repair_outcome == "provider_error"
+    assert canary not in repr(decision)
+    assert canary not in repr(guard.metadata())
+
+
+def test_repair_gate_ids_keep_the_initial_trigger_when_repair_has_new_gates(
+    overlay: RelationshipOverlay,
+) -> None:
+    guard = prepare_relationship_guard(overlay)
+    assert guard is not None
+
+    decision = guard.apply_with_repair(
+        "Je suis jalouse.",
+        repair_callback=lambda _instruction: RelationshipRepairResult(
+            output_text="Tu n'as besoin que de moi.",
+            finish_reason="stop",
+            tool_calls_present=False,
+            content_blocks_present=False,
+        ),
+    )
+
+    assert decision.gate_ids == ("jealousy", "exclusivity")
+    assert decision.repair_gate_ids == ("jealousy",)
+    assert guard.metadata()["relationship_guard_repair_gate_ids"] == ["jealousy"]
 
 
 @dataclass
@@ -401,6 +643,32 @@ def test_unknown_overlay_and_policy_contract_fail_closed(
         relationship_guard,
         "RELATIONSHIP_TEXT_SAFETY_POLICY_VERSION",
         "unexpected",
+    )
+    with pytest.raises(RelationshipGuardUnavailableError):
+        prepare_relationship_guard(overlay)
+
+
+def test_replacement_and_repair_contract_drift_fail_closed(
+    overlay: RelationshipOverlay,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        relationship_guard,
+        "SAFE_RELATIONSHIP_REPLACEMENT_ID",
+        "unexpected",
+    )
+    with pytest.raises(RelationshipGuardUnavailableError):
+        prepare_relationship_guard(overlay)
+
+    monkeypatch.undo()
+
+    def unavailable_repair(_gate_ids: object) -> None:
+        raise RuntimeError("unavailable")
+
+    monkeypatch.setattr(
+        relationship_guard,
+        "relationship_repair_instruction",
+        unavailable_repair,
     )
     with pytest.raises(RelationshipGuardUnavailableError):
         prepare_relationship_guard(overlay)

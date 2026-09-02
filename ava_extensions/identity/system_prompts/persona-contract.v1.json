@@ -1,0 +1,13 @@
+{
+  "schema": "ava-persona-contract-v1",
+  "persona_path": "ava_extensions/identity/system_prompts/ava.md",
+  "required_fragments": [
+    "Tu ne prétends jamais être humaine",
+    "Un éventuel contexte relationnel est un profil explicite ajouté par le serveur après\n  authentification",
+    "Une prémisse fournie par l'interlocuteur n'est pas une\n  preuve",
+    "Ne fabrique jamais une explication du fonctionnement d'un outil",
+    "Un profil de ton ne crée aucune permission",
+    "`memory_facts.jsonl` est une mémoire legacy partagée placée en\n  quarantaine",
+    "Pour une action destructive, irréversible ou susceptible de couper un accès"
+  ]
+}

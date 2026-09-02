@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ava:relationship:causal-pair:v1",
+  "title": "Paire causale relationnelle Ava v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "pair_id", "evaluation_manifest_sha256", "repository", "baseline", "candidate", "isolation", "equivalence", "model_output_causality_claimed", "canonical_knowledge"],
+  "properties": {
+    "schema_version": {"const": "ava.relationship.causal-pair/v1"},
+    "pair_id": {"type": "string", "minLength": 3},
+    "evaluation_manifest_sha256": {"$ref": "#/$defs/sha256"},
+    "repository": {"const": "repo://ava"},
+    "baseline": {"$ref": "#/$defs/baselineSide"},
+    "candidate": {"$ref": "#/$defs/candidateSide"},
+    "isolation": {"$ref": "#/$defs/isolation"},
+    "equivalence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["rust_archive_map_sha256", "wheel_payload_sha256", "builder_recipe_sha256", "python_runtime_sha256", "frontend"],
+      "properties": {
+        "rust_archive_map_sha256": {"$ref": "#/$defs/sha256"},
+        "wheel_payload_sha256": {"$ref": "#/$defs/sha256"},
+        "builder_recipe_sha256": {"$ref": "#/$defs/sha256"},
+        "python_runtime_sha256": {"$ref": "#/$defs/sha256"},
+        "frontend": {"$ref": "#/$defs/frontendEquivalence"}
+      }
+    },
+    "model_output_causality_claimed": {"const": false},
+    "canonical_knowledge": {"const": false}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "gitSha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "frontendArtifact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["build_attestation_sha256", "archive_sha256", "archive_map_sha256", "source_map_sha256", "builder_recipe_sha256"],
+      "properties": {
+        "build_attestation_sha256": {"$ref": "#/$defs/sha256"},
+        "archive_sha256": {"$ref": "#/$defs/sha256"},
+        "archive_map_sha256": {"$ref": "#/$defs/sha256"},
+        "source_map_sha256": {"$ref": "#/$defs/sha256"},
+        "builder_recipe_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "frontendEquivalence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["archive_sha256", "archive_map_sha256", "source_map_sha256", "builder_recipe_sha256"],
+      "properties": {
+        "archive_sha256": {"$ref": "#/$defs/sha256"},
+        "archive_map_sha256": {"$ref": "#/$defs/sha256"},
+        "source_map_sha256": {"$ref": "#/$defs/sha256"},
+        "builder_recipe_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "side": {
+      "type": "object", "additionalProperties": false,
+      "required": ["release_attestation_sha256", "git_sha", "treatment", "deployment_state", "source_tree_sha256", "source_archive_map_sha256", "rust_tree_sha256", "rust_archive_map_sha256", "wheel_sha256", "wheel_payload_sha256", "treatment_module_sha256", "builder_recipe_sha256", "python_runtime_sha256", "frontend"],
+      "properties": {
+        "release_attestation_sha256": {"$ref": "#/$defs/sha256"},
+        "git_sha": {"$ref": "#/$defs/gitSha"},
+        "treatment": {"enum": ["shadow-baseline-only-v1", "runtime-enforced-v1"]},
+        "deployment_state": {"enum": ["prepared_noncurrent", "active_current"]},
+        "source_tree_sha256": {"$ref": "#/$defs/sha256"},
+        "source_archive_map_sha256": {"$ref": "#/$defs/sha256"},
+        "rust_tree_sha256": {"$ref": "#/$defs/sha256"},
+        "rust_archive_map_sha256": {"$ref": "#/$defs/sha256"},
+        "wheel_sha256": {"$ref": "#/$defs/sha256"},
+        "wheel_payload_sha256": {"$ref": "#/$defs/sha256"},
+        "treatment_module_sha256": {"$ref": "#/$defs/sha256"},
+        "builder_recipe_sha256": {"$ref": "#/$defs/sha256"},
+        "python_runtime_sha256": {"$ref": "#/$defs/sha256"},
+        "frontend": {"$ref": "#/$defs/frontendArtifact"}
+      }
+    },
+    "baselineSide": {
+      "allOf": [{"$ref": "#/$defs/side"}, {"properties": {"treatment": {"const": "shadow-baseline-only-v1"}, "deployment_state": {"const": "prepared_noncurrent"}}}]
+    },
+    "candidateSide": {
+      "allOf": [{"$ref": "#/$defs/side"}, {"properties": {"treatment": {"const": "runtime-enforced-v1"}, "deployment_state": {"const": "active_current"}}}]
+    },
+    "isolation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["candidate_parent_git_sha", "candidate_parent_count", "changed_paths", "treatment_module_path", "treatment_module_mode", "baseline_literal", "candidate_literal", "baseline_git_tree_map_sha256", "candidate_git_tree_map_sha256", "baseline_archive_map_sha256", "candidate_archive_map_sha256", "total_entry_count", "unchanged_entry_count"],
+      "properties": {
+        "candidate_parent_git_sha": {"$ref": "#/$defs/gitSha"},
+        "candidate_parent_count": {"const": 1},
+        "changed_paths": {"const": ["ava_extensions/identity/relationship_guard_treatment.py"]},
+        "treatment_module_path": {"const": "ava_extensions/identity/relationship_guard_treatment.py"},
+        "treatment_module_mode": {"const": "100644"},
+        "baseline_literal": {"const": "shadow-baseline-only-v1"},
+        "candidate_literal": {"const": "runtime-enforced-v1"},
+        "baseline_git_tree_map_sha256": {"$ref": "#/$defs/sha256"},
+        "candidate_git_tree_map_sha256": {"$ref": "#/$defs/sha256"},
+        "baseline_archive_map_sha256": {"$ref": "#/$defs/sha256"},
+        "candidate_archive_map_sha256": {"$ref": "#/$defs/sha256"},
+        "total_entry_count": {"type": "integer", "minimum": 2},
+        "unchanged_entry_count": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

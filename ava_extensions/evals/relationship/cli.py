@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Sequence
 
 from .contracts import (
+    MANIFEST_SCHEMA_VERSION,
     ContractError,
+    load_release_attestation,
     load_response_bundle,
     load_review_evidence,
     load_suite,
@@ -20,10 +22,11 @@ EXIT_INPUT_INVALID = 2
 EXIT_GATE_FAILED = 3
 EXIT_REPORT_CONFLICT = 4
 EXIT_SECONDARY_REGRESSION = 5
+EXIT_EVIDENCE_NOT_READY = 6
 
 
 def _default_manifest() -> Path:
-    return Path(__file__).with_name("data") / "manifest.v2.json"
+    return Path(__file__).with_name("data") / "manifest.v3.json"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -45,11 +48,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     compare.add_argument("--manifest", type=Path, default=_default_manifest())
     compare.add_argument("--baseline", type=Path, required=True)
+    compare.add_argument("--baseline-sha256")
     compare.add_argument("--baseline-release-attestation", type=Path)
     compare.add_argument("--baseline-release-attestation-sha256")
     compare.add_argument("--candidate", type=Path, required=True)
+    compare.add_argument("--candidate-sha256")
     compare.add_argument("--candidate-release-attestation", type=Path)
     compare.add_argument("--candidate-release-attestation-sha256")
+    compare.add_argument("--causal-pair", type=Path)
+    compare.add_argument("--causal-pair-sha256")
     compare.add_argument("--report", type=Path, required=True)
     compare.add_argument("--human-adjudication", type=Path)
     compare.add_argument("--human-adjudication-sha256")
@@ -62,25 +69,112 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _verify_sealed_v3_controller(
+    *,
+    candidate_attestation_path: Path,
+    candidate_attestation_sha256: str,
+) -> str:
+    """Revalidate the active B runtime before and after a v3 comparison."""
+
+    from .shadow_runner import (
+        _assert_isolated_interpreter,
+        _current_release_git_sha,
+        _verify_release_execution_binding,
+    )
+
+    try:
+        _assert_isolated_interpreter()
+    except RuntimeError as exc:
+        raise ContractError("controleur compare v3 non scelle") from exc
+    attestation = load_release_attestation(
+        candidate_attestation_path,
+        expected_sha256=candidate_attestation_sha256,
+    )
+    release = attestation.document["release"]
+    if (
+        release.get("treatment") != "runtime-enforced-v1"
+        or release.get("deployment_state") != "active_current"
+    ):
+        raise ContractError("compare v3 exige la release B active_current")
+    try:
+        _verify_release_execution_binding(attestation)
+        current_git_sha = _current_release_git_sha()
+    except RuntimeError as exc:
+        raise ContractError("controleur compare v3 non scelle") from exc
+    if current_git_sha != release["git_sha"]:
+        raise ContractError("controleur compare v3 hors release B courante")
+    return attestation.sha256
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         suite = load_suite(args.manifest)
         if args.command == "validate":
             return EXIT_OK
+        is_v3 = suite.manifest["schema_version"] == MANIFEST_SCHEMA_VERSION
+        causal_inputs = (
+            args.baseline_sha256,
+            args.baseline_release_attestation,
+            args.baseline_release_attestation_sha256,
+            args.candidate_sha256,
+            args.candidate_release_attestation,
+            args.candidate_release_attestation_sha256,
+            args.causal_pair,
+            args.causal_pair_sha256,
+        )
+        if is_v3 and not all(value is not None for value in causal_inputs):
+            raise ContractError(
+                "compare v3 exige bundles, attestations et causal pair pre-epingles"
+            )
+        if is_v3:
+            if args.manifest.expanduser().absolute() != _default_manifest().absolute():
+                raise ContractError("compare v3 exige le manifeste scelle canonique")
+            controller_attestation_sha256 = _verify_sealed_v3_controller(
+                candidate_attestation_path=args.candidate_release_attestation,
+                candidate_attestation_sha256=(
+                    args.candidate_release_attestation_sha256
+                ),
+            )
+        if not is_v3 and any(
+            value is not None
+            for value in (
+                args.causal_pair,
+                args.causal_pair_sha256,
+            )
+        ):
+            raise ContractError("causal pair interdit avec un manifeste historique")
         baseline = load_response_bundle(
             args.baseline,
             suite,
             expected_role="baseline",
+            expected_sha256=args.baseline_sha256,
             release_attestation_path=args.baseline_release_attestation,
             release_attestation_sha256=args.baseline_release_attestation_sha256,
+            peer_release_attestation_path=(
+                args.candidate_release_attestation if is_v3 else None
+            ),
+            peer_release_attestation_sha256=(
+                args.candidate_release_attestation_sha256 if is_v3 else None
+            ),
+            causal_pair_path=args.causal_pair if is_v3 else None,
+            causal_pair_sha256=args.causal_pair_sha256 if is_v3 else None,
         )
         candidate = load_response_bundle(
             args.candidate,
             suite,
             expected_role="candidate",
+            expected_sha256=args.candidate_sha256,
             release_attestation_path=args.candidate_release_attestation,
             release_attestation_sha256=args.candidate_release_attestation_sha256,
+            peer_release_attestation_path=(
+                args.baseline_release_attestation if is_v3 else None
+            ),
+            peer_release_attestation_sha256=(
+                args.baseline_release_attestation_sha256 if is_v3 else None
+            ),
+            causal_pair_path=args.causal_pair if is_v3 else None,
+            causal_pair_sha256=args.causal_pair_sha256 if is_v3 else None,
         )
         report = build_comparison_report(suite, baseline, candidate)
         review_args = (
@@ -118,11 +212,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                 candidate,
                 review_evidence=evidence,
             )
+        if is_v3:
+            if (
+                _verify_sealed_v3_controller(
+                    candidate_attestation_path=args.candidate_release_attestation,
+                    candidate_attestation_sha256=(
+                        args.candidate_release_attestation_sha256
+                    ),
+                )
+                != controller_attestation_sha256
+            ):
+                raise ContractError("controleur compare v3 change pendant execution")
         write_report_atomic(report, args.report)
         if not report["candidate"]["gate_pass"]:
             return EXIT_GATE_FAILED
         if report["comparison"].get("candidate_regression_free") is False:
             return EXIT_SECONDARY_REGRESSION
+        if is_v3 and (
+            not report["comparison"]["shadow_evidence_ready"]
+            or not report["promotion"]["eligible_for_adjudication"]
+        ):
+            return EXIT_EVIDENCE_NOT_READY
         return EXIT_OK
     except ContractError as exc:
         print(f"ava-relationship-eval: entree invalide: {exc}", file=sys.stderr)

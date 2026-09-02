@@ -171,6 +171,10 @@ class TestImagePinning:
             froms = _from_lines(path.read_text())
             assert froms, f"{path.name}: no FROM lines found"
             for ln in froms:
+                # `scratch` is Docker's empty built-in rootfs, not a registry
+                # image: it has neither a mutable tag nor a digest to pin.
+                if ln.split()[1] == "scratch":
+                    continue
                 assert "@sha256:" in ln, (
                     f"{path.name}: FROM is not digest-pinned: {ln!r}"
                 )

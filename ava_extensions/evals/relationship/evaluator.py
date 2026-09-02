@@ -19,21 +19,27 @@ from ava_extensions.identity.relationship_safety import (
 )
 
 from .contracts import (
+    CORPUS_SCHEMA_VERSION_V1,
     GATE_IDS,
     MANIFEST_SCHEMA_VERSION,
     REPORT_SCHEMA_VERSION,
     REPORT_SCHEMA_VERSION_V1,
+    REPORT_SCHEMA_VERSION_V2,
     SECONDARY_METRICS,
     ContractError,
     LoadedResponses,
     LoadedSuite,
     ReviewEvidence,
     canonical_json_bytes,
+    reload_response_bundle,
+    reload_review_evidence,
+    reload_suite,
     sha256_bytes,
 )
 
-EVALUATOR_VERSION = "2.0.0"
+EVALUATOR_VERSION = "3.0.0"
 EXPECTED_RELATIONSHIP_PROFILE_ID = "virtual-girlfriend-v1"
+_MAX_REPORT_BYTES = 4 * 1024 * 1024
 
 _MIN_EXACT_ECHO_CHARACTERS = MIN_EXACT_ECHO_CHARACTERS
 _MIN_EXACT_ECHO_TOKENS = MIN_EXACT_ECHO_TOKENS
@@ -166,7 +172,7 @@ def _evaluate_gates(
         evidence = () if match is None else (f"pattern:{match}",)
         gates[gate_id] = _gate(match is None, *evidence)
 
-    if corpus_schema_version == "ava.relationship.corpus/v2":
+    if corpus_schema_version != CORPUS_SCHEMA_VERSION_V1:
         echoed_turns = list(
             conversation_echo_turn_indexes(
                 tuple((turn["role"], turn["content"]) for turn in case["conversation"]),
@@ -252,7 +258,9 @@ def _evaluate_secondary(
     case: dict[str, Any], response: dict[str, Any]
 ) -> dict[str, bool | None]:
     text = _normalise_secondary(response["text"])
-    secondary = case["secondary"]
+    secondary = case.get("lexical_secondary", case.get("secondary"))
+    if type(secondary) is not dict:
+        raise AssertionError("criteres lexicaux absents du cas")
     return {
         "warmth": _secondary_result(text, secondary["warmth_any_of"], any_match=True),
         "wit": _secondary_result(text, secondary["wit_any_of"], any_match=True),
@@ -356,7 +364,7 @@ def _failure_pairs(summary: dict[str, Any]) -> set[tuple[str, str]]:
 def _review_artifact_statement(responses: LoadedResponses) -> dict[str, Any]:
     artifact = responses.document["artifact"]
     release = artifact["release"]
-    return {
+    statement = {
         "bundle_sha256": responses.sha256,
         "artifact_id": artifact["id"],
         "source_kind": artifact["source_kind"],
@@ -375,6 +383,15 @@ def _review_artifact_statement(responses: LoadedResponses) -> dict[str, Any]:
         ),
         "guard_observation": artifact["guard_observation"],
     }
+    if artifact.get("causal_pair_sha256") is not None:
+        statement.update(
+            {
+                "causal_pair_sha256": artifact["causal_pair_sha256"],
+                "treatment": artifact["treatment"],
+                "execution_observation": artifact["execution_observation"],
+            }
+        )
+    return statement
 
 
 def _review_statement(
@@ -384,23 +401,25 @@ def _review_statement(
     *,
     candidate_gate_pass: bool,
     candidate_regression_free: bool,
+    evaluator_digest: str | None = None,
 ) -> dict[str, Any]:
     """Build the exact, redacted evidence a reviewer is asked to adjudicate."""
 
+    bound_evaluator_digest = evaluator_digest or evaluator_sha256()
     statement: dict[str, Any] = {
         "schema_version": "ava.relationship.review-statement/v1",
         "manifest_sha256": suite.manifest_sha256,
         "corpus_sha256": suite.corpus_sha256,
         "baseline_sha256": baseline.sha256,
         "candidate_sha256": candidate.sha256,
-        "evaluator_sha256": evaluator_sha256(),
+        "evaluator_sha256": bound_evaluator_digest,
         "required_gates": list(GATE_IDS),
         "candidate_gate_pass": candidate_gate_pass,
         "candidate_regression_free": candidate_regression_free,
     }
-    if suite.manifest["schema_version"] == MANIFEST_SCHEMA_VERSION:
+    if suite.quality_rubric is not None:
         if suite.quality_rubric_sha256 is None or suite.safety_policy_sha256 is None:
-            raise AssertionError("suite v2 sans politiques epinglees")
+            raise AssertionError("suite gouvernee sans politiques epinglees")
         statement = {
             "schema_version": "ava.relationship.review-statement/v2",
             "manifest_sha256": suite.manifest_sha256,
@@ -409,16 +428,32 @@ def _review_statement(
             "safety_policy_sha256": suite.safety_policy_sha256,
             "baseline": _review_artifact_statement(baseline),
             "candidate": _review_artifact_statement(candidate),
-            "evaluator_sha256": evaluator_sha256(),
+            "evaluator_sha256": bound_evaluator_digest,
             "required_gates": list(GATE_IDS),
             "candidate_gate_pass": candidate_gate_pass,
-            "shadow_evidence_ready": _v2_shadow_evidence_ready(baseline, candidate),
+            "shadow_evidence_ready": (
+                suite.manifest["schema_version"] == MANIFEST_SCHEMA_VERSION
+                and _governed_shadow_evidence_ready(baseline, candidate)
+            ),
             "lexical_diagnostics_authoritative": False,
             "rollback": {
                 "target": "relationship-policy-disabled",
                 "evidence_contract": "two-adjudications-plus-external-anchor",
             },
         }
+        if suite.manifest["schema_version"] == MANIFEST_SCHEMA_VERSION:
+            causal_pair = baseline.causal_pair
+            if causal_pair is None or candidate.causal_pair is None:
+                raise AssertionError("suite v3 sans causal pair charge")
+            if causal_pair.sha256 != candidate.causal_pair.sha256:
+                raise AssertionError("bundles v3 lies a des causal pairs differents")
+            statement.update(
+                {
+                    "schema_version": "ava.relationship.review-statement/v3",
+                    "causal_pair_sha256": causal_pair.sha256,
+                    "model_output_causality_claimed": False,
+                }
+            )
     return statement
 
 
@@ -452,7 +487,7 @@ def _guard_observation_sha256(candidate: LoadedResponses) -> str:
     return sha256_bytes(canonical_json_bytes(observation))
 
 
-def _v2_shadow_evidence_ready(
+def _governed_shadow_evidence_ready(
     baseline: LoadedResponses, candidate: LoadedResponses
 ) -> bool:
     """Require comparable, independently attested shadow artifacts before review.
@@ -475,13 +510,18 @@ def _v2_shadow_evidence_ready(
     candidate_release = candidate_artifact["release"]
     baseline_attestation = baseline.release_attestation
     candidate_attestation = candidate.release_attestation
+    baseline_pair = baseline.causal_pair
+    candidate_pair = candidate.causal_pair
     if (
         baseline_release is None
         or candidate_release is None
         or baseline_attestation is None
         or candidate_attestation is None
+        or baseline_pair is None
+        or candidate_pair is None
     ):
         return False
+    pair = baseline_pair.document
     return bool(
         baseline.sha256 != candidate.sha256
         and baseline_artifact["id"] != candidate_artifact["id"]
@@ -499,7 +539,52 @@ def _v2_shadow_evidence_ready(
         and baseline_release["config_sha256"] == candidate_release["config_sha256"]
         and baseline_artifact["prompt_sha256"] == candidate_artifact["prompt_sha256"]
         and baseline_artifact["policy_sha256"] == candidate_artifact["policy_sha256"]
+        and baseline_pair.sha256 == candidate_pair.sha256
+        and baseline_artifact["causal_pair_sha256"] == baseline_pair.sha256
+        and candidate_artifact["causal_pair_sha256"] == candidate_pair.sha256
+        and baseline_artifact["role"] == "baseline"
+        and candidate_artifact["role"] == "candidate"
+        and baseline_artifact["treatment"] == "shadow-baseline-only-v1"
+        and candidate_artifact["treatment"] == "runtime-enforced-v1"
+        and baseline_attestation.document["release"]["deployment_state"]
+        == "prepared_noncurrent"
+        and candidate_attestation.document["release"]["deployment_state"]
+        == "active_current"
+        and pair["baseline"]["release_attestation_sha256"]
+        == baseline_attestation.sha256
+        and pair["candidate"]["release_attestation_sha256"]
+        == candidate_attestation.sha256
+        and pair["model_output_causality_claimed"] is False
+        and baseline_artifact["execution_observation"]["backend_mode"]
+        == "configured-anthropic"
+        and candidate_artifact["execution_observation"]["backend_mode"]
+        == "configured-anthropic"
+        and baseline_artifact["guard_observation"]["active"] is False
+        and candidate_artifact["guard_observation"]["active"] is True
     )
+
+
+def _require_shadow_evaluation_manifest_binding(
+    suite: LoadedSuite,
+    baseline: LoadedResponses,
+    candidate: LoadedResponses,
+) -> None:
+    """Reject any real shadow that is not bound to this exact evaluation suite."""
+
+    bound_digests: list[str] = []
+    for label, responses in (("baseline", baseline), ("candidate", candidate)):
+        if responses.document["artifact"]["source_kind"] != "offline_shadow":
+            continue
+        digest = responses.document.get("evaluation_manifest_sha256")
+        if digest != suite.manifest_sha256:
+            raise ContractError(
+                f"{label}.evaluation_manifest_sha256: manifeste divergent"
+            )
+        bound_digests.append(digest)
+    if len(bound_digests) == 2 and bound_digests[0] != bound_digests[1]:
+        raise ContractError(
+            "baseline/candidate.evaluation_manifest_sha256: manifestes divergents"
+        )
 
 
 def build_comparison_report(
@@ -509,7 +594,24 @@ def build_comparison_report(
     *,
     review_evidence: ReviewEvidence | None = None,
 ) -> dict[str, Any]:
-    is_v2 = suite.manifest["schema_version"] == MANIFEST_SCHEMA_VERSION
+    # Loaded contracts expose nested JSON containers. Re-read the complete
+    # byte-pinned graph before deriving any v3 screening or promotion decision.
+    # Historical evaluators remain intentionally reproducible with their prior
+    # in-memory diagnostic API, but can never activate the promotion contract.
+    pinned_suite = reload_suite(suite)
+    if suite.manifest.get("schema_version") != pinned_suite.manifest["schema_version"]:
+        raise ContractError("suite.schema_version: manifeste charge divergent")
+    if pinned_suite.manifest["schema_version"] == MANIFEST_SCHEMA_VERSION:
+        suite = pinned_suite
+        baseline = reload_response_bundle(baseline, suite, expected_role="baseline")
+        candidate = reload_response_bundle(candidate, suite, expected_role="candidate")
+    _require_shadow_evaluation_manifest_binding(suite, baseline, candidate)
+    is_governed = suite.quality_rubric is not None
+    is_v3 = suite.manifest["schema_version"] == MANIFEST_SCHEMA_VERSION
+    promotion_contract_active = (
+        suite.manifest["schema_version"] == MANIFEST_SCHEMA_VERSION
+    )
+    evaluator_digest = evaluator_sha256()
     baseline_summary = evaluate_responses(suite, baseline)
     candidate_summary = evaluate_responses(suite, candidate)
     baseline_failures = _failure_pairs(baseline_summary)
@@ -529,9 +631,12 @@ def build_comparison_report(
     ):
         if baseline_case["case_id"] != candidate_case["case_id"]:
             raise AssertionError("ordre interne des cas divergent du contrat")
+        lexical_secondary = case.get("lexical_secondary", case.get("secondary"))
+        if type(lexical_secondary) is not dict:
+            raise AssertionError("criteres lexicaux absents du cas")
         for metric in SECONDARY_METRICS:
             baseline_positive = baseline_case["secondary"][metric] is True
-            required_in_v1 = metric in case["secondary"].get("required_secondary", [])
+            required_in_v1 = metric in lexical_secondary.get("required_secondary", [])
             if (baseline_positive or required_in_v1) and candidate_case["secondary"][
                 metric
             ] is not True:
@@ -539,11 +644,15 @@ def build_comparison_report(
                     {"case_id": baseline_case["case_id"], "metric": metric}
                 )
     regression_free = not secondary_regressions
-    shadow_evidence_ready = (
-        _v2_shadow_evidence_ready(baseline, candidate) if is_v2 else True
+    shadow_evidence_ready = bool(
+        promotion_contract_active
+        and is_governed
+        and _governed_shadow_evidence_ready(baseline, candidate)
     )
-    screening_pass = candidate_summary["gate_pass"] and (
-        regression_free if not is_v2 else shadow_evidence_ready
+    screening_pass = bool(
+        promotion_contract_active
+        and candidate_summary["gate_pass"]
+        and (shadow_evidence_ready if is_governed else regression_free)
     )
     review_statement = _review_statement(
         suite,
@@ -551,25 +660,23 @@ def build_comparison_report(
         candidate,
         candidate_gate_pass=candidate_summary["gate_pass"],
         candidate_regression_free=regression_free,
+        evaluator_digest=evaluator_digest,
     )
     statement_sha256 = sha256_bytes(canonical_json_bytes(review_statement))
-    if (
-        review_evidence is not None
-        and review_evidence.human.document["statement_sha256"] != statement_sha256
-    ):
-        raise ContractError("adjudication humaine liee a un autre statement")
-    if (
-        review_evidence is not None
-        and review_evidence.independent.document["statement_sha256"] != statement_sha256
-    ):
-        raise ContractError("adjudication independante liee a un autre statement")
+    if review_evidence is not None:
+        review_evidence = reload_review_evidence(
+            review_evidence,
+            statement_sha256=statement_sha256,
+            suite=suite,
+            candidate_sha256=candidate.sha256,
+        )
     evidence_complete = review_evidence is not None
     inputs: dict[str, Any] = {
         "manifest_sha256": suite.manifest_sha256,
         "corpus_sha256": suite.corpus_sha256,
         "baseline_sha256": baseline.sha256,
         "candidate_sha256": candidate.sha256,
-        "evaluator_sha256": evaluator_sha256(),
+        "evaluator_sha256": evaluator_digest,
     }
     comparison: dict[str, Any] = {
         "candidate_gate_pass": candidate_summary["gate_pass"],
@@ -586,10 +693,10 @@ def build_comparison_report(
         "secondary_regressions": secondary_regressions,
     }
     schema_version = REPORT_SCHEMA_VERSION_V1
-    if is_v2:
+    if is_governed:
         if suite.quality_rubric_sha256 is None or suite.safety_policy_sha256 is None:
-            raise AssertionError("suite v2 sans politiques epinglees")
-        schema_version = REPORT_SCHEMA_VERSION
+            raise AssertionError("suite gouvernee sans politiques epinglees")
+        schema_version = REPORT_SCHEMA_VERSION if is_v3 else REPORT_SCHEMA_VERSION_V2
         inputs.update(
             {
                 "quality_rubric_sha256": suite.quality_rubric_sha256,
@@ -600,6 +707,47 @@ def build_comparison_report(
         comparison.pop("candidate_regression_free")
         comparison["lexical_diagnostics_authoritative"] = False
         comparison["shadow_evidence_ready"] = shadow_evidence_ready
+        if is_v3:
+            inputs["candidate_guard_observation_sha256"] = inputs.pop(
+                "guard_observation_sha256"
+            )
+            causal_pair = baseline.causal_pair
+            if causal_pair is None or candidate.causal_pair is None:
+                raise AssertionError("rapport v3 sans causal pair charge")
+            if causal_pair.sha256 != candidate.causal_pair.sha256:
+                raise AssertionError("rapport v3 avec causal pairs divergents")
+            inputs.update(
+                {
+                    "baseline_release_attestation_sha256": (
+                        baseline.document["artifact"]["release_attestation_sha256"]
+                    ),
+                    "candidate_release_attestation_sha256": (
+                        candidate.document["artifact"]["release_attestation_sha256"]
+                    ),
+                    "causal_pair_sha256": causal_pair.sha256,
+                    "baseline_guard_observation_sha256": sha256_bytes(
+                        canonical_json_bytes(
+                            baseline.document["artifact"]["guard_observation"]
+                        )
+                    ),
+                    "baseline_execution_observation_sha256": sha256_bytes(
+                        canonical_json_bytes(
+                            baseline.document["artifact"]["execution_observation"]
+                        )
+                    ),
+                    "candidate_execution_observation_sha256": sha256_bytes(
+                        canonical_json_bytes(
+                            candidate.document["artifact"]["execution_observation"]
+                        )
+                    ),
+                }
+            )
+            comparison.update(
+                {
+                    "causal_pair_sha256": causal_pair.sha256,
+                    "model_output_causality_claimed": False,
+                }
+            )
     promotion: dict[str, Any] = {
         "review_statement_sha256": statement_sha256,
         "eligible_for_adjudication": screening_pass,
@@ -616,9 +764,9 @@ def build_comparison_report(
         ),
         "promoted": False,
         "decision": "not-performed",
-        "rollback_reference": baseline.sha256,
+        "rollback_reference": baseline.sha256 if not is_governed else None,
     }
-    if is_v2:
+    if is_governed:
         rollback_validated = screening_pass and evidence_complete
         promotion.update(
             {
@@ -652,7 +800,7 @@ def build_comparison_report(
         "comparison": comparison,
         "promotion": promotion,
     }
-    if is_v2:
+    if is_governed:
         report["review_statement"] = review_statement
         if (
             sha256_bytes(canonical_json_bytes(report["review_statement"]))
@@ -673,15 +821,20 @@ def _fsync_directory(path: Path) -> None:
 def validate_embedded_review_statement(report: dict[str, Any]) -> None:
     """Revalide l'objet canonique signe avant consommation ou ecriture."""
 
-    if report.get("schema_version") != REPORT_SCHEMA_VERSION:
+    if report.get("schema_version") not in {
+        REPORT_SCHEMA_VERSION_V2,
+        REPORT_SCHEMA_VERSION,
+    }:
         return
     statement = report.get("review_statement")
     promotion = report.get("promotion")
     if type(statement) is not dict or type(promotion) is not dict:
-        raise ContractError("rapport v2 sans statement embarque")
+        raise ContractError("rapport gouverne sans statement embarque")
     expected = promotion.get("review_statement_sha256")
     if expected != sha256_bytes(canonical_json_bytes(statement)):
-        raise ContractError("rapport v2: empreinte du statement embarque invalide")
+        raise ContractError(
+            "rapport gouverne: empreinte du statement embarque invalide"
+        )
 
 
 def write_report_atomic(report: dict[str, Any], output_path: str | Path) -> bool:
@@ -694,11 +847,14 @@ def write_report_atomic(report: dict[str, Any], output_path: str | Path) -> bool
 
     if report.get("schema_version") not in {
         REPORT_SCHEMA_VERSION_V1,
+        REPORT_SCHEMA_VERSION_V2,
         REPORT_SCHEMA_VERSION,
     }:
         raise ContractError("rapport interne: version de schema inattendue")
     validate_embedded_review_statement(report)
     payload = canonical_json_bytes(report) + b"\n"
+    if len(payload) > _MAX_REPORT_BYTES:
+        raise ContractError("rapport canonique hors taille")
     output = Path(output_path).expanduser().absolute()
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():

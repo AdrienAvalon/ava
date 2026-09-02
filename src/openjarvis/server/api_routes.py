@@ -986,15 +986,18 @@ async def websocket_chat_stream(websocket: WebSocket):
             from openjarvis.core.types import Message, Role
             from openjarvis.server.routes import (
                 _RELATIONSHIP_STREAM_BUFFER_BYTES,
-                _apply_relationship_guard,
+                _abort_relationship_generation_events,
+                _apply_relationship_guard_async,
                 _assembled_stream_tool_calls,
                 _bind_relationship_guard,
+                _cancel_relationship_generation_events,
                 _copy_engine_for_relationship_events,
                 _ensure_identity_prompt,
                 _motif_arret,
                 _reject_client_temporal_context_marker,
                 _relationship_request_event_bus,
                 _runtime_completion_limit,
+                _snapshot_relationship_messages,
             )
 
             if "temporal_context" in data:
@@ -1034,19 +1037,25 @@ async def websocket_chat_stream(websocket: WebSocket):
                 relationship_guard,
                 messages,
             )
+            relationship_repair_context = (
+                _snapshot_relationship_messages(messages)
+                if relationship_guard is not None
+                else None
+            )
+            repair_bus = None
             if relationship_guard is not None:
                 event_bus = getattr(websocket.app.state, "bus", None)
                 if event_bus is None:
                     event_bus = getattr(engine, "_bus", None)
-                if event_bus is not None:
-                    request_bus = _relationship_request_event_bus(
-                        event_bus,
-                        relationship_guard,
-                    )
-                    engine = _copy_engine_for_relationship_events(
-                        engine,
-                        request_bus,
-                    )
+                request_bus = _relationship_request_event_bus(
+                    event_bus,
+                    relationship_guard,
+                )
+                repair_bus = request_bus
+                engine = _copy_engine_for_relationship_events(
+                    engine,
+                    request_bus,
+                )
             max_tokens = _runtime_completion_limit(websocket)
 
             # This WS path streams straight from the engine (no agent /
@@ -1112,6 +1121,11 @@ async def websocket_chat_stream(websocket: WebSocket):
                                 {"finish_reason": chunk.finish_reason}
                             )
                     if terminal_reason != "stop" or not full_content.strip():
+                        if relationship_guard is not None:
+                            _abort_relationship_generation_events(repair_bus)
+                            full_content = ""
+                            buffered_content.clear()
+                            tool_call_batches.clear()
                         await websocket.send_json(
                             {"type": "error", "detail": "Chat response incomplete"},
                         )
@@ -1120,10 +1134,34 @@ async def websocket_chat_stream(websocket: WebSocket):
                     relationship_trace_metadata = None
                     if relationship_guard is not None:
                         try:
-                            decision = _apply_relationship_guard(
+                            repair_usage: dict[str, int] = {}
+                            assembled_tool_calls = _assembled_stream_tool_calls(
+                                tool_call_batches
+                            )
+
+                            def clear_rejected_ws_stream() -> None:
+                                nonlocal \
+                                    assembled_tool_calls, \
+                                    effective_content, \
+                                    full_content
+
+                                full_content = ""
+                                effective_content = ""
+                                assembled_tool_calls = []
+                                buffered_content.clear()
+                                tool_call_batches.clear()
+
+                            decision = await _apply_relationship_guard_async(
                                 relationship_guard,
                                 full_content,
-                                _assembled_stream_tool_calls(tool_call_batches),
+                                assembled_tool_calls,
+                                repair_engine=engine,
+                                repair_model=model,
+                                repair_messages=relationship_repair_context,
+                                repair_max_tokens=max_tokens,
+                                repair_usage=repair_usage,
+                                repair_bus=repair_bus,
+                                clear_rejected=clear_rejected_ws_stream,
                             )
                             relationship_trace_metadata = relationship_guard.metadata()
                             if not isinstance(relationship_trace_metadata, dict):
@@ -1131,6 +1169,11 @@ async def websocket_chat_stream(websocket: WebSocket):
                                     "relationship guard metadata is invalid"
                                 )
                         except Exception:
+                            _abort_relationship_generation_events(repair_bus)
+                            full_content = ""
+                            effective_content = ""
+                            buffered_content.clear()
+                            tool_call_batches.clear()
                             logger.warning(
                                 "WebSocket relationship policy failed before emission"
                             )
@@ -1143,10 +1186,13 @@ async def websocket_chat_stream(websocket: WebSocket):
                             continue
                         effective_content = decision.output_text
                         chunks_to_emit = (
-                            [effective_content]
+                            (effective_content,)
                             if decision.action == "replace"
-                            else buffered_content
+                            else tuple(buffered_content)
                         )
+                        full_content = ""
+                        buffered_content.clear()
+                        tool_call_batches.clear()
                         for buffered_content_chunk in chunks_to_emit:
                             await websocket.send_json(
                                 {
@@ -1200,6 +1246,9 @@ async def websocket_chat_stream(websocket: WebSocket):
                             {"type": "chunk", "content": content},
                         )
                     if terminal_reason != "stop" or not content.strip():
+                        if relationship_guard is not None:
+                            _abort_relationship_generation_events(repair_bus)
+                            content = ""
                         await websocket.send_json(
                             {"type": "error", "detail": "Chat response incomplete"},
                         )
@@ -1214,7 +1263,16 @@ async def websocket_chat_stream(websocket: WebSocket):
                                 raise RuntimeError(
                                     "relationship websocket exceeds output buffer"
                                 )
-                            decision = _apply_relationship_guard(
+                            repair_usage: dict[str, int] = {}
+
+                            def clear_rejected_ws_direct() -> None:
+                                nonlocal content, effective_content, result
+
+                                content = ""
+                                effective_content = ""
+                                result = {}
+
+                            decision = await _apply_relationship_guard_async(
                                 relationship_guard,
                                 content,
                                 (
@@ -1222,6 +1280,13 @@ async def websocket_chat_stream(websocket: WebSocket):
                                     if isinstance(result, dict)
                                     else None
                                 ),
+                                repair_engine=engine,
+                                repair_model=model,
+                                repair_messages=relationship_repair_context,
+                                repair_max_tokens=max_tokens,
+                                repair_usage=repair_usage,
+                                repair_bus=repair_bus,
+                                clear_rejected=clear_rejected_ws_direct,
                             )
                             relationship_trace_metadata = relationship_guard.metadata()
                             if not isinstance(relationship_trace_metadata, dict):
@@ -1229,6 +1294,9 @@ async def websocket_chat_stream(websocket: WebSocket):
                                     "relationship guard metadata is invalid"
                                 )
                         except Exception:
+                            _abort_relationship_generation_events(repair_bus)
+                            content = ""
+                            effective_content = ""
                             logger.warning(
                                 "WebSocket relationship policy failed before emission"
                             )
@@ -1240,6 +1308,7 @@ async def websocket_chat_stream(websocket: WebSocket):
                             )
                             continue
                         effective_content = decision.output_text
+                        content = ""
                         await websocket.send_json(
                             {"type": "chunk", "content": effective_content},
                         )
@@ -1258,9 +1327,27 @@ async def websocket_chat_stream(websocket: WebSocket):
                         ),
                         metadata=relationship_trace_metadata,
                     )
-            except WebSocketDisconnect:
+            except (WebSocketDisconnect, asyncio.CancelledError):
+                if relationship_guard is not None:
+                    _cancel_relationship_generation_events(repair_bus)
+                    full_content = ""
+                    content = ""
+                    effective_content = ""
+                    if "buffered_content" in locals():
+                        buffered_content.clear()
+                    if "tool_call_batches" in locals():
+                        tool_call_batches.clear()
                 raise
             except Exception as exc:
+                if relationship_guard is not None:
+                    _abort_relationship_generation_events(repair_bus)
+                    full_content = ""
+                    content = ""
+                    effective_content = ""
+                    if "buffered_content" in locals():
+                        buffered_content.clear()
+                    if "tool_call_batches" in locals():
+                        tool_call_batches.clear()
                 logger.warning(
                     "WebSocket chat generation failed (%s)",
                     type(exc).__name__,
@@ -1268,6 +1355,8 @@ async def websocket_chat_stream(websocket: WebSocket):
                 await websocket.send_json(
                     {"type": "error", "detail": "Chat generation failed"},
                 )
+    except asyncio.CancelledError:
+        raise
     except WebSocketDisconnect:
         pass  # Client disconnected — nothing to clean up
 

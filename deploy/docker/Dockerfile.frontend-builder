@@ -1,0 +1,65 @@
+# Builder reproductible du frontend statique Ava.
+#
+# Le contexte est exclusivement une extraction de `git archive` du commit livre.
+# Cette recette ne copie que le sous-arbre frontend/ : aucun fichier local, secret
+# operateur ou metadata .git ne peut influencer le bundle.
+FROM node:22.23.0-slim@sha256:d9f850096136edbc402debdd8729579a288aac64574ada0ff4db26b6ae58b0b2 AS builder
+
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+WORKDIR /build
+
+# Installer exactement le lock avant de copier les sources. `env -i` supprime les
+# VITE_*, proxies et secrets eventuellement injectes comme build args implicites.
+COPY frontend/package.json frontend/package-lock.json frontend/
+RUN mkdir -p /tmp/ava-npm-home /tmp/ava-npm-cache && \
+    env -i \
+      HOME=/tmp/ava-npm-home \
+      PATH=/usr/local/bin:/usr/bin:/bin \
+      LC_ALL=C \
+      TZ=UTC \
+      SOURCE_DATE_EPOCH=0 \
+      NPM_CONFIG_AUDIT=false \
+      NPM_CONFIG_CACHE=/tmp/ava-npm-cache \
+      NPM_CONFIG_FUND=false \
+      NPM_CONFIG_UPDATE_NOTIFIER=false \
+      NPM_CONFIG_USERCONFIG=/dev/null \
+      npm ci --prefix frontend --ignore-scripts --no-audit --no-fund
+
+COPY frontend/ frontend/
+
+RUN --network=none env -i \
+      HOME=/tmp/ava-npm-home \
+      PATH=/usr/local/bin:/usr/bin:/bin \
+      LC_ALL=C \
+      TZ=UTC \
+      SOURCE_DATE_EPOCH=0 \
+      NODE_ENV=production \
+      NPM_CONFIG_AUDIT=false \
+      NPM_CONFIG_CACHE=/tmp/ava-npm-cache \
+      NPM_CONFIG_FUND=false \
+      NPM_CONFIG_UPDATE_NOTIFIER=false \
+      NPM_CONFIG_USERCONFIG=/dev/null \
+      npm --prefix frontend run build
+
+RUN static_root=/build/src/openjarvis/server/static; \
+    test -s "$static_root/index.html"; \
+    ! find "$static_root" -xdev \( -type l -o ! -type d ! -type f \) -print -quit | grep -q .; \
+    find "$static_root" -xdev -type d -exec chmod 0755 -- {} +; \
+    find "$static_root" -xdev -type f -exec chmod 0644 -- {} +; \
+    mkdir -p /out; \
+    cd "$static_root"; \
+    find . -mindepth 1 -printf '%P\0' | LC_ALL=C sort -z \
+      | tar --create --file /out/frontend-static.tar \
+          --null --no-recursion -T - \
+          --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+          --format=ustar --mode='a=rX,u+w'
+
+RUN node_version="$(node --version)"; \
+    test "$node_version" = v22.23.0; \
+    npm_version="$(npm --version)"; \
+    test "$npm_version" = 10.9.8; \
+    printf '{"node_version":"%s","npm_version":"%s"}\n' \
+      "${node_version#v}" "$npm_version" > /out/frontend-toolchain.json
+
+FROM scratch AS artifact
+COPY --from=builder /out/ /

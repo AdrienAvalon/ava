@@ -62,14 +62,13 @@ def _repopulate_registries() -> None:
     )
 
     if not AgentRegistry.keys():
-        for mod_name in list(sys.modules):
-            if mod_name.startswith("openjarvis.agents.") and not mod_name.endswith(
-                "_stubs"
-            ):
-                try:
-                    importlib.reload(sys.modules[mod_name])
-                except Exception:
-                    pass
+        # Re-register the already imported default class instead of reloading
+        # every agent module. Reloading replaces class identities process-wide
+        # and makes later security checks compare a configured agent with a
+        # different `OrchestratorAgent` object.
+        from openjarvis.agents.orchestrator import OrchestratorAgent
+
+        AgentRegistry.register_value("orchestrator", OrchestratorAgent)
 
     if not ToolRegistry.keys():
         for mod_name in list(sys.modules):

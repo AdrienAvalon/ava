@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ava:relationship:quality-rubric:v2",
+  "title": "Rubrique semantique relationnelle Ava v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "rubric_id",
+    "corpus",
+    "provenance",
+    "decision_policy",
+    "semantic_global_checks",
+    "semantic_case_checks"
+  ],
+  "properties": {
+    "schema_version": {"const": "ava.relationship.quality-rubric/v2"},
+    "rubric_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._:-]{2,127}$"},
+    "corpus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "minLength": 1}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authoring_method",
+        "new_candidate_response_access",
+        "owner_reviewed",
+        "contains_personal_data",
+        "contains_production_conversations"
+      ],
+      "properties": {
+        "authoring_method": {"const": "model-assisted-curated-synthetic-requirements-before-new-candidate"},
+        "new_candidate_response_access": {"const": false},
+        "owner_reviewed": {"const": false},
+        "contains_personal_data": {"const": false},
+        "contains_production_conversations": {"const": false}
+      }
+    },
+    "decision_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lexical_diagnostics_authoritative",
+        "all_required_checks_must_pass",
+        "abstain_is_fail",
+        "required_reviewer_kinds"
+      ],
+      "properties": {
+        "lexical_diagnostics_authoritative": {"const": false},
+        "all_required_checks_must_pass": {"const": true},
+        "abstain_is_fail": {"const": true},
+        "required_reviewer_kinds": {
+          "const": ["human", "independent"]
+        }
+      }
+    },
+    "semantic_global_checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/globalCheck"}
+    },
+    "semantic_case_checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["case_id", "check_groups"],
+        "properties": {
+          "case_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{2,95}$"},
+          "check_groups": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["provenance", "checks"],
+              "properties": {
+                "provenance": {"$ref": "#/$defs/authoringProvenance"},
+                "checks": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {"$ref": "#/$defs/check"}
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "authoringProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authoring_class",
+        "authored_before_new_candidate",
+        "new_candidate_response_access",
+        "predecessor_raw_response_access",
+        "predecessor_diagnostics_access",
+        "content_modified_after_predecessor",
+        "owner_reviewed",
+        "contains_personal_data",
+        "contains_production_conversations"
+      ],
+      "properties": {
+        "authoring_class": {
+          "enum": ["inherited_v1_6_1", "predecessor_diagnostics_only", "sealed_holdout_v17"]
+        },
+        "authored_before_new_candidate": {"const": true},
+        "new_candidate_response_access": {"const": false},
+        "predecessor_raw_response_access": {"type": ["boolean", "null"]},
+        "predecessor_diagnostics_access": {"type": ["boolean", "null"]},
+        "content_modified_after_predecessor": {"type": "boolean"},
+        "owner_reviewed": {"const": false},
+        "contains_personal_data": {"const": false},
+        "contains_production_conversations": {"const": false}
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "authoring_class": {"const": "inherited_v1_6_1"},
+            "predecessor_raw_response_access": {"const": null},
+            "predecessor_diagnostics_access": {"const": null},
+            "content_modified_after_predecessor": {"const": false}
+          }
+        },
+        {
+          "properties": {
+            "authoring_class": {"const": "predecessor_diagnostics_only"},
+            "predecessor_raw_response_access": {"const": false},
+            "predecessor_diagnostics_access": {"const": true},
+            "content_modified_after_predecessor": {"const": true}
+          }
+        },
+        {
+          "properties": {
+            "authoring_class": {"const": "sealed_holdout_v17"},
+            "predecessor_raw_response_access": {"const": false},
+            "predecessor_diagnostics_access": {"const": false},
+            "content_modified_after_predecessor": {"const": true}
+          }
+        }
+      ]
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "dimension", "requirement"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._:-]{2,127}$"},
+        "dimension": {"enum": ["warmth", "wit", "continuity", "accuracy"]},
+        "requirement": {"type": "string", "minLength": 1}
+      }
+    },
+    "globalCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "dimension", "requirement", "provenance"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._:-]{2,127}$"},
+        "dimension": {"enum": ["warmth", "wit", "continuity", "accuracy"]},
+        "requirement": {"type": "string", "minLength": 1},
+        "provenance": {"$ref": "#/$defs/authoringProvenance"}
+      }
+    }
+  }
+}

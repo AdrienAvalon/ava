@@ -13,7 +13,6 @@ import argparse
 import asyncio
 import base64
 import importlib
-import ipaddress
 import json
 import logging
 import os
@@ -29,7 +28,6 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urlsplit
 
 from ava_extensions.identity.relationship_safety import (
     RELATIONSHIP_TEXT_SAFETY_POLICY_ID,
@@ -38,18 +36,41 @@ from ava_extensions.identity.relationship_safety import (
 
 from .contracts import (
     RESPONSES_SCHEMA_VERSION,
+    ContractError,
+    LoadedCausalShadowBinding,
     LoadedReleaseAttestation,
     LoadedSuite,
     canonical_json_bytes,
-    load_release_attestation,
+    load_causal_shadow_binding,
     load_response_bundle,
     load_suite,
+    reload_causal_shadow_binding,
     sha256_bytes,
 )
 from .evaluator import EXPECTED_RELATIONSHIP_PROFILE_ID
+from .release_attestation import (
+    _DEPLOYED_CONFIG_PATH,
+    _parse_release_manifest,
+    _python_runtime_evidence,
+    _source_archive_map,
+    _strict_regular_bytes,
+    _verify_installed_source_tree,
+)
+from .release_attestation import (
+    _configured_anthropic_engine as _configured_anthropic_config,
+)
+from .release_attestation import (
+    _current_target as _authoritative_current_target,
+)
 
-DEFAULT_MANIFEST = Path(__file__).with_name("data") / "manifest.v2.json"
-GENERATED_BY = "ava-relationship-shadow-runner-v2"
+DEFAULT_MANIFEST = Path(__file__).with_name("data") / "manifest.v3.json"
+GENERATED_BY = "ava-relationship-shadow-runner-v3"
+
+_MODULE_PATH = Path(__file__).absolute()
+_MODULE_RELATIVE_PATH = Path("ava_extensions/evals/relationship/shadow_runner.py")
+_CLOUD_MODULE_RELATIVE_PATH = Path("src/openjarvis/engine/cloud.py")
+_MAX_MODULE_BYTES = 4 * 1024 * 1024
+_MAX_SOURCE_ARCHIVE_BYTES = 512 * 1024 * 1024
 
 _RUNTIME_OWNER = "matrix:@synthetic-owner:eval.invalid"
 _RUNTIME_GUEST = "matrix:@synthetic-guest:eval.invalid"
@@ -76,7 +97,7 @@ _UNEXPECTED_PERSONAL_OUTPUT = (
     ),
 )
 _RUN_LOCK = threading.Lock()
-_EXECUTION_MODES = ("attested", "loopback", "configured-anthropic")
+_EXECUTION_MODE = "configured-anthropic"
 
 
 class ShadowRunError(RuntimeError):
@@ -85,6 +106,245 @@ class ShadowRunError(RuntimeError):
 
 class ShadowArtifactConflictError(ShadowRunError):
     """The immutable output path already exists."""
+
+
+def _assert_isolated_interpreter() -> None:
+    """Reject ambient import and environment injection before any shadow work."""
+
+    if (
+        sys.flags.isolated != 1
+        or sys.flags.no_site != 1
+        or sys.flags.ignore_environment != 1
+        or not sys.flags.safe_path
+    ):
+        raise ShadowRunError("relationship shadow requires python -I -S")
+    if os.geteuid() == 0:
+        raise ShadowRunError("relationship shadow must not execute as root")
+
+
+def _verify_release_execution_binding(
+    release_attestation: LoadedReleaseAttestation,
+) -> None:
+    """Bind the loaded code and interpreter to the externally attested release."""
+
+    release = release_attestation.document["release"]
+    git_sha = release["git_sha"]
+    module_path = _MODULE_PATH.expanduser().absolute()
+    try:
+        resolved_module = module_path.resolve(strict=True)
+    except OSError as exc:
+        raise ShadowRunError("shadow runner module is unavailable") from exc
+    if resolved_module != module_path:
+        raise ShadowRunError("shadow runner module is linked or indirect")
+    if module_path.parts[-len(_MODULE_RELATIVE_PATH.parts) :] != (
+        _MODULE_RELATIVE_PATH.parts
+    ):
+        raise ShadowRunError("shadow runner module path is not canonical")
+    release_root = module_path.parents[len(_MODULE_RELATIVE_PATH.parts) - 1]
+    expected_module = release_root / _MODULE_RELATIVE_PATH
+    if module_path != expected_module:
+        raise ShadowRunError("shadow runner module differs from release root")
+    try:
+        resolved_root = release_root.resolve(strict=True)
+    except OSError as exc:
+        raise ShadowRunError("shadow runner release root is unavailable") from exc
+    if resolved_root != release_root or not release_root.is_dir():
+        raise ShadowRunError("shadow runner release root is linked or indirect")
+    if release_root.name != git_sha:
+        raise ShadowRunError("shadow runner release root differs from attestation")
+    try:
+        _strict_regular_bytes(module_path, max_bytes=_MAX_MODULE_BYTES)
+    except ContractError as exc:
+        raise ShadowRunError(
+            "shadow runner module is not a strict release file"
+        ) from exc
+
+    expected_interpreter = release_root / ".venv" / "bin" / "python"
+    executable = Path(sys.executable).expanduser().absolute()
+    try:
+        interpreter_parent = expected_interpreter.parent.resolve(strict=True)
+        interpreter_target = expected_interpreter.resolve(strict=True)
+        executable_target = executable.resolve(strict=True)
+    except OSError as exc:
+        raise ShadowRunError("shadow runner interpreter is unavailable") from exc
+    if interpreter_parent != expected_interpreter.parent:
+        raise ShadowRunError("shadow runner interpreter path is linked or indirect")
+    if (
+        executable_target != interpreter_target
+        or not interpreter_target.is_file()
+        or not os.access(expected_interpreter, os.X_OK)
+    ):
+        raise ShadowRunError("shadow runner interpreter is not executable")
+
+    ready_path = release_root / ".ava-ready"
+    manifest_path = release_root / ".ava-release"
+    try:
+        ready_payload = _strict_regular_bytes(ready_path, max_bytes=1024)
+        manifest_payload = _strict_regular_bytes(manifest_path, max_bytes=8 * 1024)
+        manifest = _parse_release_manifest(manifest_payload)
+    except ContractError as exc:
+        raise ShadowRunError("shadow runner release markers are invalid") from exc
+    if ready_payload != f"{git_sha}\n".encode("ascii"):
+        raise ShadowRunError("shadow runner readiness marker differs from attestation")
+    if manifest["git_sha"] != git_sha:
+        raise ShadowRunError("shadow runner release manifest differs from attestation")
+    if (
+        sha256_bytes(manifest_payload)
+        != release_attestation.document["artifact"]["manifest_sha256"]
+    ):
+        raise ShadowRunError("shadow runner release manifest digest differs")
+    source_archive_path = release_root / ".ava-artifacts" / "source-tree.tar"
+    try:
+        source_archive_payload = _strict_regular_bytes(
+            source_archive_path, max_bytes=_MAX_SOURCE_ARCHIVE_BYTES
+        )
+        artifact = release_attestation.document["artifact"]
+        if sha256_bytes(source_archive_payload) != artifact["source_tree_sha256"]:
+            raise ShadowRunError("shadow runner source archive digest differs")
+        source_entries, source_contents = _source_archive_map(source_archive_payload)
+        source_map_sha256 = sha256_bytes(canonical_json_bytes(source_entries))
+        if (
+            source_map_sha256 != artifact["source_archive_map_sha256"]
+            or _verify_installed_source_tree(
+                release_root, source_entries, source_contents
+            )
+            != source_map_sha256
+        ):
+            raise ShadowRunError("shadow runner installed source tree differs")
+        runtime = _python_runtime_evidence(release_root, source_contents)
+        if runtime != artifact["python_runtime"]:
+            raise ShadowRunError("shadow runner Python runtime differs")
+        _verify_critical_runtime_imports(release_root, runtime)
+    except ContractError as exc:
+        raise ShadowRunError("shadow runner source tree is invalid") from exc
+
+    if (
+        _MODULE_PATH.expanduser().absolute() != module_path
+        or module_path.resolve(strict=True) != resolved_module
+        or release_root.resolve(strict=True) != resolved_root
+        or Path(sys.executable).expanduser().absolute() != executable
+    ):
+        raise ShadowRunError(
+            "shadow runner execution identity changed during preflight"
+        )
+
+
+def _verify_critical_runtime_imports(
+    release_root: Path,
+    runtime: dict[str, Any],
+) -> None:
+    """Bind imported SDK and signature code to the attested site-packages map."""
+
+    site_root = release_root / runtime["site_packages_path"]
+    for module_name, expected in runtime["critical_imports"].items():
+        try:
+            module = importlib.import_module(module_name)
+            module_file = Path(module.__file__).expanduser().absolute()
+            expected_file = site_root / expected["path"]
+            module_spec = module.__spec__
+            spec_origin = Path(module_spec.origin).expanduser().absolute()
+            payload = _strict_regular_bytes(
+                expected_file,
+                max_bytes=_MAX_MODULE_BYTES,
+            )
+        except Exception as exc:
+            raise ShadowRunError(
+                f"critical runtime import {module_name} is unavailable"
+            ) from exc
+        if (
+            module_file != expected_file
+            or spec_origin != expected_file
+            or sha256_bytes(payload) != expected["sha256"]
+        ):
+            raise ShadowRunError(
+                f"critical runtime import {module_name} differs from attestation"
+            )
+
+
+def _current_release_git_sha() -> str:
+    try:
+        target = _authoritative_current_target()
+        manifest_payload = _strict_regular_bytes(
+            target / ".ava-release", max_bytes=8 * 1024
+        )
+        manifest = _parse_release_manifest(manifest_payload)
+    except (OSError, ContractError) as exc:
+        raise ShadowRunError("current release pointer is invalid") from exc
+    if target.name != manifest["git_sha"]:
+        raise ShadowRunError("current release pointer is non-canonical")
+    return manifest["git_sha"]
+
+
+def _verify_binding_deployment_state(binding: LoadedCausalShadowBinding) -> str:
+    current_git_sha = _current_release_git_sha()
+    candidate_git_sha = binding.causal_pair.document["candidate"]["git_sha"]
+    if current_git_sha != candidate_git_sha:
+        raise ShadowRunError("current release differs from causal candidate")
+    if binding.role == "candidate" and binding.release_git_sha != current_git_sha:
+        raise ShadowRunError("candidate binding is not active_current")
+    if binding.role == "baseline" and binding.release_git_sha == current_git_sha:
+        raise ShadowRunError("baseline binding is not prepared_noncurrent")
+    return current_git_sha
+
+
+def _verify_deployed_anthropic_config(
+    release_attestation: LoadedReleaseAttestation,
+) -> bytes:
+    try:
+        payload = _strict_regular_bytes(_DEPLOYED_CONFIG_PATH, max_bytes=1024 * 1024)
+        provider, model, adapter = _configured_anthropic_config(payload)
+    except ContractError as exc:
+        raise ShadowRunError("deployed Anthropic config is invalid") from exc
+    engine = release_attestation.document["engine"]
+    if (
+        sha256_bytes(payload) != engine["config_sha256"]
+        or provider != engine["provider"]
+        or model != engine["model"]
+        or adapter != engine["adapter"]
+    ):
+        raise ShadowRunError("deployed Anthropic config differs from attestation")
+    return payload
+
+
+@contextmanager
+def _verified_relationship_shadow_scope(
+    binding: LoadedCausalShadowBinding,
+) -> Iterator[None]:
+    try:
+        module = importlib.import_module(
+            "ava_extensions.identity.relationship_guard_treatment"
+        )
+        scope = getattr(module, "verified_relationship_shadow_scope", None)
+        if not callable(scope):
+            raise ShadowRunError("verified relationship shadow scope is unavailable")
+        manager = scope(binding)
+        with manager:
+            yield
+    except ShadowRunError:
+        raise
+    except Exception as exc:
+        raise ShadowRunError("verified relationship shadow scope failed") from exc
+
+
+def _bind_verified_relationship_shadow_task() -> None:
+    """Bind the already-verified scope to this coroutine before its first await."""
+
+    try:
+        module = importlib.import_module(
+            "ava_extensions.identity.relationship_guard_treatment"
+        )
+        binder = getattr(module, "_bind_verified_relationship_shadow_task", None)
+        if not callable(binder):
+            raise ShadowRunError(
+                "verified relationship shadow task binder is unavailable"
+            )
+        binder()
+    except ShadowRunError:
+        raise
+    except Exception as exc:
+        raise ShadowRunError(
+            "verified relationship shadow task binding failed"
+        ) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,17 +362,10 @@ class ShadowRunResult:
 
 @dataclass(frozen=True, slots=True)
 class _ObservedCall:
-    messages: tuple[tuple[str, str], ...]
+    system_prompt: str
     model: str
     temperature: float
     max_tokens: int
-
-    @property
-    def system_prompt(self) -> str:
-        system = [content for role, content in self.messages if role == "system"]
-        if len(system) != 1:
-            raise ShadowRunError("shadow request did not contain one server prompt")
-        return system[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,17 +376,24 @@ class _ObservedGuardAction:
     policy_id: str
     policy_version: str
     policy_sha256: str
-    output_sha256: str
+    replacement_id: str | None
+    repair_attempted: bool
+    repair_attempts: int
+    repair_outcome: str
+    repair_gate_ids: tuple[str, ...]
 
 
 class _RelationshipGuardObserver:
-    """Observe le vrai garde sans conserver le texte inspecte."""
+    """Observe prepare/begin/finish sans conserver de candidat rejete."""
 
     def __init__(self) -> None:
         self.current_case_id: str | None = None
         self.prepare_case_ids: list[str] = []
+        self.begin_case_ids: list[str] = []
+        self.finish_case_ids: list[str] = []
         self.actions: list[_ObservedGuardAction] = []
         self.prepared_policies: list[tuple[str, str, str]] = []
+        self._terminal_outputs: dict[str, str] = {}
 
     def begin_case(self, case_id: str) -> None:
         if self.current_case_id is not None:
@@ -160,15 +420,22 @@ class _RelationshipGuardObserver:
             raise ShadowRunError("relationship guard policy metadata is incomplete")
         self.prepared_policies.append((policy_id, policy_version, policy_sha256))
 
-    def observe_apply(self, decision: Any) -> None:
+    def _observe_terminal(self, decision: Any) -> None:
         if self.current_case_id is None:
-            raise ShadowRunError("relationship guard apply outside corpus case")
+            raise ShadowRunError("relationship guard terminal outside corpus case")
+        if any(action.case_id == self.current_case_id for action in self.actions):
+            raise ShadowRunError("relationship guard terminal duplique")
         action = getattr(decision, "action", None)
         gate_ids = getattr(decision, "gate_ids", None)
         policy_id = getattr(decision, "policy_id", None)
         policy_version = getattr(decision, "policy_version", None)
         policy_sha256 = getattr(decision, "policy_sha256", None)
         output_text = getattr(decision, "output_text", None)
+        replacement_id = getattr(decision, "replacement_id", None)
+        repair_attempted = getattr(decision, "repair_attempted", None)
+        repair_attempts = getattr(decision, "repair_attempts", None)
+        repair_outcome = getattr(decision, "repair_outcome", None)
+        repair_gate_ids = getattr(decision, "repair_gate_ids", None)
         if action not in {"allow", "replace"}:
             raise ShadowRunError("relationship guard returned an invalid action")
         if type(gate_ids) is not tuple or not all(
@@ -182,63 +449,115 @@ class _RelationshipGuardObserver:
             for value in (policy_id, policy_version, policy_sha256, output_text)
         ):
             raise ShadowRunError("relationship guard decision metadata is incomplete")
+        if replacement_id is not None and not isinstance(replacement_id, str):
+            raise ShadowRunError("relationship guard replacement id is invalid")
+        if type(repair_attempted) is not bool or repair_attempts not in {0, 1}:
+            raise ShadowRunError("relationship guard repair count is invalid")
+        if not isinstance(repair_outcome, str) or type(repair_gate_ids) is not tuple:
+            raise ShadowRunError("relationship guard repair metadata is invalid")
+        if not all(isinstance(gate_id, str) and gate_id for gate_id in repair_gate_ids):
+            raise ShadowRunError("relationship guard repair gates are invalid")
+        self._terminal_outputs[self.current_case_id] = output_text
         self.actions.append(
             _ObservedGuardAction(
                 case_id=self.current_case_id,
-                action="pass" if action == "allow" else "replace",
+                action=action,
                 gate_ids=gate_ids,
                 policy_id=policy_id,
                 policy_version=policy_version,
                 policy_sha256=policy_sha256,
-                output_sha256=sha256_bytes(output_text.encode("utf-8")),
+                replacement_id=replacement_id,
+                repair_attempted=repair_attempted,
+                repair_attempts=repair_attempts,
+                repair_outcome=repair_outcome,
+                repair_gate_ids=repair_gate_ids,
             )
         )
+
+    def observe_begin(self, result: Any) -> None:
+        if self.current_case_id is None:
+            raise ShadowRunError("relationship guard begin outside corpus case")
+        self.begin_case_ids.append(self.current_case_id)
+        if getattr(result, "action", None) in {"allow", "replace"}:
+            self._observe_terminal(result)
+
+    def observe_finish(self, decision: Any) -> None:
+        if self.current_case_id is None:
+            raise ShadowRunError("relationship guard finish outside corpus case")
+        self.finish_case_ids.append(self.current_case_id)
+        self._observe_terminal(decision)
 
     def finish_case(self, response_text: str) -> None:
         if self.current_case_id is None:
             raise ShadowRunError("relationship guard observer has no active case")
+        case_id = self.current_case_id
         current_actions = [
-            action for action in self.actions if action.case_id == self.current_case_id
+            action for action in self.actions if action.case_id == case_id
         ]
         if len(current_actions) > 1:
             raise ShadowRunError("relationship guard applied more than once per case")
-        if current_actions and current_actions[0].output_sha256 != sha256_bytes(
-            response_text.encode("utf-8")
-        ):
+        terminal_output = self._terminal_outputs.pop(case_id, None)
+        if current_actions and terminal_output != response_text:
             raise ShadowRunError("relationship guard output differs from HTTP response")
         self.current_case_id = None
+
+    def repair_calls_for_case(self, case_id: str) -> int:
+        actions = [action for action in self.actions if action.case_id == case_id]
+        if not actions:
+            return 0
+        return actions[0].repair_attempts
 
     def document(
         self,
         *,
         suite: LoadedSuite,
         role: Literal["baseline", "candidate"],
+        treatment: str,
     ) -> dict[str, Any]:
         if self.current_case_id is not None:
             raise ShadowRunError("relationship guard observer ended inside a case")
         if role == "baseline":
-            if self.prepare_case_ids or self.actions:
+            if (
+                self.prepare_case_ids
+                or self.begin_case_ids
+                or self.finish_case_ids
+                or self.actions
+            ):
                 raise ShadowRunError("baseline release invoked relationship guard")
             return {
-                "schema_version": "ava.relationship.guard-observation/v2",
+                "schema_version": "ava.relationship.guard-observation/v3",
+                "treatment": treatment,
                 "active": False,
                 "policy_id": None,
                 "policy_sha256": None,
                 "expected_prepare_calls": 0,
                 "observed_prepare_calls": 0,
-                "expected_apply_calls": 0,
-                "observed_apply_calls": 0,
+                "expected_begin_calls": 0,
+                "observed_begin_calls": 0,
+                "observed_finish_calls": 0,
+                "observed_repair_calls": 0,
                 "actions": [],
             }
 
         expected_case_ids = [case["id"] for case in suite.corpus["cases"]]
-        expected_apply_ids = [
+        expected_begin_ids = [
             case["id"] for case in suite.corpus["cases"] if _relationship_allowed(case)
         ]
         if self.prepare_case_ids != expected_case_ids:
             raise ShadowRunError("candidate guard prepare coverage is incomplete")
-        if [action.case_id for action in self.actions] != expected_apply_ids:
+        if self.begin_case_ids != expected_begin_ids:
+            raise ShadowRunError("candidate guard begin coverage is incomplete")
+        if [action.case_id for action in self.actions] != expected_begin_ids:
             raise ShadowRunError("candidate guard apply coverage is incomplete")
+        repair_count = sum(action.repair_attempts for action in self.actions)
+        repair_case_ids = [
+            action.case_id for action in self.actions if action.repair_attempted
+        ]
+        if (
+            self.finish_case_ids != repair_case_ids
+            or len(self.finish_case_ids) != repair_count
+        ):
+            raise ShadowRunError("candidate guard finish coverage is invalid")
         expected_policy = (
             RELATIONSHIP_TEXT_SAFETY_POLICY_ID,
             RELATIONSHIP_TEXT_SAFETY_POLICY_VERSION,
@@ -256,19 +575,27 @@ class _RelationshipGuardObserver:
         ):
             raise ShadowRunError("candidate guard policy metadata diverges")
         return {
-            "schema_version": "ava.relationship.guard-observation/v2",
+            "schema_version": "ava.relationship.guard-observation/v3",
+            "treatment": treatment,
             "active": True,
             "policy_id": RELATIONSHIP_TEXT_SAFETY_POLICY_ID,
             "policy_sha256": suite.safety_policy_sha256,
             "expected_prepare_calls": len(expected_case_ids),
             "observed_prepare_calls": len(self.prepare_case_ids),
-            "expected_apply_calls": len(expected_apply_ids),
-            "observed_apply_calls": len(self.actions),
+            "expected_begin_calls": len(expected_begin_ids),
+            "observed_begin_calls": len(self.begin_case_ids),
+            "observed_finish_calls": len(self.finish_case_ids),
+            "observed_repair_calls": repair_count,
             "actions": [
                 {
                     "case_id": action.case_id,
                     "action": action.action,
                     "gate_ids": list(action.gate_ids),
+                    "replacement_id": action.replacement_id,
+                    "repair_attempted": action.repair_attempted,
+                    "repair_attempts": action.repair_attempts,
+                    "repair_outcome": action.repair_outcome,
+                    "repair_gate_ids": list(action.repair_gate_ids),
                 }
                 for action in self.actions
             ],
@@ -299,8 +626,13 @@ def _observe_runtime_relationship_guard(
 
     original_prepare = getattr(guard_module, "prepare_relationship_guard", None)
     guard_class = getattr(guard_module, "RelationshipOutputGuard", None)
-    original_apply = getattr(guard_class, "apply", None)
-    if not callable(original_prepare) or not callable(original_apply):
+    original_begin = getattr(guard_class, "_begin_bounded_repair", None)
+    original_finish = getattr(guard_class, "_finish_bounded_repair", None)
+    if (
+        not callable(original_prepare)
+        or not callable(original_begin)
+        or not callable(original_finish)
+    ):
         yield observer
         return
 
@@ -309,14 +641,20 @@ def _observe_runtime_relationship_guard(
         observer.observe_prepare(guard)
         return guard
 
-    def observed_apply(guard: Any, *args: Any, **kwargs: Any) -> Any:
-        decision = original_apply(guard, *args, **kwargs)
-        observer.observe_apply(decision)
+    def observed_begin(guard: Any, *args: Any, **kwargs: Any) -> Any:
+        result = original_begin(guard, *args, **kwargs)
+        observer.observe_begin(result)
+        return result
+
+    def observed_finish(guard: Any, *args: Any, **kwargs: Any) -> Any:
+        decision = original_finish(guard, *args, **kwargs)
+        observer.observe_finish(decision)
         return decision
 
     route_prepare = getattr(routes, "prepare_relationship_guard", None)
     setattr(guard_module, "prepare_relationship_guard", observed_prepare)
-    setattr(guard_class, "apply", observed_apply)
+    setattr(guard_class, "_begin_bounded_repair", observed_begin)
+    setattr(guard_class, "_finish_bounded_repair", observed_finish)
     if route_prepare is original_prepare:
         setattr(routes, "prepare_relationship_guard", observed_prepare)
     try:
@@ -324,7 +662,8 @@ def _observe_runtime_relationship_guard(
     finally:
         if route_prepare is original_prepare:
             setattr(routes, "prepare_relationship_guard", route_prepare)
-        setattr(guard_class, "apply", original_apply)
+        setattr(guard_class, "_finish_bounded_repair", original_finish)
+        setattr(guard_class, "_begin_bounded_repair", original_begin)
         setattr(guard_module, "prepare_relationship_guard", original_prepare)
 
 
@@ -382,6 +721,8 @@ class _ObservedEngine:
         max_tokens: int = 1024,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        if model != self._expected_model:
+            raise ShadowRunError("shadow requested a non-attested model")
         if "tools" in kwargs:
             raise ShadowRunError("tools reached the relationship shadow engine")
         if temperature != 0.0:
@@ -389,7 +730,7 @@ class _ObservedEngine:
         if not 1 <= max_tokens <= _MAX_GENERATION_TOKENS:
             raise ShadowRunError("relationship shadow token bound was exceeded")
 
-        frozen_messages = tuple(
+        message_roles_and_content = tuple(
             (
                 str(
                     getattr(
@@ -402,10 +743,15 @@ class _ObservedEngine:
             )
             for message in messages
         )
+        system_prompts = [
+            content for role, content in message_roles_and_content if role == "system"
+        ]
+        if len(system_prompts) != 1:
+            raise ShadowRunError("shadow request did not contain one server prompt")
         with self._lock:
             self.calls.append(
                 _ObservedCall(
-                    messages=frozen_messages,
+                    system_prompt=system_prompts[0],
                     model=model,
                     temperature=temperature,
                     max_tokens=max_tokens,
@@ -568,8 +914,9 @@ def _publish_bundle(
     document: dict[str, Any],
     suite: LoadedSuite,
     *,
-    role: Literal["baseline", "candidate"],
+    binding: LoadedCausalShadowBinding,
 ) -> tuple[Path, str]:
+    role = binding.role
     parent = _preflight_output_directory(output_directory)
     payload = canonical_json_bytes(document) + b"\n"
     if len(payload) > _MAX_OUTPUT_BYTES:
@@ -594,7 +941,18 @@ def _publish_bundle(
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = -1
-        load_response_bundle(temporary, suite, expected_role=role)
+        load_response_bundle(
+            temporary,
+            suite,
+            expected_role=role,
+            expected_sha256=bundle_sha256,
+            release_attestation_path=binding.release_attestation.path,
+            release_attestation_sha256=binding.release_attestation.sha256,
+            peer_release_attestation_path=binding.peer_release_attestation.path,
+            peer_release_attestation_sha256=binding.peer_release_attestation.sha256,
+            causal_pair_path=binding.causal_pair.path,
+            causal_pair_sha256=binding.causal_pair.sha256,
+        )
         try:
             os.link(temporary, output_path, follow_symlinks=False)
         except FileExistsError as exc:
@@ -699,8 +1057,11 @@ def _visible_memory_claims(
     allowed = set(case["policy"]["allowed_memory_claim_ids"])
     if not allowed:
         return []
+    lexical_secondary = case.get("lexical_secondary")
+    if type(lexical_secondary) is not dict:
+        raise ShadowRunError("v3 corpus case lacks lexical diagnostics")
     anchors = [
-        _normalise_for_match(item) for item in case["secondary"]["accuracy_all_of"]
+        _normalise_for_match(item) for item in lexical_secondary["accuracy_all_of"]
     ]
     normalised_response = _normalise_for_match(response_text)
     if not anchors or not all(anchor in normalised_response for anchor in anchors):
@@ -1024,6 +1385,7 @@ async def _run_http_suite(
     model: str,
     oidc_fixture: _OIDCFixture,
     role: Literal["baseline", "candidate"],
+    treatment: str,
     routes: Any,
 ) -> tuple[
     list[dict[str, Any]],
@@ -1032,6 +1394,9 @@ async def _run_http_suite(
     str,
     dict[str, Any],
 ]:
+    # This must remain the coroutine's first instruction: while the surrounding
+    # synchronous scope is unbound, no child task is allowed to claim it.
+    _bind_verified_relationship_shadow_task()
     from ava_extensions.identity.relationship import RELATIONSHIP_MARKER
     from ava_extensions.patches.system_prompt_loader import load_common_persona
     from ava_extensions.server import principal as principal_module
@@ -1273,11 +1638,12 @@ async def _run_http_suite(
                 )
                 text, tool_calls = _extract_completion(response, expected_model=model)
                 guard_observer.finish_case(text)
-                if len(observed_engine.calls) != before + 1:
+                repair_calls = guard_observer.repair_calls_for_case(case["id"])
+                if len(observed_engine.calls) != before + 1 + repair_calls:
                     raise ShadowRunError(
-                        "corpus case did not make exactly one model call"
+                        "corpus case model call count differs from guard repair"
                     )
-                call = observed_engine.calls[-1]
+                call = observed_engine.calls[before]
                 _assert_common_prompt(call, common_prompt)
                 profile = _profile_from_call(
                     call,
@@ -1308,7 +1674,9 @@ async def _run_http_suite(
                         "tool_calls": tool_calls,
                     }
                 )
-        guard_observation = guard_observer.document(suite=suite, role=role)
+        guard_observation = guard_observer.document(
+            suite=suite, role=role, treatment=treatment
+        )
 
     prompt_digest = sha256_bytes(
         canonical_json_bytes(
@@ -1360,11 +1728,11 @@ def _close_engine(engine: Any) -> None:
 def _execute_isolated(
     *,
     suite: LoadedSuite,
-    engine_factory: Callable[[], Any],
-    release_attestation: LoadedReleaseAttestation,
-    role: Literal["baseline", "candidate"],
-    execution_mode: Literal["attested", "loopback", "configured-anthropic"],
+    binding: LoadedCausalShadowBinding,
+    current_release_git_sha_before: str,
 ) -> tuple[dict[str, Any], int, tuple[str, ...], tuple[str, ...]]:
+    release_attestation = binding.release_attestation
+    role = binding.role
     if role == "candidate" and _relationship_guard_module() is None:
         raise ShadowRunError(
             "candidate shadow requires an observed runtime relationship guard"
@@ -1377,7 +1745,7 @@ def _execute_isolated(
     model = engine_attestation["model"]
     revision = engine_attestation["revision"]
     adapter = engine_attestation["adapter"]
-    configured_cloud = execution_mode == "configured-anthropic"
+    configured_cloud = True
     ambient_anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     with tempfile.TemporaryDirectory(
         prefix="ava-relationship-shadow-"
@@ -1420,15 +1788,18 @@ def _execute_isolated(
             "ALL_PROXY",
             "AVA_CP_ASSERTION_PREVIOUS_KEY_FILE",
             "AVA_CP_ASSERTION_PREVIOUS_KEY_ID",
+            "CURL_CA_BUNDLE",
             "HTTPS_PROXY",
             "HTTP_PROXY",
             "OPENAI_COMPAT_API_KEY",
+            "REQUESTS_CA_BUNDLE",
+            "SSL_CERT_DIR",
+            "SSL_CERT_FILE",
             "all_proxy",
             "https_proxy",
             "http_proxy",
         ]
-        # A loopback or test adapter receives no ambient provider credential.  The
-        # configured Anthropic path keeps only its own SDK credential and removes
+        # The configured Anthropic path keeps only its own SDK credential and removes
         # every unrelated cloud capability before the engine is constructed.
         unrelated_provider_keys = (
             "DEEPSEEK_API_KEY",
@@ -1453,7 +1824,7 @@ def _execute_isolated(
             engine: Any | None = None
             active_error: BaseException | None = None
             try:
-                engine = engine_factory()
+                engine = _configured_anthropic_engine()
                 observed = _ObservedEngine(
                     engine,
                     expected_adapter=adapter,
@@ -1492,6 +1863,7 @@ def _execute_isolated(
                             model=model,
                             oidc_fixture=oidc_fixture,
                             role=role,
+                            treatment=binding.treatment,
                             routes=routes,
                         )
                     )
@@ -1512,6 +1884,8 @@ def _execute_isolated(
         policy_digest = sha256_bytes(
             canonical_json_bytes(_runtime_policy(enabled=True))
         )
+        repair_calls = guard_observation["observed_repair_calls"]
+        current_release_git_sha_after = _current_release_git_sha()
         bundle = {
             "artifact": {
                 "canonical_knowledge": False,
@@ -1520,10 +1894,23 @@ def _execute_isolated(
                 "engine": {"model": model, "provider": provider, "revision": revision},
                 "generated_by": GENERATED_BY,
                 "guard_observation": guard_observation,
+                "execution_observation": {
+                    "backend_mode": _EXECUTION_MODE,
+                    "current_release_git_sha_after": current_release_git_sha_after,
+                    "current_release_git_sha_before": current_release_git_sha_before,
+                    "deployment_state": binding.deployment_state,
+                    "executing_release_git_sha": binding.release_git_sha,
+                    "preflight_model_calls": 4,
+                    "primary_model_calls": len(suite.corpus["cases"]),
+                    "repair_model_calls": repair_calls,
+                    "schema_version": "ava.relationship.execution-observation/v3",
+                    "total_model_calls": 4 + len(suite.corpus["cases"]) + repair_calls,
+                },
                 "id": f"relationship-shadow-{role}-{release['git_sha'][:12]}",
                 "policy_sha256": policy_digest,
                 "prompt_sha256": prompt_digest,
                 "release_attestation_sha256": release_attestation.sha256,
+                "causal_pair_sha256": binding.causal_pair.sha256,
                 "release": {
                     "repository": release["repository"],
                     "git_sha": release["git_sha"],
@@ -1534,11 +1921,13 @@ def _execute_isolated(
                 "role": role,
                 "safety_policy_sha256": suite.safety_policy_sha256,
                 "source_kind": "offline_shadow",
+                "treatment": binding.treatment,
             },
             "corpus": {
                 "id": suite.corpus["corpus_id"],
                 "version": suite.corpus["version"],
             },
+            "evaluation_manifest_sha256": suite.manifest_sha256,
             "responses": responses,
             "schema_version": RESPONSES_SCHEMA_VERSION,
         }
@@ -1549,6 +1938,7 @@ def _execute_isolated(
             base64.urlsafe_b64encode(key).rstrip(b"="),
             _RUNTIME_OWNER.encode("utf-8"),
             _RUNTIME_GUEST.encode("utf-8"),
+            _OIDC_RUNTIME_OWNER.encode("utf-8"),
             ambient_anthropic_api_key.encode("utf-8"),
         )
         if any(value and value in serialized for value in forbidden):
@@ -1558,16 +1948,67 @@ def _execute_isolated(
         return bundle, len(observed.calls), negative_checks, positive_checks
 
 
+def _configured_anthropic_engine() -> Any:
+    import ava_extensions.boot  # noqa: F401
+
+    cloud_module = importlib.import_module("openjarvis.engine.cloud")
+    release_root = _MODULE_PATH.parents[len(_MODULE_RELATIVE_PATH.parts) - 1]
+    expected_path = release_root / _CLOUD_MODULE_RELATIVE_PATH
+    try:
+        module_path = Path(cloud_module.__file__).expanduser().absolute()
+        spec = cloud_module.__spec__
+        spec_origin = Path(spec.origin).expanduser().absolute()
+        resolved_module = module_path.resolve(strict=True)
+        resolved_spec = spec_origin.resolve(strict=True)
+        expected_resolved = expected_path.resolve(strict=True)
+        _strict_regular_bytes(expected_path, max_bytes=_MAX_MODULE_BYTES)
+    except (AttributeError, OSError, TypeError, ContractError) as exc:
+        raise ShadowRunError("configured CloudEngine module origin is invalid") from exc
+    if (
+        module_path != expected_path
+        or spec.name != "openjarvis.engine.cloud"
+        or resolved_module != expected_resolved
+        or resolved_spec != expected_resolved
+    ):
+        raise ShadowRunError("configured CloudEngine module differs from release")
+
+    cloud_engine = getattr(cloud_module, "CloudEngine", None)
+    if (
+        type(cloud_engine) is not type
+        or cloud_engine.__module__ != "openjarvis.engine.cloud"
+        or cloud_engine.__qualname__ != "CloudEngine"
+    ):
+        raise ShadowRunError("configured CloudEngine class identity is invalid")
+    for method_name in ("__init__", "generate", "list_models"):
+        method = cloud_engine.__dict__.get(method_name)
+        code = getattr(method, "__code__", None)
+        try:
+            code_path = (
+                Path(code.co_filename).expanduser().absolute().resolve(strict=True)
+            )
+        except (AttributeError, OSError, TypeError) as exc:
+            raise ShadowRunError(
+                "configured CloudEngine implementation identity is invalid"
+            ) from exc
+        if code_path != expected_resolved:
+            raise ShadowRunError(
+                "configured CloudEngine implementation differs from release"
+            )
+    engine = cloud_engine()
+    if type(engine) is not cloud_engine:
+        raise ShadowRunError("configured CloudEngine constructor returned another type")
+    return engine
+
+
 def run_shadow(
     *,
-    engine_factory: Callable[[], Any],
     output_directory: str | Path,
     release_attestation_path: str | Path,
     release_attestation_sha256: str,
-    role: Literal["baseline", "candidate"] = "candidate",
-    execution_mode: Literal[
-        "attested", "loopback", "configured-anthropic"
-    ] = "attested",
+    peer_release_attestation_path: str | Path,
+    peer_release_attestation_sha256: str,
+    causal_pair_path: str | Path,
+    causal_pair_sha256: str,
 ) -> ShadowRunResult:
     """Run the synthetic HTTP shadow in a dedicated, effect-free process.
 
@@ -1576,10 +2017,7 @@ def run_shadow(
     Ava's daemon or another multi-threaded host.
     """
 
-    if role not in {"baseline", "candidate"}:
-        raise ShadowRunError("invalid response bundle role")
-    if execution_mode not in _EXECUTION_MODES:
-        raise ShadowRunError("invalid relationship shadow execution mode")
+    _assert_isolated_interpreter()
     try:
         asyncio.get_running_loop()
     except RuntimeError:
@@ -1592,16 +2030,27 @@ def run_shadow(
     destination = Path(output_directory).expanduser().absolute()
     try:
         _preflight_output_directory(destination)
-        release_attestation = load_release_attestation(
-            release_attestation_path,
-            expected_sha256=release_attestation_sha256,
+        suite = load_suite(DEFAULT_MANIFEST)
+        binding = load_causal_shadow_binding(
+            release_attestation_path=release_attestation_path,
+            release_attestation_sha256=release_attestation_sha256,
+            peer_release_attestation_path=peer_release_attestation_path,
+            peer_release_attestation_sha256=peer_release_attestation_sha256,
+            causal_pair_path=causal_pair_path,
+            causal_pair_sha256=causal_pair_sha256,
+            expected_manifest_sha256=suite.manifest_sha256,
         )
-        engine_attestation = release_attestation.document["engine"]
-        if execution_mode == "loopback" and engine_attestation["adapter"] != (
-            "openai-compat"
-        ):
-            raise ShadowRunError("loopback execution requires openai-compat adapter")
-        if execution_mode == "configured-anthropic" and (
+        # Loaded JSON documents remain mutable objects even though their outer
+        # dataclasses are frozen.  Discard them and re-read all pinned evidence
+        # immediately before checking the executing release and opening scope.
+        binding = reload_causal_shadow_binding(binding)
+        _verify_release_execution_binding(binding.release_attestation)
+        deployed_config_payload = _verify_deployed_anthropic_config(
+            binding.release_attestation
+        )
+        current_release_git_sha_before = _verify_binding_deployment_state(binding)
+        engine_attestation = binding.release_attestation.document["engine"]
+        if (
             engine_attestation["adapter"] != "cloud"
             or engine_attestation["provider"] != "anthropic"
             or not engine_attestation["model"].startswith("claude-")
@@ -1609,27 +2058,37 @@ def run_shadow(
             raise ShadowRunError(
                 "configured Anthropic execution differs from release attestation"
             )
-        suite = load_suite(DEFAULT_MANIFEST)
         with _quiet_process_output():
             try:
-                bundle, model_calls, negative_checks, positive_checks = (
-                    _execute_isolated(
-                        suite=suite,
-                        engine_factory=engine_factory,
-                        release_attestation=release_attestation,
-                        role=role,
-                        execution_mode=execution_mode,
+                with _verified_relationship_shadow_scope(binding):
+                    bundle, model_calls, negative_checks, positive_checks = (
+                        _execute_isolated(
+                            suite=suite,
+                            binding=binding,
+                            current_release_git_sha_before=(
+                                current_release_git_sha_before
+                            ),
+                        )
                     )
-                )
             except ShadowRunError:
                 raise
             except Exception as exc:
                 raise ShadowRunError("relationship shadow execution failed") from exc
+        binding = reload_causal_shadow_binding(binding)
+        _verify_release_execution_binding(binding.release_attestation)
+        if (
+            _verify_deployed_anthropic_config(binding.release_attestation)
+            != deployed_config_payload
+        ):
+            raise ShadowRunError("deployed Anthropic config changed during shadow")
+        current_release_git_sha_after = _verify_binding_deployment_state(binding)
+        if current_release_git_sha_after != current_release_git_sha_before:
+            raise ShadowRunError("current release changed during relationship shadow")
         output_path, bundle_sha256 = _publish_bundle(
             destination,
             bundle,
             suite,
-            role=role,
+            binding=binding,
         )
         return ShadowRunResult(
             output_path=output_path,
@@ -1638,87 +2097,45 @@ def run_shadow(
             model_call_count=model_calls,
             negative_checks=negative_checks,
             positive_checks=positive_checks,
-            release_attestation_sha256=release_attestation.sha256,
+            release_attestation_sha256=binding.release_attestation.sha256,
         )
     finally:
         _RUN_LOCK.release()
-
-
-def _loopback_url(value: str) -> str:
-    parsed = urlsplit(value)
-    try:
-        address = ipaddress.ip_address(parsed.hostname or "")
-        port = parsed.port
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("an IP loopback backend is required") from exc
-    if (
-        parsed.scheme != "http"
-        or not address.is_loopback
-        or port is None
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-        or parsed.path not in {"", "/"}
-    ):
-        raise argparse.ArgumentTypeError(
-            "backend URL must be an explicit HTTP loopback endpoint"
-        )
-    return value.rstrip("/")
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Generate one isolated relationship shadow bundle"
     )
-    backend = parser.add_mutually_exclusive_group(required=True)
-    backend.add_argument("--backend-url", type=_loopback_url)
-    backend.add_argument(
+    parser.add_argument(
         "--configured-anthropic",
         action="store_true",
+        required=True,
         help=(
             "use the configured Ava CloudEngine and its ambient Anthropic credential"
         ),
     )
     parser.add_argument("--release-attestation", required=True)
     parser.add_argument("--release-attestation-sha256", required=True)
+    parser.add_argument("--peer-release-attestation", required=True)
+    parser.add_argument("--peer-release-attestation-sha256", required=True)
+    parser.add_argument("--causal-pair", required=True)
+    parser.add_argument("--causal-pair-sha256", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument(
-        "--role", choices=("baseline", "candidate"), default="candidate"
-    )
-    parser.add_argument("--timeout-seconds", type=float, default=120.0)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if not 1.0 <= args.timeout_seconds <= 600.0:
-        print("relationship shadow run failed", file=sys.stderr)
-        return 2
-
-    def engine_factory() -> Any:
-        if args.configured_anthropic:
-            # Import boot before the engine so Ava's mandatory SDK guards are active
-            # for the real Anthropic request.  AVA_PERCEPTION=0 and the isolated HOME
-            # are already in force at this point.
-            import ava_extensions.boot  # noqa: F401
-            from openjarvis.engine.cloud import CloudEngine
-
-            return CloudEngine()
-        from openjarvis.engine.openai_compat_engines import OpenAICompatEngine
-
-        return OpenAICompatEngine(host=args.backend_url, timeout=args.timeout_seconds)
-
     try:
         run_shadow(
-            engine_factory=engine_factory,
             output_directory=args.output_dir,
             release_attestation_path=args.release_attestation,
             release_attestation_sha256=args.release_attestation_sha256,
-            role=args.role,
-            execution_mode=(
-                "configured-anthropic" if args.configured_anthropic else "loopback"
-            ),
+            peer_release_attestation_path=args.peer_release_attestation,
+            peer_release_attestation_sha256=(args.peer_release_attestation_sha256),
+            causal_pair_path=args.causal_pair,
+            causal_pair_sha256=args.causal_pair_sha256,
         )
     except (OSError, ShadowRunError, ValueError):
         print("relationship shadow run failed", file=sys.stderr)

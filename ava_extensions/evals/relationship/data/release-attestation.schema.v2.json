@@ -1,0 +1,165 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ava:release:attestation:v2",
+  "title": "Attestation de release Ava v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "attestation_id", "release", "engine", "artifact", "canonical_knowledge"],
+  "properties": {
+    "schema_version": {"const": "ava.release.attestation/v2"},
+    "attestation_id": {"type": "string", "minLength": 3},
+    "release": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repository", "git_sha", "deployment_state", "treatment", "treatment_module_path", "treatment_module_sha256"],
+      "properties": {
+        "repository": {"const": "repo://ava"},
+        "git_sha": {"$ref": "#/$defs/gitSha"},
+        "deployment_state": {"enum": ["prepared_noncurrent", "active_current"]},
+        "treatment": {"enum": ["shadow-baseline-only-v1", "runtime-enforced-v1"]},
+        "treatment_module_path": {"const": "ava_extensions/identity/relationship_guard_treatment.py"},
+        "treatment_module_sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "allOf": [{
+        "if": {"properties": {"treatment": {"const": "shadow-baseline-only-v1"}}, "required": ["treatment"]},
+        "then": {"properties": {"deployment_state": {"const": "prepared_noncurrent"}}},
+        "else": {"properties": {"deployment_state": {"const": "active_current"}}}
+      }]
+    },
+    "engine": {
+      "type": "object", "additionalProperties": false,
+      "required": ["provider", "model", "revision", "adapter", "config_sha256"],
+      "properties": {
+        "provider": {"const": "anthropic"},
+        "model": {"type": "string", "pattern": "^claude-[A-Za-z0-9._+-]+$"},
+        "revision": {"type": "string", "pattern": "^claude-[A-Za-z0-9._+-]+$"},
+        "adapter": {"const": "cloud"},
+        "config_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "artifact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["manifest_sha256", "evaluation_manifest_sha256", "frontend", "source_tree_sha256", "source_archive_map_sha256", "rust_tree_sha256", "rust_archive_map_sha256", "wheel_sha256", "wheel_payload_sha256", "wheel_filename", "rust_attestation_sha256", "rust_builder", "python_runtime"],
+      "properties": {
+        "manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "evaluation_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "frontend": {"$ref": "#/$defs/frontend"},
+        "source_tree_sha256": {"$ref": "#/$defs/sha256"},
+        "source_archive_map_sha256": {"$ref": "#/$defs/sha256"},
+        "rust_tree_sha256": {"$ref": "#/$defs/sha256"},
+        "rust_archive_map_sha256": {"$ref": "#/$defs/sha256"},
+        "wheel_sha256": {"$ref": "#/$defs/sha256"},
+        "wheel_payload_sha256": {"$ref": "#/$defs/sha256"},
+        "wheel_filename": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]+\\.whl$"},
+        "rust_attestation_sha256": {"$ref": "#/$defs/sha256"},
+        "rust_builder": {"$ref": "#/$defs/rustBuilder"},
+        "python_runtime": {"$ref": "#/$defs/pythonRuntime"}
+      }
+    },
+    "canonical_knowledge": {"const": false}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "gitSha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "frontend": {
+      "type": "object", "additionalProperties": false,
+      "required": ["build_attestation_sha256", "archive_sha256", "archive_map_sha256", "source_map_sha256", "builder_recipe_sha256"],
+      "properties": {
+        "build_attestation_sha256": {"$ref": "#/$defs/sha256"},
+        "archive_sha256": {"$ref": "#/$defs/sha256"},
+        "archive_map_sha256": {"$ref": "#/$defs/sha256"},
+        "source_map_sha256": {"$ref": "#/$defs/sha256"},
+        "builder_recipe_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "pythonRuntime": {
+      "type": "object", "additionalProperties": false,
+      "required": ["format", "implementation", "python_version", "executable_path", "executable_sha256", "runtime_source_path", "runtime_source_sha256", "runtime_archive_path", "runtime_archive_sha256", "runtime_archive_map_sha256", "python_install_path", "python_install_map_sha256", "python_install_entry_count", "python_install_total_size", "pyvenv_path", "pyvenv_contract_sha256", "stdlib_path", "stdlib_map_sha256", "stdlib_entry_count", "stdlib_total_size", "site_packages_path", "site_packages_map_sha256", "site_packages_entry_count", "site_packages_total_size", "lock_path", "lock_sha256", "requirements_path", "requirements_sha256", "requirements_set_sha256", "wheelhouse_manifest_path", "wheelhouse_manifest_sha256", "wheelhouse_path", "wheelhouse_map_sha256", "critical_imports", "removed_pth_count", "removed_pth_set_sha256", "distribution_set_sha256", "installer", "site_initialization", "bytecode_allowed"],
+      "properties": {
+        "format": {"const": "ava.python-runtime/v1"},
+        "implementation": {"const": "cpython"},
+        "python_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+        "executable_path": {"const": ".venv/bin/python"},
+        "executable_sha256": {"$ref": "#/$defs/sha256"},
+        "runtime_source_path": {"const": "deploy/runtime/ava-python-runtime.v1.json"},
+        "runtime_source_sha256": {"$ref": "#/$defs/sha256"},
+        "runtime_archive_path": {"const": ".ava-artifacts/python-runtime.tar.gz"},
+        "runtime_archive_sha256": {"$ref": "#/$defs/sha256"},
+        "runtime_archive_map_sha256": {"$ref": "#/$defs/sha256"},
+        "python_install_path": {"const": ".python"},
+        "python_install_map_sha256": {"$ref": "#/$defs/sha256"},
+        "python_install_entry_count": {"type": "integer", "minimum": 1},
+        "python_install_total_size": {"type": "integer", "minimum": 1},
+        "pyvenv_path": {"const": ".venv/pyvenv.cfg"},
+        "pyvenv_contract_sha256": {"$ref": "#/$defs/sha256"},
+        "stdlib_path": {"type": "string", "pattern": "^\\.python/lib/python[0-9]+\\.[0-9]+$"},
+        "stdlib_map_sha256": {"$ref": "#/$defs/sha256"},
+        "stdlib_entry_count": {"type": "integer", "minimum": 1},
+        "stdlib_total_size": {"type": "integer", "minimum": 1},
+        "site_packages_path": {"type": "string", "pattern": "^\\.venv/lib/python[0-9]+\\.[0-9]+/site-packages$"},
+        "site_packages_map_sha256": {"$ref": "#/$defs/sha256"},
+        "site_packages_entry_count": {"type": "integer", "minimum": 1},
+        "site_packages_total_size": {"type": "integer", "minimum": 1},
+        "lock_path": {"const": "uv.lock"},
+        "lock_sha256": {"$ref": "#/$defs/sha256"},
+        "requirements_path": {"const": "deploy/runtime/ava-runtime-requirements.v1.txt"},
+        "requirements_sha256": {"$ref": "#/$defs/sha256"},
+        "requirements_set_sha256": {"$ref": "#/$defs/sha256"},
+        "wheelhouse_manifest_path": {"const": "deploy/runtime/ava-runtime-wheelhouse.v1.json"},
+        "wheelhouse_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "wheelhouse_path": {"const": ".ava-artifacts/python-wheelhouse"},
+        "wheelhouse_map_sha256": {"$ref": "#/$defs/sha256"},
+        "critical_imports": {
+          "type": "object", "additionalProperties": false,
+          "required": ["anthropic", "cryptography", "httpcore", "httpx"],
+          "properties": {
+            "anthropic": {"$ref": "#/$defs/criticalImportAnthropic"},
+            "cryptography": {"$ref": "#/$defs/criticalImportCryptography"},
+            "httpcore": {"$ref": "#/$defs/criticalImportHttpcore"},
+            "httpx": {"$ref": "#/$defs/criticalImportHttpx"}
+          }
+        },
+        "removed_pth_count": {"type": "integer", "minimum": 0},
+        "removed_pth_set_sha256": {"$ref": "#/$defs/sha256"},
+        "distribution_set_sha256": {"$ref": "#/$defs/sha256"},
+        "installer": {
+          "type": "object", "additionalProperties": false,
+          "required": ["path", "sha256", "version", "arguments"],
+          "properties": {
+            "path": {"const": "/usr/local/bin/ava-uv"},
+            "sha256": {"$ref": "#/$defs/sha256"},
+            "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+            "arguments": {"const": ["--no-config", "pip", "sync", "<release>/deploy/runtime/ava-runtime-requirements.v1.txt", "--python=<release>/.venv/bin/python", "--require-hashes", "--no-build", "--offline", "--link-mode=copy", "--no-index", "--no-cache", "--find-links=<release>/.ava-artifacts/python-wheelhouse"]}
+          }
+        },
+        "site_initialization": {"const": false},
+        "bytecode_allowed": {"const": false}
+      }
+    },
+    "criticalImport": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {"path": {"type": "string"}, "sha256": {"$ref": "#/$defs/sha256"}}
+    },
+    "criticalImportAnthropic": {"allOf": [{"$ref": "#/$defs/criticalImport"}, {"properties": {"path": {"const": "anthropic/__init__.py"}}}]},
+    "criticalImportCryptography": {"allOf": [{"$ref": "#/$defs/criticalImport"}, {"properties": {"path": {"const": "cryptography/__init__.py"}}}]},
+    "criticalImportHttpcore": {"allOf": [{"$ref": "#/$defs/criticalImport"}, {"properties": {"path": {"const": "httpcore/__init__.py"}}}]},
+    "criticalImportHttpx": {"allOf": [{"$ref": "#/$defs/criticalImport"}, {"properties": {"path": {"const": "httpx/__init__.py"}}}]},
+    "rustBuilder": {
+      "type": "object", "additionalProperties": false,
+      "required": ["attestation_type", "signature", "builder_image_id", "builder_dockerfile_sha256", "builder_platform", "builder_python_image", "builder_rust_image", "python_version", "rust_version", "maturin_version", "wheel_compatibility"],
+      "properties": {
+        "attestation_type": {"const": "unsigned-checksum-manifest"},
+        "signature": {"const": "none"},
+        "builder_image_id": {"$ref": "#/$defs/sha256"},
+        "builder_dockerfile_sha256": {"$ref": "#/$defs/sha256"},
+        "builder_platform": {"const": "linux/amd64"},
+        "builder_python_image": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,190}@sha256:[0-9a-f]{64}$"},
+        "builder_rust_image": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,190}@sha256:[0-9a-f]{64}$"},
+        "python_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+        "rust_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+        "maturin_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+        "wheel_compatibility": {"type": "string", "pattern": "^manylinux_[0-9]+_[0-9]+_x86_64$"}
+      }
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "archive": {
+    "member_count": 4522,
+    "regular_file_bytes": 97688071,
+    "regular_file_count": 3474,
+    "sealed_relative_path": ".ava-artifacts/python-runtime.tar.gz",
+    "sha256": "d480f5d5878910ecbae212bf23bd7c25d7b209eb8cf5e98823c977384d272e88",
+    "size": 34075380,
+    "symlink_count": 1048,
+    "url": "https://releases.astral.sh/github/python-build-standalone/releases/download/20260510/cpython-3.12.13%2B20260510-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+  },
+  "build": "20260510",
+  "implementation": "cpython",
+  "platform": "x86_64-unknown-linux-gnu",
+  "schema": "ava.python-runtime-source/v1",
+  "version": "3.12.13"
+}

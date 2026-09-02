@@ -92,10 +92,12 @@ class TraceCollector:
         *,
         store: Optional[TraceStore] = None,
         bus: Optional[EventBus] = None,
+        defer_persistence: bool = False,
     ) -> None:
         self._agent = agent
         self._store = store
         self._bus = bus
+        self._defer_persistence = defer_persistence
         # Departs d'appels d'outil en attente, PAR NOM D'OUTIL (cf. `_on_tool_start`).
         self._tool_starts: dict[str, list[tuple[float, Any]]] = {}
         self._current_steps: list[TraceStep] = []
@@ -143,25 +145,33 @@ class TraceCollector:
             except Exception:
                 if content_filter is not None:
                     # The Ava observability extension records `_current_steps`
-                    # when an agent raises.  Overlay events are intentionally
-                    # request-local and still raw at this point, so never let
-                    # that fallback persist or log them.
+                    # when an agent raises. Overlay events are request-local
+                    # and still raw here, so never persist or log them.
+                    abort_events = getattr(
+                        self._bus,
+                        "abort_generation_events",
+                        None,
+                    )
+                    if callable(abort_events):
+                        try:
+                            abort_events()
+                        except Exception:
+                            pass
                     self._current_steps = []
                     raise RuntimeError("filtered agent execution failed") from None
                 raise
+            if content_filter is not None:
+                try:
+                    # Keep subscriptions active through a possible bounded
+                    # repair, then scrub all captured events before storage.
+                    result = self._filter_agent_result(result)
+                except Exception:
+                    self._current_steps = []
+                    raise RuntimeError("trace content filtering failed") from None
         finally:
             self._unsubscribe(unsubs)
 
         ended_at = time.time()
-
-        if content_filter is not None:
-            try:
-                result = self._filter_agent_result(result)
-            except Exception:
-                # Fail closed without handing raw request-local events to the
-                # failure-trace patch installed by Ava.
-                self._current_steps = []
-                raise RuntimeError("trace content filtering failed") from None
 
         # Add final respond step
         self._current_steps.append(
@@ -308,11 +318,12 @@ class TraceCollector:
 
         self._last_trace = trace
 
-        if self._store is not None:
-            self._store.save(trace)
+        if not self._defer_persistence:
+            if self._store is not None:
+                self._store.save(trace)
 
-        if self._bus is not None:
-            self._bus.publish(EventType.TRACE_COMPLETE, {"trace": trace})
+            if self._bus is not None:
+                self._bus.publish(EventType.TRACE_COMPLETE, {"trace": trace})
 
         return result
 
@@ -350,6 +361,17 @@ class TraceCollector:
             allow_conversation_echo=allow_conversation_echo,
             final=final,
         )
+        self._validate_content_filter_result(result, final=final)
+        if final:
+            self._register_final_filter_result(result)
+        return result
+
+    @staticmethod
+    def _validate_content_filter_result(
+        result: TraceContentFilterResult,
+        *,
+        final: bool,
+    ) -> None:
         if (
             not isinstance(result, TraceContentFilterResult)
             or not isinstance(result.content, str)
@@ -359,12 +381,52 @@ class TraceCollector:
             or (final and result.suppress_structured_output and not result.content)
         ):
             raise RuntimeError("trace content filter returned invalid data")
-        if final:
-            self._final_filter_applied = True
-            self._last_content_filter_result = result
-            if result.suppress_structured_output:
-                self._replacement_filter_result = result
-        return result
+
+    def _register_final_filter_result(
+        self,
+        result: TraceContentFilterResult,
+    ) -> None:
+        if self._final_filter_applied:
+            raise RuntimeError("terminal trace content filter already applied")
+        self._final_filter_applied = True
+        self._last_content_filter_result = result
+        if result.suppress_structured_output:
+            self._replacement_filter_result = result
+
+    def _purge_result_before_repair(
+        self,
+        result: AgentResult,
+        metadata: dict[str, Any],
+    ) -> None:
+        """Drop the rejected candidate before a staged provider call blocks."""
+
+        result.content = ""
+        result.tool_results = []
+        raw_messages = metadata.get("messages")
+        if isinstance(raw_messages, list):
+            safe_messages: list[dict[str, str]] = []
+            for message in raw_messages:
+                if dataclasses.is_dataclass(message) and not isinstance(message, type):
+                    message = dataclasses.asdict(message)
+                if not isinstance(message, Mapping):
+                    continue
+                role = message.get("role")
+                content = message.get("content", "")
+                if role == "user" and isinstance(content, str):
+                    safe_messages.append({"role": "user", "content": content})
+                elif role in {"assistant", "tool"}:
+                    safe_messages.append({"role": str(role), "content": ""})
+            metadata["messages"] = safe_messages
+        for key in (
+            "tool_calls",
+            "tool_results",
+            "content_blocks",
+            "audio",
+            "audio_path",
+        ):
+            metadata.pop(key, None)
+        result.metadata = metadata
+        self._current_steps = []
 
     def _filter_messages(
         self,
@@ -431,11 +493,23 @@ class TraceCollector:
         return filtered_messages
 
     def _scrub_steps_after_replacement(self) -> None:
+        replacement = self._replacement_filter_result
+        replacement_content = replacement.content if replacement is not None else ""
+        preserve_index: int | None = None
+        for index, step in enumerate(self._current_steps):
+            if (
+                step.step_type == StepType.GENERATE
+                and replacement_content
+                and step.output.get("content") == replacement_content
+            ):
+                preserve_index = index
         scrubbed: list[TraceStep] = []
-        for step in self._current_steps:
+        for index, step in enumerate(self._current_steps):
             if step.step_type == StepType.TOOL_CALL:
                 continue
             if step.step_type == StepType.GENERATE:
+                if index != preserve_index:
+                    step.output["content"] = ""
                 step.output.pop("tool_calls", None)
                 step.output.pop("tool_results", None)
                 step.output.pop("content_blocks", None)
@@ -554,12 +628,29 @@ class TraceCollector:
                 if key in metadata and metadata[key] not in (None, [], {}, "")
             }
         )
-        decision = self._apply_content_filter(
-            result.content,
-            structured,
-            allow_conversation_echo=True,
-            final=True,
-        )
+        staged_begin = getattr(self._active_content_filter, "begin_final", None)
+        staged_finish = getattr(self._active_content_filter, "finish_final", None)
+        if callable(staged_begin) and callable(staged_finish):
+            stage = staged_begin(
+                result.content,
+                structured,
+                allow_conversation_echo=True,
+            )
+            if isinstance(stage, TraceContentFilterResult):
+                decision = stage
+            else:
+                self._purge_result_before_repair(result, metadata)
+                structured = ()
+                decision = staged_finish(stage)
+            self._validate_content_filter_result(decision, final=True)
+            self._register_final_filter_result(decision)
+        else:
+            decision = self._apply_content_filter(
+                result.content,
+                structured,
+                allow_conversation_echo=True,
+                final=True,
+            )
         self._scrub_trace_steps()
         if "messages" in metadata:
             metadata["messages"] = self._filter_messages(

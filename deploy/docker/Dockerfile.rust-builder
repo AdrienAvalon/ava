@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7.0@sha256:4611ea7b7d89ce41ec5c63df83076ccec3fe8daa32a2d9c96e5decb72e9a8d67
 # Builder de release pour l'extension native Ava.
 #
 # Les deux bases sont immuables et ciblent linux/amd64, l'architecture de la VM.
@@ -11,10 +12,19 @@ FROM rust:1.88.0-bookworm@sha256:4727898c104ecd2e22d780925832502faee9fe4e70581b8
 # ses en-tetes et pip. Les deux images reposent sur la meme Debian bookworm.
 COPY --from=python-runtime /usr/local/ /usr/local/
 
-ENV PATH="/usr/local/cargo/bin:/usr/local/bin:${PATH}" \
+ENV PATH="/usr/local/cargo/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    CARGO_HOME=/usr/local/cargo \
+    CARGO_TARGET_DIR=/build/rust/target \
     CARGO_TERM_COLOR=never \
+    CARGO_INCREMENTAL=0 \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONHASHSEED=0 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    RUSTUP_HOME=/usr/local/rustup \
+    SOURCE_DATE_EPOCH=315532800 \
+    TZ=UTC
 
 # Maturin est epingle a la version verrouillee par uv.lock. Le hash est celui de
 # sa wheel Linux x86_64 publiee sur PyPI ; --require-hashes interdit toute derive.
@@ -32,50 +42,147 @@ RUN printf '%s\n' \
     rustc --version | grep -Eq '^rustc 1\.88\.0 ' && \
     test "$(maturin --version)" = 'maturin 1.14.1'
 
-ARG AVA_GIT_SHA
-LABEL org.opencontainers.image.title="Ava Rust release builder" \
-      org.opencontainers.image.revision="${AVA_GIT_SHA}" \
-      org.opencontainers.image.description="Unsigned checksum-manifest builder for openjarvis_rust"
-
 WORKDIR /build
 
 # Le contexte est cree par git archive : seul le sous-arbre Rust du commit cible
 # entre dans l'image, jamais un secret ou un fichier non suivi du poste operateur.
 COPY rust/ rust/
+COPY deploy/docker/canonicalize-rust-wheel.py /usr/local/libexec/ava-canonicalize-rust-wheel.py
 
-RUN test -n "${AVA_GIT_SHA}" && \
-    test "$(rustc --version | awk '{print $2}')" = '1.88.0' && \
-    test "$(python3 -c 'import platform; print(platform.python_version())')" = '3.12.13'
+# Seul `cargo fetch` dispose du reseau apres l'entree du source Rust. Il ne
+# compile ni build.rs ni proc-macro. Tous les environnements qui executent le
+# source sont ensuite reconstruits par `env -i`, sans proxy ni secret herite.
+RUN mkdir -p -m 0700 /tmp/ava-builder-home && \
+    env -i \
+      HOME=/tmp/ava-builder-home \
+      PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      CARGO_HOME=/usr/local/cargo \
+      CARGO_TARGET_DIR=/build/rust/target \
+      CARGO_TERM_COLOR=never \
+      CARGO_INCREMENTAL=0 \
+      CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
+      LANG=C.UTF-8 \
+      LC_ALL=C.UTF-8 \
+      RUSTUP_HOME=/usr/local/rustup \
+      SOURCE_DATE_EPOCH=315532800 \
+      TZ=UTC \
+      cargo fetch --manifest-path rust/Cargo.toml --locked
+
+RUN --network=none env -i \
+    HOME=/tmp/ava-builder-home \
+    PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    CARGO_HOME=/usr/local/cargo \
+    CARGO_TARGET_DIR=/build/rust/target \
+    CARGO_TERM_COLOR=never \
+    CARGO_INCREMENTAL=0 \
+    CARGO_NET_OFFLINE=true \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    RUSTUP_HOME=/usr/local/rustup \
+    SOURCE_DATE_EPOCH=315532800 \
+    TZ=UTC \
+    sh -eu -c "test \"\$(rustc --version | awk '{print \$2}')\" = 1.88.0 && \
+    test \"\$(python3 -c 'import platform; print(platform.python_version())')\" = 3.12.13"
 
 # Le workspace entier est teste contre Cargo.lock avant de produire l'artefact.
-RUN cargo test \
+RUN --network=none env -i \
+      HOME=/tmp/ava-builder-home \
+      PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      CARGO_HOME=/usr/local/cargo \
+      CARGO_TARGET_DIR=/build/rust/target \
+      CARGO_TERM_COLOR=never \
+      CARGO_INCREMENTAL=0 \
+      CARGO_NET_OFFLINE=true \
+      LANG=C.UTF-8 \
+      LC_ALL=C.UTF-8 \
+      RUSTUP_HOME=/usr/local/rustup \
+      SOURCE_DATE_EPOCH=315532800 \
+      TZ=UTC \
+      cargo test \
       --manifest-path rust/Cargo.toml \
       --workspace \
-      --locked
+      --locked \
+      --offline
 
-RUN mkdir -p /artifacts && \
-    maturin build \
+RUN --network=none mkdir -p /artifacts && \
+    env -i \
+      HOME=/tmp/ava-builder-home \
+      PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      CARGO_HOME=/usr/local/cargo \
+      CARGO_TARGET_DIR=/build/rust/target \
+      CARGO_TERM_COLOR=never \
+      CARGO_INCREMENTAL=0 \
+      CARGO_NET_OFFLINE=true \
+      LANG=C.UTF-8 \
+      LC_ALL=C.UTF-8 \
+      PYTHONHASHSEED=0 \
+      PYTHONDONTWRITEBYTECODE=1 \
+      RUSTUP_HOME=/usr/local/rustup \
+      SOURCE_DATE_EPOCH=315532800 \
+      TZ=UTC \
+      maturin build \
       --manifest-path rust/crates/openjarvis-python/Cargo.toml \
       --interpreter python3 \
       --release \
       --locked \
+      --offline \
       --compatibility manylinux_2_36 \
       --out /artifacts
 
+# cargo-cyclonedx injecte un UUID et une date murale. Reecrire le SBOM, RECORD
+# et le conteneur ZIP entier avant tout test et toute extraction de l'artefact.
+RUN --network=none env -i \
+    PATH=/usr/local/bin:/usr/bin:/bin \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONHASHSEED=0 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    SOURCE_DATE_EPOCH=315532800 \
+    TZ=UTC \
+    sh -eu -c " \
+    wheel_count=\"\$(find /artifacts -maxdepth 1 -type f -name '*.whl' | wc -l)\"; \
+    test \"\$wheel_count\" -eq 1; \
+    wheel=\"\$(find /artifacts -maxdepth 1 -type f -name '*.whl')\"; \
+    python3 /usr/local/libexec/ava-canonicalize-rust-wheel.py \
+      --source-date-epoch \"\$SOURCE_DATE_EPOCH\" \
+      \"\$wheel\" /tmp/openjarvis-rust-canonical.whl; \
+    mv /tmp/openjarvis-rust-canonical.whl \"\$wheel\""
+
 # L'import est verifie depuis un venv et un cwd jetables, en mode isole. Il ne
 # peut donc pas reussir en important le checkout ou le site utilisateur par hasard.
-RUN set -eu; \
-    wheel_count="$(find /artifacts -maxdepth 1 -type f -name '*.whl' | wc -l)"; \
-    test "$wheel_count" -eq 1; \
-    wheel="$(find /artifacts -maxdepth 1 -type f -name '*.whl')"; \
-    case "$(basename "$wheel")" in \
+RUN --network=none env -i \
+    HOME=/tmp/verify-home \
+    PATH=/usr/local/bin:/usr/bin:/bin \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONHASHSEED=0 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    SOURCE_DATE_EPOCH=315532800 \
+    TZ=UTC \
+    sh -eu -c " \
+    wheel_count=\"\$(find /artifacts -maxdepth 1 -type f -name '*.whl' | wc -l)\"; \
+    test \"\$wheel_count\" -eq 1; \
+    wheel=\"\$(find /artifacts -maxdepth 1 -type f -name '*.whl')\"; \
+    case \"\$(basename \"\$wheel\")\" in \
       *-cp312-cp312-manylinux_2_36_x86_64.whl) ;; \
-      *) printf 'wheel incompatible avec la VM: %s\n' "$wheel" >&2; exit 1 ;; \
+      *) printf 'wheel incompatible avec la VM: %s\n' \"\$wheel\" >&2; exit 1 ;; \
     esac; \
     python3 -m venv /tmp/verify-venv; \
-    /tmp/verify-venv/bin/pip install --no-deps --no-index "$wheel"; \
+    /tmp/verify-venv/bin/pip install --no-deps --no-index \"\$wheel\"; \
     mkdir -p /tmp/verify-cwd; \
     cd /tmp/verify-cwd; \
-    HOME=/tmp/verify-home /tmp/verify-venv/bin/python -I -c \
+    /tmp/verify-venv/bin/python -I -c \
       'import openjarvis_rust; assert openjarvis_rust.__file__'; \
-    rm -rf /tmp/verify-venv /tmp/verify-cwd /tmp/verify-home
+    rm -rf /tmp/verify-venv /tmp/verify-cwd /tmp/verify-home"
+
+# Le SHA de revision n'entre qu'apres tests, build, canonicalisation et import.
+# Le stage publie ne contient que le couple d'artefacts produit plus haut.
+FROM scratch AS release
+
+ARG AVA_GIT_SHA
+LABEL org.opencontainers.image.title="Ava Rust release builder" \
+      org.opencontainers.image.revision="${AVA_GIT_SHA}" \
+      org.opencontainers.image.description="Unsigned checksum-manifest builder for openjarvis_rust"
+
+COPY --from=builder /artifacts/ /artifacts/

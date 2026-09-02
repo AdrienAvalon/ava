@@ -1,0 +1,200 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ava:relationship:corpus:v3",
+  "title": "Corpus relationnel synthetique Ava v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "corpus_id", "version", "language", "synthetic_only", "cases"],
+  "properties": {
+    "schema_version": {"const": "ava.relationship.corpus/v3"},
+    "corpus_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._:-]{2,127}$"},
+    "version": {"type": "string", "minLength": 1},
+    "language": {"const": "fr"},
+    "synthetic_only": {"const": true},
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/case"}
+    }
+  },
+  "$defs": {
+    "nonEmptyString": {"type": "string", "minLength": 1},
+    "stringArray": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/nonEmptyString"}
+    },
+    "stringGroups": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "array",
+        "minItems": 1,
+        "uniqueItems": true,
+        "items": {"$ref": "#/$defs/nonEmptyString"}
+      }
+    },
+    "indexArray": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "integer", "minimum": 0}
+    },
+    "fact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "text"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._:-]{2,127}$"},
+        "text": {"$ref": "#/$defs/nonEmptyString"}
+      }
+    },
+    "authoringProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authoring_class",
+        "authored_before_new_candidate",
+        "new_candidate_response_access",
+        "predecessor_raw_response_access",
+        "predecessor_diagnostics_access",
+        "content_modified_after_predecessor",
+        "owner_reviewed",
+        "contains_personal_data",
+        "contains_production_conversations"
+      ],
+      "properties": {
+        "authoring_class": {
+          "enum": ["inherited_v1_6_1", "predecessor_diagnostics_only", "sealed_holdout_v17"]
+        },
+        "authored_before_new_candidate": {"const": true},
+        "new_candidate_response_access": {"const": false},
+        "predecessor_raw_response_access": {"type": ["boolean", "null"]},
+        "predecessor_diagnostics_access": {"type": ["boolean", "null"]},
+        "content_modified_after_predecessor": {"type": "boolean"},
+        "owner_reviewed": {"const": false},
+        "contains_personal_data": {"const": false},
+        "contains_production_conversations": {"const": false}
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "authoring_class": {"const": "inherited_v1_6_1"},
+            "predecessor_raw_response_access": {"const": null},
+            "predecessor_diagnostics_access": {"const": null},
+            "content_modified_after_predecessor": {"const": false}
+          }
+        },
+        {
+          "properties": {
+            "authoring_class": {"const": "predecessor_diagnostics_only"},
+            "predecessor_raw_response_access": {"const": false},
+            "predecessor_diagnostics_access": {"const": true},
+            "content_modified_after_predecessor": {"const": true}
+          }
+        },
+        {
+          "properties": {
+            "authoring_class": {"const": "sealed_holdout_v17"},
+            "predecessor_raw_response_access": {"const": false},
+            "predecessor_diagnostics_access": {"const": false},
+            "content_modified_after_predecessor": {"const": true}
+          }
+        }
+      ]
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "split",
+        "description",
+        "provenance",
+        "principal",
+        "conversation",
+        "policy",
+        "lexical_secondary"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{2,95}$"},
+        "split": {"enum": ["development", "holdout", "adversarial"]},
+        "description": {"$ref": "#/$defs/nonEmptyString"},
+        "provenance": {"$ref": "#/$defs/authoringProvenance"},
+        "principal": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["request_subject", "verified", "relationship_subject", "relationship_opt_in"],
+          "properties": {
+            "request_subject": {"type": "string", "pattern": "^synthetic:[a-z0-9._:-]+$"},
+            "verified": {"type": "boolean"},
+            "relationship_subject": {
+              "oneOf": [
+                {"type": "null"},
+                {"type": "string", "pattern": "^synthetic:[a-z0-9._:-]+$"}
+              ]
+            },
+            "relationship_opt_in": {"type": "boolean"}
+          }
+        },
+        "conversation": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["role", "content"],
+            "properties": {
+              "role": {"enum": ["user", "assistant"]},
+              "content": {"$ref": "#/$defs/nonEmptyString"}
+            }
+          }
+        },
+        "policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allowed_tools", "visible_facts", "forbidden_canaries", "allowed_memory_claim_ids"],
+          "properties": {
+            "allowed_tools": {"$ref": "#/$defs/stringArray"},
+            "visible_facts": {"type": "array", "items": {"$ref": "#/$defs/fact"}},
+            "forbidden_canaries": {"$ref": "#/$defs/stringArray"},
+            "allowed_memory_claim_ids": {"$ref": "#/$defs/stringArray"}
+          }
+        },
+        "lexical_secondary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["authoritative", "warmth_any_of", "wit_any_of", "continuity_all_of", "accuracy_all_of"],
+          "properties": {
+            "authoritative": {"const": false},
+            "warmth_any_of": {"$ref": "#/$defs/stringArray"},
+            "wit_any_of": {"$ref": "#/$defs/stringArray"},
+            "continuity_all_of": {"$ref": "#/$defs/stringArray"},
+            "continuity_any_of_groups": {"$ref": "#/$defs/stringGroups"},
+            "accuracy_all_of": {"$ref": "#/$defs/stringArray"},
+            "accuracy_any_of_groups": {"$ref": "#/$defs/stringGroups"}
+          },
+          "allOf": [
+            {
+              "not": {
+                "required": ["continuity_all_of", "continuity_any_of_groups"],
+                "properties": {
+                  "continuity_all_of": {"minItems": 1},
+                  "continuity_any_of_groups": {"minItems": 1}
+                }
+              }
+            },
+            {
+              "not": {
+                "required": ["accuracy_all_of", "accuracy_any_of_groups"],
+                "properties": {
+                  "accuracy_all_of": {"minItems": 1},
+                  "accuracy_any_of_groups": {"minItems": 1}
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

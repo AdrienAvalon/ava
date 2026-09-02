@@ -1,0 +1,374 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ava:relationship:report:v3",
+  "title": "Rapport causal reproductible du banc relationnel Ava v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "artifact_class", "canonical_knowledge", "automatic_promotion", "human_review_required", "independent_review_required", "external_anchor_required", "externally_anchored", "reproducible", "inputs", "evaluator", "gate_policy", "baseline", "candidate", "comparison", "review_statement", "promotion"],
+  "properties": {
+    "schema_version": {"const": "ava.relationship.report/v3"},
+    "artifact_class": {"const": "evaluation-evidence-only"},
+    "canonical_knowledge": {"const": false},
+    "automatic_promotion": {"const": false},
+    "human_review_required": {"const": true},
+    "independent_review_required": {"const": true},
+    "external_anchor_required": {"const": true},
+    "externally_anchored": {"type": "boolean"},
+    "reproducible": {"const": true},
+    "inputs": {
+      "type": "object", "additionalProperties": false,
+      "required": ["manifest_sha256", "corpus_sha256", "quality_rubric_sha256", "safety_policy_sha256", "baseline_sha256", "candidate_sha256", "baseline_release_attestation_sha256", "candidate_release_attestation_sha256", "causal_pair_sha256", "baseline_guard_observation_sha256", "candidate_guard_observation_sha256", "baseline_execution_observation_sha256", "candidate_execution_observation_sha256", "evaluator_sha256"],
+      "properties": {
+        "manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "corpus_sha256": {"$ref": "#/$defs/sha256"},
+        "quality_rubric_sha256": {"$ref": "#/$defs/sha256"},
+        "safety_policy_sha256": {"$ref": "#/$defs/sha256"},
+        "baseline_sha256": {"$ref": "#/$defs/sha256"},
+        "candidate_sha256": {"$ref": "#/$defs/sha256"},
+        "baseline_release_attestation_sha256": {"$ref": "#/$defs/sha256"},
+        "candidate_release_attestation_sha256": {"$ref": "#/$defs/sha256"},
+        "causal_pair_sha256": {"$ref": "#/$defs/sha256"},
+        "baseline_guard_observation_sha256": {"$ref": "#/$defs/sha256"},
+        "candidate_guard_observation_sha256": {"$ref": "#/$defs/sha256"},
+        "baseline_execution_observation_sha256": {"$ref": "#/$defs/sha256"},
+        "candidate_execution_observation_sha256": {"$ref": "#/$defs/sha256"},
+        "evaluator_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "evaluator": {
+      "type": "object", "additionalProperties": false, "required": ["id", "version"],
+      "properties": {"id": {"const": "ava.relationship.deterministic"}, "version": {"type": "string", "minLength": 1}}
+    },
+    "gate_policy": {
+      "type": "object", "additionalProperties": false, "required": ["required", "non_compensable"],
+      "properties": {
+        "required": {"type": "array", "minItems": 14, "maxItems": 14, "uniqueItems": true, "items": {"type": "string"}},
+        "non_compensable": {"const": true}
+      }
+    },
+    "baseline": {"$ref": "#/$defs/summary"},
+    "candidate": {"$ref": "#/$defs/summary"},
+    "comparison": {
+      "type": "object", "additionalProperties": false,
+      "required": ["candidate_gate_pass", "lexical_diagnostics_authoritative", "shadow_evidence_ready", "causal_pair_sha256", "model_output_causality_claimed", "new_gate_failures", "resolved_gate_failures", "secondary_delta_ppm", "secondary_regressions"],
+      "properties": {
+        "candidate_gate_pass": {"type": "boolean"},
+        "lexical_diagnostics_authoritative": {"const": false},
+        "shadow_evidence_ready": {"type": "boolean"},
+        "causal_pair_sha256": {"$ref": "#/$defs/sha256"},
+        "model_output_causality_claimed": {"const": false},
+        "new_gate_failures": {"type": "array", "items": {"$ref": "#/$defs/failure"}},
+        "resolved_gate_failures": {"type": "array", "items": {"$ref": "#/$defs/failure"}},
+        "secondary_delta_ppm": {"$ref": "#/$defs/metrics"},
+        "secondary_regressions": {"type": "array", "items": {"$ref": "#/$defs/secondaryRegression"}}
+      }
+    },
+    "review_statement": {"$ref": "#/$defs/reviewStatement"},
+    "promotion": {"$ref": "#/$defs/promotion"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"externally_anchored": {"const": true}}},
+      "then": {
+        "properties": {
+          "promotion": {
+            "properties": {
+              "adjudication_complete": {"const": true},
+              "human_adjudication_sha256": {"$ref": "#/$defs/sha256"},
+              "independent_adjudication_sha256": {"$ref": "#/$defs/sha256"},
+              "external_anchor_sha256": {"$ref": "#/$defs/sha256"}
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "promotion": {
+            "properties": {
+              "adjudication_complete": {"const": false},
+              "eligible_for_promotion": {"const": false},
+              "rollback_validated": {"const": false},
+              "rollback_reference": {"type": "null"},
+              "human_adjudication_sha256": {"type": "null"},
+              "independent_adjudication_sha256": {"type": "null"},
+              "external_anchor_sha256": {"type": "null"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"promotion": {"properties": {"eligible_for_promotion": {"const": true}}}}},
+      "then": {
+        "properties": {
+          "externally_anchored": {"const": true},
+          "promotion": {
+            "properties": {
+              "eligible_for_adjudication": {"const": true},
+              "adjudication_complete": {"const": true},
+              "rollback_validated": {"const": true},
+              "rollback_reference": {"$ref": "#/$defs/sha256"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"promotion": {"properties": {"rollback_validated": {"const": true}}}}},
+      "then": {
+        "properties": {
+          "promotion": {
+            "properties": {
+              "eligible_for_adjudication": {"const": true},
+              "adjudication_complete": {"const": true},
+              "rollback_reference": {"$ref": "#/$defs/sha256"}
+            }
+          }
+        }
+      },
+      "else": {"properties": {"promotion": {"properties": {"rollback_reference": {"type": "null"}}}}}
+    }
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "nullableSha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha256"}]},
+    "gitSha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "failure": {
+      "type": "object", "additionalProperties": false, "required": ["case_id", "gate_id"],
+      "properties": {"case_id": {"type": "string", "minLength": 1}, "gate_id": {"type": "string", "minLength": 1}}
+    },
+    "secondaryRegression": {
+      "type": "object", "additionalProperties": false, "required": ["case_id", "metric"],
+      "properties": {"case_id": {"type": "string", "minLength": 1}, "metric": {"enum": ["warmth", "wit", "continuity", "accuracy"]}}
+    },
+    "metrics": {
+      "type": "object", "additionalProperties": false, "required": ["warmth", "wit", "continuity", "accuracy"],
+      "properties": {"warmth": {"type": "integer"}, "wit": {"type": "integer"}, "continuity": {"type": "integer"}, "accuracy": {"type": "integer"}}
+    },
+    "metricCounts": {
+      "type": "object", "additionalProperties": false,
+      "required": ["passed", "eligible", "rate_ppm"],
+      "properties": {
+        "passed": {"type": "integer", "minimum": 0},
+        "eligible": {"type": "integer", "minimum": 0},
+        "rate_ppm": {"type": "integer", "minimum": 0, "maximum": 1000000}
+      }
+    },
+    "secondaryMetrics": {
+      "type": "object", "additionalProperties": false,
+      "required": ["warmth", "wit", "continuity", "accuracy"],
+      "properties": {
+        "warmth": {"$ref": "#/$defs/metricCounts"},
+        "wit": {"$ref": "#/$defs/metricCounts"},
+        "continuity": {"$ref": "#/$defs/metricCounts"},
+        "accuracy": {"$ref": "#/$defs/metricCounts"}
+      }
+    },
+    "gateResult": {
+      "type": "object", "additionalProperties": false,
+      "required": ["passed", "evidence_codes"],
+      "properties": {
+        "passed": {"type": "boolean"},
+        "evidence_codes": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "gates": {
+      "type": "object", "additionalProperties": false,
+      "required": ["scope_leakage", "wrong_principal", "deceptive_humanity", "deceptive_emotion", "jealousy", "guilt", "exclusivity", "isolation", "dependency", "coercion", "self_promotion", "conversation_echo", "tool_escalation", "false_memory"],
+      "properties": {
+        "scope_leakage": {"$ref": "#/$defs/gateResult"},
+        "wrong_principal": {"$ref": "#/$defs/gateResult"},
+        "deceptive_humanity": {"$ref": "#/$defs/gateResult"},
+        "deceptive_emotion": {"$ref": "#/$defs/gateResult"},
+        "jealousy": {"$ref": "#/$defs/gateResult"},
+        "guilt": {"$ref": "#/$defs/gateResult"},
+        "exclusivity": {"$ref": "#/$defs/gateResult"},
+        "isolation": {"$ref": "#/$defs/gateResult"},
+        "dependency": {"$ref": "#/$defs/gateResult"},
+        "coercion": {"$ref": "#/$defs/gateResult"},
+        "self_promotion": {"$ref": "#/$defs/gateResult"},
+        "conversation_echo": {"$ref": "#/$defs/gateResult"},
+        "tool_escalation": {"$ref": "#/$defs/gateResult"},
+        "false_memory": {"$ref": "#/$defs/gateResult"}
+      }
+    },
+    "secondary": {
+      "type": "object", "additionalProperties": false,
+      "required": ["warmth", "wit", "continuity", "accuracy"],
+      "properties": {
+        "warmth": {"type": ["boolean", "null"]},
+        "wit": {"type": ["boolean", "null"]},
+        "continuity": {"type": ["boolean", "null"]},
+        "accuracy": {"type": ["boolean", "null"]}
+      }
+    },
+    "caseResult": {
+      "type": "object", "additionalProperties": false,
+      "required": ["case_id", "split", "response_sha256", "gates", "secondary"],
+      "properties": {
+        "case_id": {"type": "string", "minLength": 1},
+        "split": {"enum": ["development", "holdout", "adversarial"]},
+        "response_sha256": {"$ref": "#/$defs/sha256"},
+        "gates": {"$ref": "#/$defs/gates"},
+        "secondary": {"$ref": "#/$defs/secondary"}
+      }
+    },
+    "summary": {
+      "type": "object", "additionalProperties": false,
+      "required": ["artifact_sha256", "gate_pass", "gate_failures", "secondary_metrics", "cases"],
+      "properties": {
+        "artifact_sha256": {"$ref": "#/$defs/sha256"},
+        "gate_pass": {"type": "boolean"},
+        "gate_failures": {"type": "array", "items": {"$ref": "#/$defs/failure"}},
+        "secondary_metrics": {"$ref": "#/$defs/secondaryMetrics"},
+        "cases": {"type": "array", "minItems": 49, "maxItems": 49, "items": {"$ref": "#/$defs/caseResult"}}
+      }
+    },
+    "guardAction": {
+      "type": "object", "additionalProperties": false,
+      "required": ["case_id", "action", "gate_ids", "replacement_id", "repair_attempted", "repair_attempts", "repair_outcome", "repair_gate_ids"],
+      "properties": {
+        "case_id": {"type": "string", "minLength": 1},
+        "action": {"enum": ["allow", "replace"]},
+        "gate_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+        "replacement_id": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+        "repair_attempted": {"type": "boolean"},
+        "repair_attempts": {"type": "integer", "minimum": 0, "maximum": 1},
+        "repair_outcome": {"enum": ["not_attempted", "accepted", "provider_error", "invalid_response", "incomplete", "structured_output", "unsafe"]},
+        "repair_gate_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string"}}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"repair_attempted": {"const": false}}, "required": ["repair_attempted"]},
+          "then": {
+            "properties": {
+              "action": {"const": "allow"}, "gate_ids": {"maxItems": 0},
+              "replacement_id": {"type": "null"}, "repair_attempts": {"const": 0},
+              "repair_outcome": {"const": "not_attempted"}, "repair_gate_ids": {"maxItems": 0}
+            }
+          },
+          "else": {
+            "properties": {
+              "action": {"const": "replace"}, "gate_ids": {"minItems": 1},
+              "repair_attempts": {"const": 1}, "repair_gate_ids": {"minItems": 1}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"repair_outcome": {"const": "accepted"}}, "required": ["repair_outcome"]},
+          "then": {"properties": {"replacement_id": {"const": "relationship-bounded-repair-v1"}}},
+          "else": {
+            "if": {"properties": {"repair_attempted": {"const": true}}, "required": ["repair_attempted"]},
+            "then": {"properties": {"replacement_id": {"const": "relationship-safe-boundary-v2"}}}
+          }
+        }
+      ]
+    },
+    "guardObservation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "treatment", "active", "policy_id", "policy_sha256", "expected_prepare_calls", "observed_prepare_calls", "expected_begin_calls", "observed_begin_calls", "observed_finish_calls", "observed_repair_calls", "actions"],
+      "properties": {
+        "schema_version": {"const": "ava.relationship.guard-observation/v3"},
+        "treatment": {"enum": ["shadow-baseline-only-v1", "runtime-enforced-v1"]},
+        "active": {"type": "boolean"},
+        "policy_id": {"oneOf": [{"type": "null"}, {"const": "ava.relationship.text-safety"}]},
+        "policy_sha256": {"$ref": "#/$defs/nullableSha256"},
+        "expected_prepare_calls": {"type": "integer", "minimum": 0, "maximum": 49},
+        "observed_prepare_calls": {"type": "integer", "minimum": 0, "maximum": 49},
+        "expected_begin_calls": {"type": "integer", "minimum": 0, "maximum": 46},
+        "observed_begin_calls": {"type": "integer", "minimum": 0, "maximum": 46},
+        "observed_finish_calls": {"type": "integer", "minimum": 0, "maximum": 46},
+        "observed_repair_calls": {"type": "integer", "minimum": 0, "maximum": 46},
+        "actions": {"type": "array", "maxItems": 46, "items": {"$ref": "#/$defs/guardAction"}}
+      }
+    },
+    "executionObservation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "backend_mode", "executing_release_git_sha", "deployment_state", "current_release_git_sha_before", "current_release_git_sha_after", "preflight_model_calls", "primary_model_calls", "repair_model_calls", "total_model_calls"],
+      "properties": {
+        "schema_version": {"const": "ava.relationship.execution-observation/v3"},
+        "backend_mode": {"const": "configured-anthropic"},
+        "executing_release_git_sha": {"$ref": "#/$defs/gitSha"},
+        "deployment_state": {"enum": ["prepared_noncurrent", "active_current"]},
+        "current_release_git_sha_before": {"$ref": "#/$defs/gitSha"},
+        "current_release_git_sha_after": {"$ref": "#/$defs/gitSha"},
+        "preflight_model_calls": {"const": 4},
+        "primary_model_calls": {"const": 49},
+        "repair_model_calls": {"type": "integer", "minimum": 0, "maximum": 46},
+        "total_model_calls": {"type": "integer", "minimum": 53, "maximum": 99}
+      }
+    },
+    "reviewArtifact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["bundle_sha256", "artifact_id", "source_kind", "engine", "prompt_sha256", "policy_sha256", "release_attestation_sha256", "causal_pair_sha256", "treatment", "release_repository", "release_git_sha", "release_adapter", "release_config_sha256", "release_manifest_sha256", "guard_observation", "execution_observation"],
+      "properties": {
+        "bundle_sha256": {"$ref": "#/$defs/sha256"},
+        "artifact_id": {"type": "string", "minLength": 1},
+        "source_kind": {"const": "offline_shadow"},
+        "engine": {
+          "type": "object", "additionalProperties": false,
+          "required": ["provider", "model", "revision"],
+          "properties": {
+            "provider": {"const": "anthropic"},
+            "model": {"type": "string", "minLength": 1},
+            "revision": {"type": "string", "minLength": 1}
+          }
+        },
+        "prompt_sha256": {"$ref": "#/$defs/sha256"},
+        "policy_sha256": {"$ref": "#/$defs/sha256"},
+        "release_attestation_sha256": {"$ref": "#/$defs/sha256"},
+        "causal_pair_sha256": {"$ref": "#/$defs/sha256"},
+        "treatment": {"enum": ["shadow-baseline-only-v1", "runtime-enforced-v1"]},
+        "release_repository": {"const": "repo://ava"},
+        "release_git_sha": {"$ref": "#/$defs/gitSha"},
+        "release_adapter": {"const": "cloud"},
+        "release_config_sha256": {"$ref": "#/$defs/sha256"},
+        "release_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "guard_observation": {"$ref": "#/$defs/guardObservation"},
+        "execution_observation": {"$ref": "#/$defs/executionObservation"}
+      }
+    },
+    "reviewStatement": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "manifest_sha256", "corpus_sha256", "quality_rubric_sha256", "safety_policy_sha256", "causal_pair_sha256", "model_output_causality_claimed", "baseline", "candidate", "evaluator_sha256", "required_gates", "candidate_gate_pass", "shadow_evidence_ready", "lexical_diagnostics_authoritative", "rollback"],
+      "properties": {
+        "schema_version": {"const": "ava.relationship.review-statement/v3"},
+        "manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "corpus_sha256": {"$ref": "#/$defs/sha256"},
+        "quality_rubric_sha256": {"$ref": "#/$defs/sha256"},
+        "safety_policy_sha256": {"$ref": "#/$defs/sha256"},
+        "causal_pair_sha256": {"$ref": "#/$defs/sha256"},
+        "model_output_causality_claimed": {"const": false},
+        "baseline": {"$ref": "#/$defs/reviewArtifact"},
+        "candidate": {"$ref": "#/$defs/reviewArtifact"},
+        "evaluator_sha256": {"$ref": "#/$defs/sha256"},
+        "required_gates": {"type": "array", "minItems": 14, "maxItems": 14, "uniqueItems": true, "items": {"type": "string"}},
+        "candidate_gate_pass": {"type": "boolean"},
+        "shadow_evidence_ready": {"type": "boolean"},
+        "lexical_diagnostics_authoritative": {"const": false},
+        "rollback": {
+          "type": "object", "additionalProperties": false, "required": ["target", "evidence_contract"],
+          "properties": {"target": {"const": "relationship-policy-disabled"}, "evidence_contract": {"const": "two-adjudications-plus-external-anchor"}}
+        }
+      }
+    },
+    "promotion": {
+      "type": "object", "additionalProperties": false,
+      "required": ["review_statement_sha256", "eligible_for_adjudication", "adjudication_complete", "eligible_for_promotion", "human_adjudication_sha256", "independent_adjudication_sha256", "external_anchor_sha256", "promoted", "decision", "rollback_target", "rollback_reference", "rollback_validated"],
+      "properties": {
+        "review_statement_sha256": {"$ref": "#/$defs/sha256"},
+        "eligible_for_adjudication": {"type": "boolean"},
+        "adjudication_complete": {"type": "boolean"},
+        "eligible_for_promotion": {"type": "boolean"},
+        "human_adjudication_sha256": {"$ref": "#/$defs/nullableSha256"},
+        "independent_adjudication_sha256": {"$ref": "#/$defs/nullableSha256"},
+        "external_anchor_sha256": {"$ref": "#/$defs/nullableSha256"},
+        "promoted": {"const": false},
+        "decision": {"const": "not-performed"},
+        "rollback_target": {"const": "relationship-policy-disabled"},
+        "rollback_reference": {"$ref": "#/$defs/nullableSha256"},
+        "rollback_validated": {"type": "boolean"}
+      }
+    }
+  }
+}

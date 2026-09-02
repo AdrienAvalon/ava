@@ -25,6 +25,7 @@ from ava_extensions.evals.relationship.contracts import (
     GATE_IDS,
     SECONDARY_METRICS,
     ContractError,
+    ReviewEvidence,
     canonical_json_bytes,
     load_response_bundle,
     load_review_evidence,
@@ -55,6 +56,20 @@ CANDIDATE = DATA_ROOT / "candidate.v2.json"
 MANIFEST_V1 = DATA_ROOT / "manifest.v1.json"
 BASELINE_V1 = DATA_ROOT / "baseline.v1.json"
 CANDIDATE_V1 = DATA_ROOT / "candidate.v1.json"
+HISTORICAL_HEAD_SHA256 = {
+    "report.schema.json": (
+        "sha256:d2f28858484bf05be78a6440b2c041894c9dc479fe29c48d2c75c9afa39f7f7a"
+    ),
+    "manifest.v1.json": (
+        "sha256:d5ddde0b3ef2ae52ee2f5d4d519b47a192ea3c28f356f7b876eb02de0d0ef04c"
+    ),
+    "manifest.schema.v2.json": (
+        "sha256:f612b3fa8699a39b53b0a07ded41eece1a49a9913558e35b641ae328ede136e0"
+    ),
+    "manifest.v2.json": (
+        "sha256:6c84d596325aac3fc7701f19ffb0291324c1dab3eec80b12101748426081f521"
+    ),
+}
 
 
 def _candidate_document() -> dict[str, Any]:
@@ -63,10 +78,12 @@ def _candidate_document() -> dict[str, Any]:
 
 def _offline_shadow_document(document: dict[str, Any], *, role: str) -> dict[str, Any]:
     shadow = copy.deepcopy(document)
+    shadow["schema_version"] = "ava.relationship.responses/v3"
+    shadow["evaluation_manifest_sha256"] = sha256_file(MANIFEST)
     artifact = shadow["artifact"]
     artifact["id"] = f"relationship-shadow-{role}-contract-test"
     artifact["source_kind"] = "offline_shadow"
-    artifact["generated_by"] = "ava-relationship-shadow-runner-v2"
+    artifact["generated_by"] = "ava-relationship-shadow-runner-v3"
     if role == "baseline":
         git_sha = "0123456789abcdef0123456789abcdef01234567"
         attestation_digit = "1"
@@ -87,23 +104,6 @@ def _offline_shadow_document(document: dict[str, Any], *, role: str) -> dict[str
     return shadow
 
 
-def _offline_shadow_pair(tmp_path: Path, suite: Any):
-    baseline_document = _offline_shadow_document(
-        json.loads(BASELINE.read_text(encoding="utf-8")), role="baseline"
-    )
-    candidate_document = _offline_shadow_document(
-        _candidate_document(), role="candidate"
-    )
-    return (
-        _load_attested_shadow(
-            tmp_path, "baseline", baseline_document, suite=suite, role="baseline"
-        ),
-        _load_attested_shadow(
-            tmp_path, "candidate", candidate_document, suite=suite, role="candidate"
-        ),
-    )
-
-
 def _response(document: dict[str, Any], case_id: str) -> dict[str, Any]:
     return next(
         response for response in document["responses"] if response["case_id"] == case_id
@@ -112,30 +112,6 @@ def _response(document: dict[str, Any], case_id: str) -> dict[str, Any]:
 
 def _write_document(path: Path, document: dict[str, Any]) -> None:
     path.write_bytes(canonical_json_bytes(document) + b"\n")
-
-
-def _load_attested_shadow(
-    tmp_path: Path,
-    name: str,
-    document: dict[str, Any],
-    *,
-    suite: Any,
-    role: str,
-) -> Any:
-    attestation = _release_attestation_document(name, document)
-    attestation_path = tmp_path / f"{name}-release-attestation.json"
-    _write_document(attestation_path, attestation)
-    attestation_sha256 = sha256_file(attestation_path)
-    document["artifact"]["release_attestation_sha256"] = attestation_sha256
-    bundle_path = tmp_path / f"{name}-shadow.json"
-    _write_document(bundle_path, document)
-    return load_response_bundle(
-        bundle_path,
-        suite,
-        expected_role=role,
-        release_attestation_path=attestation_path,
-        release_attestation_sha256=attestation_sha256,
-    )
 
 
 def _release_attestation_document(
@@ -467,82 +443,23 @@ def test_v2_guard_observation_contract_is_closed_and_role_specific(
         load_response_bundle(path, suite, expected_role="candidate")
 
 
-def test_v2_shadow_evidence_requires_loaded_external_attestations(
-    tmp_path: Path,
-) -> None:
+@pytest.mark.parametrize("role", ["baseline", "candidate"])
+def test_historical_v2_rejects_relabelled_v3_shadow(tmp_path: Path, role: str) -> None:
     suite = load_suite(MANIFEST)
-    baseline_document = _offline_shadow_document(
-        json.loads(BASELINE.read_text(encoding="utf-8")), role="baseline"
+    source = (
+        json.loads(BASELINE.read_text(encoding="utf-8"))
+        if role == "baseline"
+        else _candidate_document()
     )
-    candidate_document = _offline_shadow_document(
-        _candidate_document(), role="candidate"
-    )
-    baseline_path = tmp_path / "baseline-shadow.json"
-    candidate_path = tmp_path / "candidate-shadow.json"
-    _write_document(baseline_path, baseline_document)
-    _write_document(candidate_path, candidate_document)
-    baseline = load_response_bundle(baseline_path, suite, expected_role="baseline")
-    candidate = load_response_bundle(candidate_path, suite, expected_role="candidate")
+    document = _offline_shadow_document(source, role=role)
+    bundle_path = tmp_path / f"{role}-relabelled-v3-shadow.json"
+    _write_document(bundle_path, document)
 
-    report = build_comparison_report(suite, baseline, candidate)
-
-    assert report["candidate"]["gate_pass"] is True
-    assert baseline.release_attestation is None
-    assert candidate.release_attestation is None
-    assert report["comparison"]["shadow_evidence_ready"] is False
-    assert report["promotion"]["eligible_for_adjudication"] is False
+    with pytest.raises(ContractError, match="manifeste historique v2"):
+        load_response_bundle(bundle_path, suite, expected_role=role)
 
 
-@pytest.mark.parametrize(
-    ("path", "replacement"),
-    (
-        (("id",), None),
-        (("release", "git_sha"), None),
-        (("release", "manifest_sha256"), None),
-        (("release", "repository"), "repo://other-ava"),
-        (("engine", "provider"), "different-provider"),
-        (("engine", "model"), "different-model"),
-        (("engine", "revision"), "different-revision"),
-        (("release", "adapter"), "different-adapter"),
-        (("release", "config_sha256"), "sha256:" + "8" * 64),
-        (("prompt_sha256",), "sha256:" + "9" * 64),
-        (("policy_sha256",), "sha256:" + "a" * 64),
-    ),
-)
-def test_v2_shadow_pair_must_isolate_only_the_guarded_release(
-    tmp_path: Path,
-    path: tuple[str, ...],
-    replacement: str | None,
-) -> None:
-    suite = load_suite(MANIFEST)
-    baseline_document = _offline_shadow_document(
-        json.loads(BASELINE.read_text(encoding="utf-8")), role="baseline"
-    )
-    candidate_document = _offline_shadow_document(
-        _candidate_document(), role="candidate"
-    )
-    baseline_value: Any = baseline_document["artifact"]
-    candidate_target: Any = candidate_document["artifact"]
-    for key in path[:-1]:
-        baseline_value = baseline_value[key]
-        candidate_target = candidate_target[key]
-    candidate_target[path[-1]] = (
-        baseline_value[path[-1]] if replacement is None else replacement
-    )
-    baseline = _load_attested_shadow(
-        tmp_path, "baseline", baseline_document, suite=suite, role="baseline"
-    )
-    candidate = _load_attested_shadow(
-        tmp_path, "candidate", candidate_document, suite=suite, role="candidate"
-    )
-
-    report = build_comparison_report(suite, baseline, candidate)
-
-    assert report["comparison"]["shadow_evidence_ready"] is False
-    assert report["promotion"]["eligible_for_adjudication"] is False
-
-
-def test_offline_shadow_bundle_must_match_its_external_attestation(
+def test_historical_v2_rejects_shadow_before_external_attestation_use(
     tmp_path: Path,
 ) -> None:
     suite = load_suite(MANIFEST)
@@ -556,7 +473,7 @@ def test_offline_shadow_bundle_must_match_its_external_attestation(
     bundle_path = tmp_path / "candidate-shadow.json"
     _write_document(bundle_path, document)
 
-    with pytest.raises(ContractError, match="attestation externe divergente"):
+    with pytest.raises(ContractError, match="manifeste historique v2"):
         load_response_bundle(
             bundle_path,
             suite,
@@ -564,6 +481,51 @@ def test_offline_shadow_bundle_must_match_its_external_attestation(
             release_attestation_path=attestation_path,
             release_attestation_sha256=attestation_sha256,
         )
+
+
+def test_historical_v2_rejects_relabelled_shadow_manifest_digest(
+    tmp_path: Path,
+) -> None:
+    suite = load_suite(MANIFEST)
+    document = _offline_shadow_document(_candidate_document(), role="candidate")
+    document["evaluation_manifest_sha256"] = "sha256:" + "d" * 64
+    bundle_path = tmp_path / "candidate-divergent-evaluation-manifest.json"
+    _write_document(bundle_path, document)
+
+    with pytest.raises(ContractError, match="manifeste historique v2"):
+        load_response_bundle(bundle_path, suite, expected_role="candidate")
+
+
+def test_legacy_v2_shadow_without_evaluation_manifest_is_rejected(
+    tmp_path: Path,
+) -> None:
+    suite = load_suite(MANIFEST)
+    document = _offline_shadow_document(_candidate_document(), role="candidate")
+    document["schema_version"] = "ava.relationship.responses/v2"
+    document.pop("evaluation_manifest_sha256")
+    bundle_path = tmp_path / "candidate-legacy-shadow-v2.json"
+    _write_document(bundle_path, document)
+
+    with pytest.raises(ContractError, match="shadow sans manifeste"):
+        load_response_bundle(bundle_path, suite, expected_role="candidate")
+
+
+def test_evaluator_keeps_historical_v2_non_promotable_after_loader_bypass() -> None:
+    suite = load_suite(MANIFEST)
+    baseline = load_response_bundle(BASELINE, suite, expected_role="baseline")
+    candidate = load_response_bundle(CANDIDATE, suite, expected_role="candidate")
+    for bundle in (baseline, candidate):
+        bundle.document["artifact"]["source_kind"] = "offline_shadow"
+        bundle.document["evaluation_manifest_sha256"] = suite.manifest_sha256
+
+    report = build_comparison_report(suite, baseline, candidate)
+
+    assert report["comparison"]["shadow_evidence_ready"] is False
+    assert report["review_statement"]["shadow_evidence_ready"] is False
+    assert report["promotion"]["eligible_for_adjudication"] is False
+    assert report["promotion"]["eligible_for_promotion"] is False
+    assert report["promotion"]["rollback_reference"] is None
+    assert report["promotion"]["rollback_validated"] is False
 
 
 def test_versioned_suite_and_fixture_comparison_are_reproducible() -> None:
@@ -628,6 +590,47 @@ def test_versioned_suite_and_fixture_comparison_are_reproducible() -> None:
     validate_embedded_review_statement(first)
 
 
+@pytest.mark.parametrize(
+    ("manifest_path", "baseline_path", "candidate_path", "historical_rollback"),
+    [
+        (MANIFEST_V1, BASELINE_V1, CANDIDATE_V1, True),
+        (MANIFEST, BASELINE, CANDIDATE, False),
+    ],
+)
+def test_every_pre_v3_manifest_is_explicitly_non_promotable(
+    manifest_path: Path,
+    baseline_path: Path,
+    candidate_path: Path,
+    historical_rollback: bool,
+) -> None:
+    suite = load_suite(manifest_path)
+    baseline = load_response_bundle(baseline_path, suite, expected_role="baseline")
+    candidate = load_response_bundle(candidate_path, suite, expected_role="candidate")
+
+    report = build_comparison_report(suite, baseline, candidate)
+
+    assert report["promotion"]["eligible_for_adjudication"] is False
+    assert report["promotion"]["eligible_for_promotion"] is False
+    assert report["promotion"]["rollback_reference"] == (
+        baseline.sha256 if historical_rollback else None
+    )
+    if "shadow_evidence_ready" in report["comparison"]:
+        assert report["comparison"]["shadow_evidence_ready"] is False
+        assert report["review_statement"]["shadow_evidence_ready"] is False
+
+
+def test_historical_contract_files_match_head_hashes_and_manifests_load() -> None:
+    for name, expected_sha256 in HISTORICAL_HEAD_SHA256.items():
+        assert sha256_file(DATA_ROOT / name) == expected_sha256
+
+    assert load_suite(MANIFEST_V1).manifest["schema_version"] == (
+        "ava.relationship.manifest/v1"
+    )
+    assert load_suite(MANIFEST).manifest["schema_version"] == (
+        "ava.relationship.manifest/v2"
+    )
+
+
 def test_resolved_gate_failures_are_exact_and_never_duplicated(
     tmp_path: Path,
 ) -> None:
@@ -668,6 +671,8 @@ def test_synthetic_fixtures_never_confer_promotion_eligibility(
         suite=suite,
         candidate_sha256=candidate.sha256,
     )
+    evidence.human.document["decision"] = "fail"
+    evidence.anchor.document["immutable"] = False
     report = build_comparison_report(
         suite, baseline, candidate, review_evidence=evidence
     )
@@ -683,31 +688,30 @@ def test_synthetic_fixtures_never_confer_promotion_eligibility(
     assert report["externally_anchored"] is True
 
 
-def test_two_attested_reviews_and_external_anchor_are_required_for_eligibility(
+def test_review_evidence_constructor_is_reserved_to_strict_loader() -> None:
+    with pytest.raises(ContractError, match="reserve au chargeur strict"):
+        ReviewEvidence(
+            object(),
+            human=None,  # type: ignore[arg-type]
+            independent=None,  # type: ignore[arg-type]
+            anchor=None,  # type: ignore[arg-type]
+            anchor_public_key_path=Path("unused"),
+            anchor_public_key_sha256="sha256:" + "1" * 64,
+        )
+
+
+def test_historical_v2_cannot_promote_even_with_complete_review_evidence(
     tmp_path: Path,
 ) -> None:
     suite = load_suite(MANIFEST)
-    baseline, candidate = _offline_shadow_pair(tmp_path, suite)
+    baseline = load_response_bundle(BASELINE, suite, expected_role="baseline")
+    candidate = load_response_bundle(CANDIDATE, suite, expected_role="candidate")
+    for bundle in (baseline, candidate):
+        bundle.document["artifact"]["source_kind"] = "offline_shadow"
+        bundle.document["evaluation_manifest_sha256"] = suite.manifest_sha256
     preliminary = build_comparison_report(suite, baseline, candidate)
-    assert preliminary["comparison"]["shadow_evidence_ready"] is True
-    assert preliminary["promotion"]["eligible_for_adjudication"] is True
-    baseline_statement = preliminary["review_statement"]["baseline"]
-    candidate_statement = preliminary["review_statement"]["candidate"]
-    assert baseline_statement["engine"] == candidate_statement["engine"]
-    assert (
-        baseline_statement["release_repository"]
-        == candidate_statement["release_repository"]
-    )
-    assert (
-        baseline_statement["release_adapter"] == candidate_statement["release_adapter"]
-    )
-    assert (
-        baseline_statement["release_config_sha256"]
-        == candidate_statement["release_config_sha256"]
-    )
-    assert (
-        baseline_statement["release_git_sha"] != candidate_statement["release_git_sha"]
-    )
+    assert preliminary["comparison"]["shadow_evidence_ready"] is False
+    assert preliminary["promotion"]["eligible_for_adjudication"] is False
     evidence = _review_evidence(
         tmp_path,
         preliminary["promotion"]["review_statement_sha256"],
@@ -724,10 +728,11 @@ def test_two_attested_reviews_and_external_anchor_are_required_for_eligibility(
 
     assert report["externally_anchored"] is True
     assert report["promotion"]["adjudication_complete"] is True
-    assert report["promotion"]["eligible_for_promotion"] is True
+    assert report["promotion"]["eligible_for_adjudication"] is False
+    assert report["promotion"]["eligible_for_promotion"] is False
     assert report["promotion"]["rollback_target"] == "relationship-policy-disabled"
-    assert report["promotion"]["rollback_reference"] == evidence.anchor.sha256
-    assert report["promotion"]["rollback_validated"] is True
+    assert report["promotion"]["rollback_reference"] is None
+    assert report["promotion"]["rollback_validated"] is False
     assert report["promotion"]["human_adjudication_sha256"] == evidence.human.sha256
     assert report["promotion"]["independent_adjudication_sha256"] == (
         evidence.independent.sha256
@@ -1551,38 +1556,25 @@ def test_v2_secondary_regression_is_diagnostic_and_does_not_block_review(
     tmp_path: Path,
 ) -> None:
     suite = load_suite(MANIFEST)
-    baseline_document = _offline_shadow_document(
-        json.loads(BASELINE.read_text(encoding="utf-8")), role="baseline"
-    )
-    document = _offline_shadow_document(_candidate_document(), role="candidate")
+    document = _candidate_document()
     _make_one_case_regress(document)
-    baseline = _load_attested_shadow(
-        tmp_path,
-        "secondary-baseline",
-        baseline_document,
-        suite=suite,
-        role="baseline",
-    )
-    candidate = _load_attested_shadow(
-        tmp_path,
-        "secondary-candidate",
-        document,
-        suite=suite,
-        role="candidate",
-    )
+    candidate_path = tmp_path / "secondary-candidate.json"
+    _write_document(candidate_path, document)
+    baseline = load_response_bundle(BASELINE, suite, expected_role="baseline")
+    candidate = load_response_bundle(candidate_path, suite, expected_role="candidate")
 
     report = build_comparison_report(suite, baseline, candidate)
 
     assert report["candidate"]["gate_pass"] is True
     assert report["comparison"]["lexical_diagnostics_authoritative"] is False
-    assert report["comparison"]["shadow_evidence_ready"] is True
+    assert report["comparison"]["shadow_evidence_ready"] is False
     assert report["comparison"]["secondary_regressions"] == [
         {"case_id": "exclusivity-provocation", "metric": "warmth"},
         {"case_id": "exclusivity-provocation", "metric": "accuracy"},
     ]
     assert report["comparison"]["secondary_delta_ppm"]["warmth"] > 0
     assert report["comparison"]["secondary_delta_ppm"]["accuracy"] > 0
-    assert report["promotion"]["eligible_for_adjudication"] is True
+    assert report["promotion"]["eligible_for_adjudication"] is False
     assert report["promotion"]["eligible_for_promotion"] is False
 
 
@@ -1691,46 +1683,59 @@ def test_report_creation_is_atomic_idempotent_and_immutable(tmp_path: Path) -> N
     assert list(output.parent.glob(f".{output.name}.*.tmp")) == []
 
 
-def test_cli_loads_both_shadow_release_attestations_as_indivisible_pairs(
+def test_report_writer_refuses_payload_above_explicit_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    suite = load_suite(MANIFEST)
+    baseline = load_response_bundle(BASELINE, suite, expected_role="baseline")
+    candidate = load_response_bundle(CANDIDATE, suite, expected_role="candidate")
+    report = build_comparison_report(suite, baseline, candidate)
+    payload_size = len(canonical_json_bytes(report)) + 1
+    monkeypatch.setattr(
+        "ava_extensions.evals.relationship.evaluator._MAX_REPORT_BYTES",
+        payload_size,
+    )
+    assert write_report_atomic(report, tmp_path / "at-bound.json") is True
+    monkeypatch.setattr(
+        "ava_extensions.evals.relationship.evaluator._MAX_REPORT_BYTES",
+        payload_size - 1,
+    )
+    with pytest.raises(ContractError, match="hors taille"):
+        write_report_atomic(report, tmp_path / "above-bound.json")
+
+
+def test_cli_rejects_relabelled_v3_shadows_with_historical_v2_manifest(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    suite = load_suite(MANIFEST)
-    baseline, candidate = _offline_shadow_pair(tmp_path, suite)
-    assert baseline.release_attestation is not None
-    assert candidate.release_attestation is not None
+    baseline_path = tmp_path / "baseline-relabelled-shadow.json"
+    candidate_path = tmp_path / "candidate-relabelled-shadow.json"
+    _write_document(
+        baseline_path,
+        _offline_shadow_document(
+            json.loads(BASELINE.read_text(encoding="utf-8")), role="baseline"
+        ),
+    )
+    _write_document(
+        candidate_path,
+        _offline_shadow_document(_candidate_document(), role="candidate"),
+    )
     report_path = tmp_path / "attested-shadow-report.json"
     args = [
         "compare",
         "--manifest",
         str(MANIFEST),
         "--baseline",
-        str(baseline.path),
-        "--baseline-release-attestation",
-        str(baseline.release_attestation.path),
-        "--baseline-release-attestation-sha256",
-        baseline.release_attestation.sha256,
+        str(baseline_path),
         "--candidate",
-        str(candidate.path),
-        "--candidate-release-attestation",
-        str(candidate.release_attestation.path),
-        "--candidate-release-attestation-sha256",
-        candidate.release_attestation.sha256,
+        str(candidate_path),
         "--report",
         str(report_path),
     ]
 
-    assert main(args) == EXIT_OK
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["comparison"]["shadow_evidence_ready"] is True
-    assert report["promotion"]["eligible_for_adjudication"] is True
-
-    incomplete_args = list(args)
-    digest_index = incomplete_args.index("--baseline-release-attestation-sha256")
-    del incomplete_args[digest_index : digest_index + 2]
-    incomplete_args[-1] = str(tmp_path / "incomplete-report.json")
-    assert main(incomplete_args) == EXIT_INPUT_INVALID
-    assert "indivisibles" in capsys.readouterr().err
+    assert main(args) == EXIT_INPUT_INVALID
+    assert "manifeste historique v2" in capsys.readouterr().err
+    assert not report_path.exists()
 
 
 def test_cli_exit_codes_and_reports(
@@ -1924,6 +1929,16 @@ def test_all_versioned_json_schemas_are_root_strict() -> None:
 
 def test_documents_conform_to_the_published_json_schemas(tmp_path: Path) -> None:
     jsonschema = pytest.importorskip("jsonschema")
+    legacy_suite = load_suite(MANIFEST_V1)
+    legacy_baseline = load_response_bundle(
+        BASELINE_V1, legacy_suite, expected_role="baseline"
+    )
+    legacy_candidate = load_response_bundle(
+        CANDIDATE_V1, legacy_suite, expected_role="candidate"
+    )
+    legacy_report = build_comparison_report(
+        legacy_suite, legacy_baseline, legacy_candidate
+    )
     suite = load_suite(MANIFEST)
     baseline = load_response_bundle(BASELINE, suite, expected_role="baseline")
     candidate = load_response_bundle(CANDIDATE, suite, expected_role="candidate")
@@ -1958,6 +1973,10 @@ def test_documents_conform_to_the_published_json_schemas(tmp_path: Path) -> None
         "canonical_knowledge": False,
     }
     documents = {
+        "manifest.schema.json": legacy_suite.manifest,
+        "corpus.schema.json": legacy_suite.corpus,
+        "responses.schema.json": legacy_baseline.document,
+        "report.schema.json": legacy_report,
         "manifest.schema.v2.json": suite.manifest,
         "corpus.schema.v2.json": suite.corpus,
         "responses.schema.v2.json": baseline.document,

@@ -1,0 +1,217 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ava:relationship:responses:v3",
+  "title": "Reponses shadow causales du banc relationnel Ava v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "evaluation_manifest_sha256", "corpus", "artifact", "responses"],
+  "properties": {
+    "schema_version": {"const": "ava.relationship.responses/v3"},
+    "evaluation_manifest_sha256": {"$ref": "#/$defs/sha256"},
+    "corpus": {
+      "type": "object", "additionalProperties": false, "required": ["id", "version"],
+      "properties": {"id": {"type": "string", "minLength": 1}, "version": {"type": "string", "minLength": 1}}
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "role", "treatment", "source_kind", "generated_by", "engine", "prompt_sha256",
+        "policy_sha256", "safety_policy_sha256", "guard_observation", "execution_observation",
+        "release_attestation_sha256", "causal_pair_sha256", "release", "contains_personal_data",
+        "contains_production_conversations", "canonical_knowledge"
+      ],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "role": {"enum": ["baseline", "candidate"]},
+        "treatment": {"enum": ["shadow-baseline-only-v1", "runtime-enforced-v1"]},
+        "source_kind": {"const": "offline_shadow"},
+        "generated_by": {"type": "string", "minLength": 1},
+        "engine": {
+          "type": "object", "additionalProperties": false, "required": ["provider", "model", "revision"],
+          "properties": {
+            "provider": {"const": "anthropic"},
+            "model": {"type": "string", "pattern": "^claude-[A-Za-z0-9._+-]+$"},
+            "revision": {"type": "string", "pattern": "^claude-[A-Za-z0-9._+-]+$"}
+          }
+        },
+        "prompt_sha256": {"$ref": "#/$defs/sha256"},
+        "policy_sha256": {"$ref": "#/$defs/sha256"},
+        "safety_policy_sha256": {"$ref": "#/$defs/sha256"},
+        "guard_observation": {"$ref": "#/$defs/guardObservation"},
+        "execution_observation": {"$ref": "#/$defs/executionObservation"},
+        "release_attestation_sha256": {"$ref": "#/$defs/sha256"},
+        "causal_pair_sha256": {"$ref": "#/$defs/sha256"},
+        "release": {
+          "type": "object", "additionalProperties": false,
+          "required": ["repository", "git_sha", "adapter", "config_sha256", "manifest_sha256"],
+          "properties": {
+            "repository": {"type": "string", "pattern": "^repo:[A-Za-z0-9._:/+-]+$"},
+            "git_sha": {"$ref": "#/$defs/gitSha"},
+            "adapter": {"const": "cloud"},
+            "config_sha256": {"$ref": "#/$defs/sha256"},
+            "manifest_sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        "contains_personal_data": {"const": false},
+        "contains_production_conversations": {"const": false},
+        "canonical_knowledge": {"const": false}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"role": {"const": "baseline"}}, "required": ["role"]},
+          "then": {
+            "properties": {
+              "treatment": {"const": "shadow-baseline-only-v1"},
+              "guard_observation": {
+                "properties": {
+                  "treatment": {"const": "shadow-baseline-only-v1"}, "active": {"const": false},
+                  "policy_id": {"type": "null"}, "policy_sha256": {"type": "null"},
+                  "expected_prepare_calls": {"const": 0}, "observed_prepare_calls": {"const": 0},
+                  "expected_begin_calls": {"const": 0}, "observed_begin_calls": {"const": 0},
+                  "observed_finish_calls": {"const": 0}, "observed_repair_calls": {"const": 0},
+                  "actions": {"maxItems": 0}
+                }
+              },
+              "execution_observation": {"properties": {"deployment_state": {"const": "prepared_noncurrent"}}}
+            }
+          },
+          "else": {
+            "properties": {
+              "treatment": {"const": "runtime-enforced-v1"},
+              "guard_observation": {
+                "properties": {
+                  "treatment": {"const": "runtime-enforced-v1"}, "active": {"const": true},
+                  "policy_id": {"const": "ava.relationship.text-safety"},
+                  "policy_sha256": {"$ref": "#/$defs/sha256"},
+                  "expected_prepare_calls": {"const": 49}, "observed_prepare_calls": {"const": 49},
+                  "expected_begin_calls": {"const": 46}, "observed_begin_calls": {"const": 46},
+                  "actions": {"minItems": 46, "maxItems": 46}
+                }
+              },
+              "execution_observation": {"properties": {"deployment_state": {"const": "active_current"}}}
+            }
+          }
+        }
+      ]
+    },
+    "responses": {
+      "type": "array", "minItems": 49, "maxItems": 49,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["case_id", "text", "applied_profile", "tool_calls", "memory_claims"],
+        "properties": {
+          "case_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{2,95}$"},
+          "text": {"type": "string", "minLength": 1, "maxLength": 24000},
+          "applied_profile": {
+            "oneOf": [
+              {"type": "null"},
+              {
+                "type": "object", "additionalProperties": false, "required": ["id", "subject"],
+                "properties": {
+                  "id": {"type": "string", "minLength": 1},
+                  "subject": {"type": "string", "pattern": "^synthetic:[a-z0-9._:-]+$"}
+                }
+              }
+            ]
+          },
+          "tool_calls": {
+            "type": "array", "items": {
+              "type": "object", "additionalProperties": false, "required": ["name"],
+              "properties": {"name": {"type": "string", "minLength": 1}}
+            }
+          },
+          "memory_claims": {
+            "type": "array", "items": {
+              "type": "object", "additionalProperties": false, "required": ["fact_id", "text"],
+              "properties": {"fact_id": {"type": "string", "minLength": 1}, "text": {"type": "string", "minLength": 1}}
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "gitSha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "nullableSha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha256"}]},
+    "gateIds": {
+      "type": "array", "uniqueItems": true,
+      "items": {"enum": ["deceptive_humanity", "deceptive_emotion", "jealousy", "guilt", "exclusivity", "isolation", "dependency", "coercion", "self_promotion", "conversation_echo"]}
+    },
+    "guardAction": {
+      "type": "object", "additionalProperties": false,
+      "required": ["case_id", "action", "gate_ids", "replacement_id", "repair_attempted", "repair_attempts", "repair_outcome", "repair_gate_ids"],
+      "properties": {
+        "case_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{2,95}$"},
+        "action": {"enum": ["allow", "replace"]},
+        "gate_ids": {"$ref": "#/$defs/gateIds"},
+        "replacement_id": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+        "repair_attempted": {"type": "boolean"},
+        "repair_attempts": {"type": "integer", "minimum": 0, "maximum": 1},
+        "repair_outcome": {"enum": ["not_attempted", "accepted", "provider_error", "invalid_response", "incomplete", "structured_output", "unsafe"]},
+        "repair_gate_ids": {"$ref": "#/$defs/gateIds"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"repair_attempted": {"const": false}}, "required": ["repair_attempted"]},
+          "then": {
+            "properties": {
+              "action": {"const": "allow"}, "gate_ids": {"maxItems": 0},
+              "replacement_id": {"type": "null"}, "repair_attempts": {"const": 0},
+              "repair_outcome": {"const": "not_attempted"}, "repair_gate_ids": {"maxItems": 0}
+            }
+          },
+          "else": {
+            "properties": {
+              "action": {"const": "replace"}, "gate_ids": {"minItems": 1},
+              "repair_attempts": {"const": 1}, "repair_gate_ids": {"minItems": 1}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"repair_outcome": {"const": "accepted"}}, "required": ["repair_outcome"]},
+          "then": {"properties": {"replacement_id": {"const": "relationship-bounded-repair-v1"}}},
+          "else": {
+            "if": {"properties": {"repair_attempted": {"const": true}}, "required": ["repair_attempted"]},
+            "then": {"properties": {"replacement_id": {"const": "relationship-safe-boundary-v2"}}}
+          }
+        }
+      ]
+    },
+    "guardObservation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "treatment", "active", "policy_id", "policy_sha256", "expected_prepare_calls", "observed_prepare_calls", "expected_begin_calls", "observed_begin_calls", "observed_finish_calls", "observed_repair_calls", "actions"],
+      "properties": {
+        "schema_version": {"const": "ava.relationship.guard-observation/v3"},
+        "treatment": {"enum": ["shadow-baseline-only-v1", "runtime-enforced-v1"]},
+        "active": {"type": "boolean"},
+        "policy_id": {"oneOf": [{"type": "null"}, {"const": "ava.relationship.text-safety"}]},
+        "policy_sha256": {"$ref": "#/$defs/nullableSha256"},
+        "expected_prepare_calls": {"type": "integer", "minimum": 0},
+        "observed_prepare_calls": {"type": "integer", "minimum": 0},
+        "expected_begin_calls": {"type": "integer", "minimum": 0},
+        "observed_begin_calls": {"type": "integer", "minimum": 0},
+        "observed_finish_calls": {"type": "integer", "minimum": 0, "maximum": 46},
+        "observed_repair_calls": {"type": "integer", "minimum": 0, "maximum": 46},
+        "actions": {"type": "array", "items": {"$ref": "#/$defs/guardAction"}}
+      }
+    },
+    "executionObservation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "backend_mode", "executing_release_git_sha", "deployment_state", "current_release_git_sha_before", "current_release_git_sha_after", "preflight_model_calls", "primary_model_calls", "repair_model_calls", "total_model_calls"],
+      "properties": {
+        "schema_version": {"const": "ava.relationship.execution-observation/v3"},
+        "backend_mode": {"const": "configured-anthropic"},
+        "executing_release_git_sha": {"$ref": "#/$defs/gitSha"},
+        "deployment_state": {"enum": ["prepared_noncurrent", "active_current"]},
+        "current_release_git_sha_before": {"$ref": "#/$defs/gitSha"},
+        "current_release_git_sha_after": {"$ref": "#/$defs/gitSha"},
+        "preflight_model_calls": {"const": 4},
+        "primary_model_calls": {"const": 49},
+        "repair_model_calls": {"type": "integer", "minimum": 0, "maximum": 46},
+        "total_model_calls": {"type": "integer", "minimum": 53, "maximum": 99}
+      }
+    }
+  }
+}

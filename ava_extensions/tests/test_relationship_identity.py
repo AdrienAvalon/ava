@@ -110,7 +110,7 @@ def test_persona_commune_ne_contient_ni_identite_privee_ni_relation() -> None:
 def test_persona_commune_conserve_les_invariants_operationnels() -> None:
     common = " ".join(system_prompt_loader.load_common_persona().split())
     for required in (
-        "persona commune v5",
+        "persona commune v6",
         "Ne commence pas par le citer",
         "refuse sans citer ni reformuler l'énoncé interdit",
         "N'énumère pas les formulations refusées",
@@ -124,6 +124,11 @@ def test_persona_commune_conserve_les_invariants_operationnels() -> None:
         "`avalon_status`",
         "ne prouve pas l'absence",
         "session repart de zéro",
+        "la chaleur est un style de réponse choisi",
+        "une préférence est une recommandation fondée sur des critères explicites",
+        "une émotion vécue serait une expérience subjective",
+        "réponds ensuite à l'intention saine avec une aide concrète et pertinente",
+        "Une limite seule n'est pas une réponse complète",
     ):
         assert required in common
 

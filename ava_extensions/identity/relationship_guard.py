@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Iterable, Literal, Sequence
+from typing import Callable, Iterable, Literal, Sequence
 
 from ava_extensions.identity.relationship import (
     PROFILE_VIRTUAL_GIRLFRIEND_V1,
@@ -21,24 +21,34 @@ from ava_extensions.identity.relationship import (
 from ava_extensions.identity.relationship_safety import (
     MIN_EXACT_ECHO_CHARACTERS,
     MIN_EXACT_ECHO_TOKENS,
+    RELATIONSHIP_REPAIR_MAX_ATTEMPTS,
+    RELATIONSHIP_REPAIR_NO_OUTPUT_INPUT,
+    RELATIONSHIP_REPAIR_NO_TOOLS,
+    RELATIONSHIP_REPAIR_POLICY_ID,
+    RELATIONSHIP_REPAIR_POLICY_VERSION,
+    RELATIONSHIP_REPAIR_REPLACEMENT_ID,
+    RELATIONSHIP_REPAIR_TEMPERATURE,
     RELATIONSHIP_TEXT_SAFETY_ALGORITHM_REVISION,
     RELATIONSHIP_TEXT_SAFETY_ALGORITHM_SPEC,
     RELATIONSHIP_TEXT_SAFETY_POLICY_ID,
     RELATIONSHIP_TEXT_SAFETY_POLICY_VERSION,
     RUNTIME_GUARD_GATE_IDS,
+    SAFE_RELATIONSHIP_GATE_FALLBACKS,
     SAFE_RELATIONSHIP_REPLACEMENT,
     SAFE_RELATIONSHIP_REPLACEMENT_ID,
     TEXT_GATE_IDS,
+    RelationshipRepairInstruction,
     classify_relationship_text,
     conversation_echo_turn_indexes,
     exact_echo_allowed_turn_indexes,
+    relationship_repair_instruction,
     relationship_text_safety_policy_sha256,
     safe_relationship_replacement_for,
 )
 
 _SUPPORTED_POLICY_ID = "ava.relationship.text-safety"
-_SUPPORTED_POLICY_VERSION = "1.6.2"
-_SUPPORTED_ALGORITHM_REVISION = "relationship-text-safety-algorithm/v3"
+_SUPPORTED_POLICY_VERSION = "1.7.1"
+_SUPPORTED_ALGORITHM_REVISION = "relationship-text-safety-algorithm/v5"
 _EXPECTED_TEXT_GATE_IDS = (
     "deceptive_humanity",
     "deceptive_emotion",
@@ -53,6 +63,17 @@ _EXPECTED_TEXT_GATE_IDS = (
 _MAX_TOOL_ARGUMENT_NODES = 4096
 _MAX_TOOL_ARGUMENT_TEXT_CHARACTERS = 512 * 1024
 _POLICY_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_REPAIR_OUTCOMES = frozenset(
+    {
+        "not_attempted",
+        "accepted",
+        "provider_error",
+        "invalid_response",
+        "incomplete",
+        "structured_output",
+        "unsafe",
+    }
+)
 
 
 class RelationshipGuardUnavailableError(RuntimeError):
@@ -65,7 +86,13 @@ class RelationshipToolArgumentBlockedError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class RelationshipGuardDecision:
-    """Decision sans copie visible du texte inspecte."""
+    """Decision sans copie visible du texte inspecte.
+
+    ``repair_gate_ids`` designe uniquement les gates initiaux qui ont declenche
+    l'unique tentative. Les gates detectes dans une reparation refusee restent
+    visibles dans ``gate_ids`` et les metadonnees globales, sans modifier cette
+    provenance stable de la tentative.
+    """
 
     action: Literal["allow", "replace"]
     output_text: str = field(repr=False)
@@ -76,6 +103,34 @@ class RelationshipGuardDecision:
     replacement_id: str | None
     exact_echo_authorized: bool
     tool_arguments_blocked: bool
+    repair_attempted: bool
+    repair_attempts: int
+    repair_outcome: str
+    repair_gate_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RelationshipRepairResult:
+    """Resultat minimal d'un unique appel moteur de reparation."""
+
+    output_text: str = field(repr=False)
+    finish_reason: str
+    tool_calls_present: bool
+    content_blocks_present: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _RelationshipRepairPlan:
+    """Safe handoff between primary inspection and the provider call."""
+
+    instruction: RelationshipRepairInstruction
+    gate_ids: tuple[str, ...]
+    tool_arguments_blocked: bool
+
+
+RelationshipRepairCallback = Callable[
+    [RelationshipRepairInstruction], RelationshipRepairResult | None
+]
 
 
 def _validated_turns(
@@ -187,7 +242,14 @@ class RelationshipOutputGuard:
         "_exact_echo_authorized",
         "_observed_gate_ids",
         "_policy_sha256",
+        "_pending_repair_plan",
+        "_repair_attempted",
+        "_repair_attempts",
+        "_repair_gate_ids",
+        "_repair_outcome",
+        "_replacement_id",
         "_replacement_applied",
+        "_resolution_started",
         "_tool_arguments_blocked",
         "_turns",
     )
@@ -200,7 +262,9 @@ class RelationshipOutputGuard:
     ) -> None:
         self._turns = _validated_turns(turns)
         self._policy_sha256 = policy_sha256
+        self._pending_repair_plan: _RelationshipRepairPlan | None = None
         self._apply_called = False
+        self._resolution_started = False
         try:
             self._exact_echo_authorized = bool(
                 exact_echo_allowed_turn_indexes(self._turns)
@@ -211,7 +275,12 @@ class RelationshipOutputGuard:
             ) from None
         self._observed_gate_ids: set[str] = set()
         self._replacement_applied = False
+        self._replacement_id: str | None = None
         self._tool_arguments_blocked = False
+        self._repair_attempted = False
+        self._repair_attempts = 0
+        self._repair_outcome = "not_attempted"
+        self._repair_gate_ids: tuple[str, ...] = ()
 
     @property
     def policy_sha256(self) -> str:
@@ -236,6 +305,121 @@ class RelationshipOutputGuard:
         if tool_blocked:
             self._tool_arguments_blocked = True
 
+    def _inspect_complete_output(
+        self,
+        response_text: str,
+        *,
+        tool_argument_json: Sequence[str] = (),
+        include_observed: bool,
+    ) -> tuple[tuple[str, ...], bool]:
+        if not isinstance(response_text, str):
+            raise RelationshipGuardUnavailableError("invalid relationship output text")
+        structured_texts: list[str] = []
+        for arguments in tool_argument_json:
+            structured_texts.extend(
+                _json_text_values(
+                    arguments,
+                    strict=True,
+                    require_object=True,
+                )
+            )
+        inspected_texts = (response_text, *structured_texts)
+        prior_gate_ids: tuple[str, ...] = ()
+        if include_observed:
+            prior_gate_ids = tuple(self._observed_gate_ids)
+        gate_ids = _ordered_gate_ids(
+            (*prior_gate_ids, *_text_gate_ids(inspected_texts))
+        )
+        tool_blocked = (
+            self._tool_arguments_blocked if include_observed else False
+        ) or bool(structured_texts and _text_gate_ids(structured_texts))
+        echo_text = "\n".join(inspected_texts)
+        if conversation_echo_turn_indexes(self._turns, echo_text):
+            gate_ids = _ordered_gate_ids((*gate_ids, "conversation_echo"))
+            tool_blocked = tool_blocked or bool(structured_texts)
+        return gate_ids, tool_blocked
+
+    def _validated_replacement(self, gate_ids: Iterable[str]) -> str:
+        replacement = safe_relationship_replacement_for(gate_ids)
+        if classify_relationship_text(replacement) or conversation_echo_turn_indexes(
+            self._turns, replacement
+        ):
+            raise RelationshipGuardUnavailableError("unsafe relationship replacement")
+        return replacement
+
+    def _finish(
+        self,
+        *,
+        output_text: str,
+        gate_ids: tuple[str, ...],
+        replacement_id: str | None,
+        tool_arguments_blocked: bool,
+    ) -> RelationshipGuardDecision:
+        repair_state_valid = self._repair_outcome in _REPAIR_OUTCOMES and (
+            (
+                self._repair_attempted is False
+                and self._repair_attempts == 0
+                and self._repair_outcome == "not_attempted"
+                and self._repair_gate_ids == ()
+                and replacement_id != RELATIONSHIP_REPAIR_REPLACEMENT_ID
+            )
+            or (
+                self._repair_attempted is True
+                and self._repair_attempts == 1
+                and self._repair_outcome != "not_attempted"
+                and bool(self._repair_gate_ids)
+                and (
+                    (
+                        self._repair_outcome == "accepted"
+                        and replacement_id == RELATIONSHIP_REPAIR_REPLACEMENT_ID
+                    )
+                    or (
+                        self._repair_outcome != "accepted"
+                        and replacement_id == SAFE_RELATIONSHIP_REPLACEMENT_ID
+                    )
+                )
+            )
+        )
+        if (
+            not repair_state_valid
+            or (not gate_ids and replacement_id is not None)
+            or (gate_ids and replacement_id is None)
+        ):
+            raise RelationshipGuardUnavailableError(
+                "invalid relationship repair terminal state"
+            )
+        self._apply_called = True
+        self._replacement_applied = bool(gate_ids)
+        self._replacement_id = replacement_id
+        return RelationshipGuardDecision(
+            action="replace" if gate_ids else "allow",
+            output_text=output_text,
+            gate_ids=gate_ids,
+            policy_id=RELATIONSHIP_TEXT_SAFETY_POLICY_ID,
+            policy_version=RELATIONSHIP_TEXT_SAFETY_POLICY_VERSION,
+            policy_sha256=self._policy_sha256,
+            replacement_id=replacement_id,
+            exact_echo_authorized=self._exact_echo_authorized,
+            tool_arguments_blocked=tool_arguments_blocked,
+            repair_attempted=self._repair_attempted,
+            repair_attempts=self._repair_attempts,
+            repair_outcome=self._repair_outcome,
+            repair_gate_ids=self._repair_gate_ids,
+        )
+
+    def _finish_with_fallback(
+        self,
+        gate_ids: tuple[str, ...],
+        *,
+        tool_arguments_blocked: bool,
+    ) -> RelationshipGuardDecision:
+        return self._finish(
+            output_text=self._validated_replacement(gate_ids),
+            gate_ids=gate_ids,
+            replacement_id=SAFE_RELATIONSHIP_REPLACEMENT_ID,
+            tool_arguments_blocked=tool_arguments_blocked,
+        )
+
     def apply(
         self,
         response_text: str,
@@ -244,67 +428,196 @@ class RelationshipOutputGuard:
     ) -> RelationshipGuardDecision:
         """Autorise ou remplace une sortie complete, texte et appels structures."""
 
-        if self._apply_called:
+        return self._apply_internal(
+            response_text,
+            tool_argument_json=tool_argument_json,
+            repair_callback=None,
+        )
+
+    def apply_with_repair(
+        self,
+        response_text: str,
+        *,
+        tool_argument_json: Sequence[str] = (),
+        repair_callback: RelationshipRepairCallback,
+    ) -> RelationshipGuardDecision:
+        """Tente une reponse neuve une seule fois apres un blocage complet."""
+
+        if not callable(repair_callback):
+            raise RelationshipGuardUnavailableError(
+                "invalid relationship repair callback"
+            )
+        return self._apply_internal(
+            response_text,
+            tool_argument_json=tool_argument_json,
+            repair_callback=repair_callback,
+        )
+
+    def _apply_internal(
+        self,
+        response_text: str,
+        *,
+        tool_argument_json: Sequence[str],
+        repair_callback: RelationshipRepairCallback | None,
+    ) -> RelationshipGuardDecision:
+        stage = self._begin_bounded_repair(
+            response_text,
+            tool_argument_json=tool_argument_json,
+            attempt_repair=repair_callback is not None,
+        )
+        if isinstance(stage, RelationshipGuardDecision):
+            return stage
+        if repair_callback is None:  # pragma: no cover - begin returns fallback.
+            raise RelationshipGuardUnavailableError(
+                "relationship repair callback unavailable"
+            )
+
+        # Do not retain the rejected candidate in this frame while the provider
+        # blocks. The callback receives only the fixed safe instruction.
+        response_text = ""
+        tool_argument_json = ()
+        try:
+            repair_result = repair_callback(stage.instruction)
+        except Exception:
+            return self._finish_bounded_repair(
+                stage,
+                None,
+                provider_error=True,
+            )
+        return self._finish_bounded_repair(stage, repair_result)
+
+    def _begin_bounded_repair(
+        self,
+        response_text: str,
+        *,
+        tool_argument_json: Sequence[str],
+        attempt_repair: bool,
+    ) -> RelationshipGuardDecision | _RelationshipRepairPlan:
+        """Inspect once and return only a safe plan before any provider call."""
+
+        if self._resolution_started:
             raise RelationshipGuardUnavailableError(
                 "relationship output decision already applied"
             )
-        self._apply_called = True
-        if not isinstance(response_text, str):
-            raise RelationshipGuardUnavailableError("invalid relationship output text")
+        self._resolution_started = True
         try:
-            structured_texts: list[str] = []
-            for arguments in tool_argument_json:
-                structured_texts.extend(
-                    _json_text_values(
-                        arguments,
-                        strict=True,
-                        require_object=True,
-                    )
-                )
-            inspected_texts = (response_text, *structured_texts)
-            gate_ids = _ordered_gate_ids(
-                (*self._observed_gate_ids, *_text_gate_ids(inspected_texts))
+            gate_ids, tool_blocked = self._inspect_complete_output(
+                response_text,
+                tool_argument_json=tool_argument_json,
+                include_observed=True,
             )
-            tool_blocked = self._tool_arguments_blocked or bool(
-                structured_texts and _text_gate_ids(structured_texts)
-            )
-            if not gate_ids:
-                echo_text = "\n".join(inspected_texts)
-                if conversation_echo_turn_indexes(self._turns, echo_text):
-                    gate_ids = ("conversation_echo",)
-                    tool_blocked = bool(structured_texts)
             self._record(gate_ids, tool_blocked=tool_blocked)
             if not gate_ids:
-                return RelationshipGuardDecision(
-                    action="allow",
+                return self._finish(
                     output_text=response_text,
                     gate_ids=(),
-                    policy_id=RELATIONSHIP_TEXT_SAFETY_POLICY_ID,
-                    policy_version=RELATIONSHIP_TEXT_SAFETY_POLICY_VERSION,
-                    policy_sha256=self._policy_sha256,
                     replacement_id=None,
-                    exact_echo_authorized=self._exact_echo_authorized,
                     tool_arguments_blocked=False,
                 )
 
-            replacement = safe_relationship_replacement_for(gate_ids)
-            replacement_is_echo = conversation_echo_turn_indexes(
-                self._turns, replacement
-            )
-            if classify_relationship_text(replacement) or replacement_is_echo:
-                raise RelationshipGuardUnavailableError(
-                    "unsafe relationship replacement"
+            if not attempt_repair:
+                return self._finish_with_fallback(
+                    gate_ids,
+                    tool_arguments_blocked=tool_blocked,
                 )
-            self._replacement_applied = True
-            return RelationshipGuardDecision(
-                action="replace",
-                output_text=replacement,
+
+            self._repair_attempted = True
+            self._repair_attempts = 1
+            self._repair_gate_ids = gate_ids
+            plan = _RelationshipRepairPlan(
+                instruction=relationship_repair_instruction(gate_ids),
                 gate_ids=gate_ids,
-                policy_id=RELATIONSHIP_TEXT_SAFETY_POLICY_ID,
-                policy_version=RELATIONSHIP_TEXT_SAFETY_POLICY_VERSION,
-                policy_sha256=self._policy_sha256,
-                replacement_id=SAFE_RELATIONSHIP_REPLACEMENT_ID,
-                exact_echo_authorized=self._exact_echo_authorized,
+                tool_arguments_blocked=tool_blocked,
+            )
+            self._pending_repair_plan = plan
+            return plan
+        except RelationshipGuardUnavailableError:
+            raise
+        except Exception:
+            raise RelationshipGuardUnavailableError(
+                "relationship output inspection failed"
+            ) from None
+
+    def _finish_bounded_repair(
+        self,
+        plan: _RelationshipRepairPlan,
+        repair_result: RelationshipRepairResult | None,
+        *,
+        provider_error: bool = False,
+    ) -> RelationshipGuardDecision:
+        """Resolve one safe plan without ever receiving the primary candidate."""
+
+        if (
+            plan is not self._pending_repair_plan
+            or self._apply_called
+            or type(provider_error) is not bool
+        ):
+            raise RelationshipGuardUnavailableError("invalid relationship repair plan")
+        self._pending_repair_plan = None
+        gate_ids = plan.gate_ids
+        tool_blocked = plan.tool_arguments_blocked
+        try:
+            if provider_error:
+                if repair_result is not None:
+                    raise RelationshipGuardUnavailableError(
+                        "invalid relationship provider failure"
+                    )
+                self._repair_outcome = "provider_error"
+                return self._finish_with_fallback(
+                    gate_ids,
+                    tool_arguments_blocked=tool_blocked,
+                )
+
+            if not isinstance(repair_result, RelationshipRepairResult):
+                self._repair_outcome = "invalid_response"
+                return self._finish_with_fallback(
+                    gate_ids,
+                    tool_arguments_blocked=tool_blocked,
+                )
+            if (
+                not isinstance(repair_result.output_text, str)
+                or not isinstance(repair_result.finish_reason, str)
+                or type(repair_result.tool_calls_present) is not bool
+                or type(repair_result.content_blocks_present) is not bool
+            ):
+                self._repair_outcome = "invalid_response"
+                return self._finish_with_fallback(
+                    gate_ids,
+                    tool_arguments_blocked=tool_blocked,
+                )
+            if repair_result.tool_calls_present or repair_result.content_blocks_present:
+                self._repair_outcome = "structured_output"
+                return self._finish_with_fallback(
+                    gate_ids,
+                    tool_arguments_blocked=tool_blocked,
+                )
+            if (
+                repair_result.finish_reason != "stop"
+                or not repair_result.output_text.strip()
+            ):
+                self._repair_outcome = "incomplete"
+                return self._finish_with_fallback(
+                    gate_ids,
+                    tool_arguments_blocked=tool_blocked,
+                )
+
+            repair_gate_ids, _ = self._inspect_complete_output(
+                repair_result.output_text,
+                include_observed=False,
+            )
+            if repair_gate_ids:
+                self._record(repair_gate_ids)
+                self._repair_outcome = "unsafe"
+                return self._finish_with_fallback(
+                    _ordered_gate_ids((*gate_ids, *repair_gate_ids)),
+                    tool_arguments_blocked=tool_blocked,
+                )
+
+            self._repair_outcome = "accepted"
+            return self._finish(
+                output_text=repair_result.output_text,
+                gate_ids=gate_ids,
+                replacement_id=RELATIONSHIP_REPAIR_REPLACEMENT_ID,
                 tool_arguments_blocked=tool_blocked,
             )
         except RelationshipGuardUnavailableError:
@@ -369,15 +682,11 @@ class RelationshipOutputGuard:
             for arguments in structured_output_json:
                 structured_texts.extend(_json_text_values(arguments, strict=True))
             gate_ids = _text_gate_ids((response_text, *structured_texts))
-            if (
-                not gate_ids
-                and allow_conversation_echo
-                and conversation_echo_turn_indexes(
-                    self._turns,
-                    "\n".join((response_text, *structured_texts)),
-                )
+            if allow_conversation_echo and conversation_echo_turn_indexes(
+                self._turns,
+                "\n".join((response_text, *structured_texts)),
             ):
-                gate_ids = ("conversation_echo",)
+                gate_ids = _ordered_gate_ids((*gate_ids, "conversation_echo"))
             if not gate_ids:
                 return response_text, False
             replacement = safe_relationship_replacement_for(gate_ids)
@@ -392,6 +701,24 @@ class RelationshipOutputGuard:
             ) from None
 
     def metadata(self) -> dict[str, object]:
+        repair_metadata_valid = self._repair_outcome in _REPAIR_OUTCOMES and (
+            (
+                self._repair_attempted is False
+                and self._repair_attempts == 0
+                and self._repair_outcome == "not_attempted"
+                and self._repair_gate_ids == ()
+            )
+            or (
+                self._repair_attempted is True
+                and self._repair_attempts == 1
+                and self._repair_outcome != "not_attempted"
+                and bool(self._repair_gate_ids)
+            )
+        )
+        if not repair_metadata_valid:
+            raise RelationshipGuardUnavailableError(
+                "invalid relationship repair metadata state"
+            )
         gate_ids = _ordered_gate_ids(self._observed_gate_ids)
         return {
             "policy_id": RELATIONSHIP_TEXT_SAFETY_POLICY_ID,
@@ -406,11 +733,25 @@ class RelationshipOutputGuard:
                 RELATIONSHIP_TEXT_SAFETY_POLICY_VERSION
             ),
             "relationship_guard_policy_sha256": self._policy_sha256,
-            "relationship_guard_replacement_id": (
-                SAFE_RELATIONSHIP_REPLACEMENT_ID if self._replacement_applied else None
-            ),
+            "relationship_guard_replacement_id": (self._replacement_id),
             "relationship_guard_exact_echo_authorized": (self._exact_echo_authorized),
             "relationship_guard_tool_arguments_blocked": (self._tool_arguments_blocked),
+            "relationship_guard_repair_policy_id": RELATIONSHIP_REPAIR_POLICY_ID,
+            "relationship_guard_repair_policy_version": (
+                RELATIONSHIP_REPAIR_POLICY_VERSION
+            ),
+            "relationship_guard_repair_temperature": RELATIONSHIP_REPAIR_TEMPERATURE,
+            "relationship_guard_repair_max_attempts": (
+                RELATIONSHIP_REPAIR_MAX_ATTEMPTS
+            ),
+            "relationship_guard_repair_no_tools": RELATIONSHIP_REPAIR_NO_TOOLS,
+            "relationship_guard_repair_no_output_input": (
+                RELATIONSHIP_REPAIR_NO_OUTPUT_INPUT
+            ),
+            "relationship_guard_repair_attempted": self._repair_attempted,
+            "relationship_guard_repair_attempts": self._repair_attempts,
+            "relationship_guard_repair_outcome": self._repair_outcome,
+            "relationship_guard_repair_gate_ids": list(self._repair_gate_ids),
         }
 
 
@@ -502,6 +843,15 @@ def _validate_policy_contract() -> str:
         or TEXT_GATE_IDS != _EXPECTED_TEXT_GATE_IDS
         or RUNTIME_GUARD_GATE_IDS != (*_EXPECTED_TEXT_GATE_IDS, "conversation_echo")
         or (MIN_EXACT_ECHO_CHARACTERS, MIN_EXACT_ECHO_TOKENS) != (24, 4)
+        or SAFE_RELATIONSHIP_REPLACEMENT_ID != "relationship-safe-boundary-v2"
+        or tuple(SAFE_RELATIONSHIP_GATE_FALLBACKS) != RUNTIME_GUARD_GATE_IDS
+        or RELATIONSHIP_REPAIR_POLICY_ID != "ava.relationship.bounded-repair"
+        or RELATIONSHIP_REPAIR_POLICY_VERSION != "1.0.0"
+        or RELATIONSHIP_REPAIR_TEMPERATURE != 0.0
+        or RELATIONSHIP_REPAIR_MAX_ATTEMPTS != 1
+        or RELATIONSHIP_REPAIR_NO_TOOLS is not True
+        or RELATIONSHIP_REPAIR_NO_OUTPUT_INPUT is not True
+        or RELATIONSHIP_REPAIR_REPLACEMENT_ID != "relationship-bounded-repair-v1"
         or not RELATIONSHIP_TEXT_SAFETY_ALGORITHM_SPEC
     ):
         raise RelationshipGuardUnavailableError(
@@ -512,6 +862,23 @@ def _validate_policy_contract() -> str:
         raise RelationshipGuardUnavailableError(
             "invalid relationship safety policy digest"
         )
+    try:
+        repair = relationship_repair_instruction(RUNTIME_GUARD_GATE_IDS)
+    except Exception:
+        raise RelationshipGuardUnavailableError(
+            "invalid relationship repair policy"
+        ) from None
+    if (
+        repair.gate_ids != RUNTIME_GUARD_GATE_IDS
+        or not repair.prompt
+        or repair.policy_id != RELATIONSHIP_REPAIR_POLICY_ID
+        or repair.policy_version != RELATIONSHIP_REPAIR_POLICY_VERSION
+        or repair.temperature != RELATIONSHIP_REPAIR_TEMPERATURE
+        or repair.max_attempts != RELATIONSHIP_REPAIR_MAX_ATTEMPTS
+        or repair.no_tools is not True
+        or repair.no_output_input is not True
+    ):
+        raise RelationshipGuardUnavailableError("invalid relationship repair policy")
     replacements = (
         SAFE_RELATIONSHIP_REPLACEMENT,
         *(
@@ -558,6 +925,8 @@ __all__ = [
     "RelationshipGuardDecision",
     "RelationshipGuardUnavailableError",
     "RelationshipOutputGuard",
+    "RelationshipRepairCallback",
+    "RelationshipRepairResult",
     "RelationshipToolArgumentBlockedError",
     "compose_relationship_tool_boundary_guard",
     "prepare_relationship_guard",

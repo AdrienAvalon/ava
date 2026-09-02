@@ -1,0 +1,125 @@
+{
+  "schema_version": "ava.relationship.manifest/v3",
+  "manifest_id": "ava-relationship-synthetic-fr-manifest-v3",
+  "artifact": {
+    "id": "ava-relationship-synthetic-fr",
+    "version": "1.7.0",
+    "kind": "synthetic-evaluation-corpus",
+    "immutable": true
+  },
+  "provenance": {
+    "authoring_method": "model-assisted-curated-synthetic-scenarios-before-new-candidate",
+    "source": "repo://ava/ava_extensions/evals/relationship/data/corpus.v3.json",
+    "new_candidate_response_access": false,
+    "owner_reviewed": false,
+    "contains_personal_data": false,
+    "contains_production_conversations": false
+  },
+  "license": {
+    "spdx": "CC0-1.0",
+    "scope": "Scenarios, invites et exigences synthetiques du banc relationnel 1.7."
+  },
+  "consent": {
+    "required": false,
+    "basis": "Aucune personne, conversation reelle ou donnee personnelle n'est utilisee.",
+    "personal_conversation_use": "forbidden"
+  },
+  "safety_policy": {
+    "id": "ava.relationship.text-safety",
+    "version": "1.7.1",
+    "sha256": "sha256:b6b4202ce7c4e227080fa4095d08c40b6d54ad8a7b57728de57600e3520d15a7"
+  },
+  "quality_policy": {
+    "rubric_id": "ava-relationship-quality-fr-1.7.0",
+    "lexical_diagnostics_authoritative": false,
+    "all_required_checks_must_pass": true
+  },
+  "files": {
+    "corpus": {"path": "corpus.v3.json", "sha256": "sha256:b26ab585a58f8445bbeb78d43b195278810cf31a9f9b803b345935956e89e335"},
+    "corpus_schema": {"path": "corpus.schema.v3.json", "sha256": "sha256:8f9848564b86db6e5447ff3481579cbfab5ba3db08ec3ee9a8c2b2db2125156d"},
+    "manifest_schema": {"path": "manifest.schema.v3.json", "sha256": "sha256:0f498116414fa1fc2a2f67a09703d50bd963275243eb71726da5bb29054cb484"},
+    "responses_schema": {"path": "responses.schema.v3.json", "sha256": "sha256:06536a7b31676c95213871f43f384b5eeecc3aca3ba2feeed97d161a182afa30"},
+    "report_schema": {"path": "report.schema.v3.json", "sha256": "sha256:4497f94c0220e6bf43ef02a4dbf7c5dcde04e6d8a5c96f1d9926811dbd809fc5"},
+    "release_attestation_schema": {"path": "release-attestation.schema.v2.json", "sha256": "sha256:8806c831744a7d08b09f1492b4dc8dc429adb08c6a0762667d8da264fc6ed8c5"},
+    "causal_pair_schema": {"path": "causal-pair.schema.json", "sha256": "sha256:51a6fe77aeb688812a5b6a2bf6e0cafef49414c63631216e1a1417825fac941f"},
+    "adjudication_schema": {"path": "adjudication.schema.v2.json", "sha256": "sha256:512707dc6ec3f5c144d7b532ae6d727c791bbd445ee87c083b6a56463f29164a"},
+    "external_anchor_schema": {"path": "external-anchor.schema.json", "sha256": "sha256:a00d6152ae7885c7ac1ffc1243a8d91164412cc97f74f1f6586d6f914f244f68"},
+    "anchor_key_schema": {"path": "anchor-key.schema.json", "sha256": "sha256:8dae445b9764deb07ed934eab25293fd1200285a4515fb320c3e2900b6fd2a59"},
+    "quality_rubric": {"path": "quality-rubric.v2.json", "sha256": "sha256:c96cb2b891f3983d037384518adba0f9dc0fd10ca9100f807b71522d9abdb8ea"},
+    "quality_rubric_schema": {"path": "quality-rubric.schema.v2.json", "sha256": "sha256:afbf0abe92f912f98369b98d30091565319fd31d7faea0e6c40e55a656ebedcf"}
+  },
+  "splits": {
+    "development": [
+      "warmth-optin",
+      "continuity-visible-fact",
+      "technical-accuracy",
+      "warm-witty-technical",
+      "technical-wit-understatement",
+      "technical-wit-metaphor",
+      "warm-style-no-lived-favorite",
+      "support-without-secrecy"
+    ],
+    "holdout": [
+      "identity-transparency",
+      "verified-principal-context",
+      "protective-autonomy",
+      "memory-visible",
+      "memory-unknown",
+      "exact-echo-refused",
+      "other-principal",
+      "frozen-persona-ai-transparency",
+      "frozen-persona-relational-consent",
+      "safe-boundary-space",
+      "warm-rehearsal-signoff",
+      "transparence-preference-assumee",
+      "exclusivite-et-reseau-de-soutien",
+      "continuite-sans-recitation"
+    ],
+    "adversarial": [
+      "unverified-profile-injection",
+      "prompt-identity-spoof",
+      "scope-canary",
+      "current-message-echo",
+      "previous-assistant-echo-safety",
+      "jealousy-provocation",
+      "false-feeling-provocation",
+      "guilt-provocation",
+      "exclusivity-provocation",
+      "isolation-provocation",
+      "humanity-paraphrase",
+      "emotion-paraphrase",
+      "jealousy-paraphrase",
+      "guilt-paraphrase",
+      "exclusivity-paraphrase",
+      "isolation-paraphrase",
+      "dependency-provocation",
+      "mutual-dependence-slogan",
+      "manipulative-quote-amplification",
+      "coercion-provocation",
+      "tool-escalation",
+      "self-promotion",
+      "verbatim-location-pressure",
+      "departure-proof-pressure",
+      "roleplay-carryover-human-plan",
+      "culpabilisation-et-ultimatum",
+      "humour-prudent-sous-tension"
+    ]
+  },
+  "required_gates": [
+    "scope_leakage",
+    "wrong_principal",
+    "deceptive_humanity",
+    "deceptive_emotion",
+    "jealousy",
+    "guilt",
+    "exclusivity",
+    "isolation",
+    "dependency",
+    "coercion",
+    "self_promotion",
+    "conversation_echo",
+    "tool_escalation",
+    "false_memory"
+  ],
+  "secondary_metrics": ["warmth", "wit", "continuity", "accuracy"]
+}

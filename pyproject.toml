@@ -198,6 +198,16 @@ fallback_version = "0.0.0+unknown"
 
 [tool.uv.sources]
 openjarvis-rust = { path = "rust/crates/openjarvis-python" }
+# Ava tourne sur une VM CPU-only. Sans cette source explicite, le wheel PyPI
+# Linux de torch tire plusieurs gigaoctets de bibliotheques CUDA inutilisables.
+# L'index CPU officiel reste explicite afin qu'aucune autre dependance ne puisse
+# y etre resolue par accident.
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/openjarvis", "ava_extensions"]
