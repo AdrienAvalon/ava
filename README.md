@@ -1,178 +1,133 @@
 <div align="center">
-  <img alt="OpenJarvis" src="assets/OpenJarvis_Horizontal_Logo.png" width="400">
 
-  <p><i>Personal AI, On Personal Devices.</i></p>
+# Ava
 
-  <p>
-    <a href="https://arxiv.org/abs/2605.17172"><img src="https://img.shields.io/badge/arXiv-2605.17172-b31b1b.svg" alt="arXiv"></a>
-    <a href="https://openjarvis.stanford.edu/"><img src="https://img.shields.io/badge/project-OpenJarvis-blue" alt="Project"></a>
-    <a href="https://open-jarvis.github.io/OpenJarvis/"><img src="https://img.shields.io/badge/docs-mkdocs-blue" alt="Docs"></a>
-    <img src="https://img.shields.io/badge/python-%3E%3D3.10-blue" alt="Python">
-    <img src="https://img.shields.io/badge/license-Apache%202.0-green" alt="License">
-    <a href="https://discord.gg/CMVBmDQ5Fj"><img src="https://img.shields.io/badge/discord-join-7289da?logo=discord&logoColor=white" alt="Discord"></a>
-    <a href="https://x.com/OpenJarvisAI"><img src="https://img.shields.io/badge/X-@OpenJarvisAI-black?logo=x&logoColor=white" alt="X / Twitter"></a>
-  </p>
+**Un assistant personnel en français, avec la voix, des outils et des accès délimités.**
+
+Ava adapte OpenJarvis à un environnement auto-hébergé : conversation, synthèse vocale,
+intégrations ciblées et travail sur l'identité et la mémoire des échanges.
+
+[Code Ava](https://github.com/AdrienAvalon/ava/tree/ava-main) · [Extensions](https://github.com/AdrienAvalon/ava/tree/ava-main/ava_extensions) · [Français](README.md) · [English](README.en.md)
+
+[![Python](https://img.shields.io/badge/Python-extensions-3776AB?logo=python&logoColor=white)](https://github.com/AdrienAvalon/ava/tree/ava-main/ava_extensions)
+[![Rust](https://img.shields.io/badge/Rust-runtime-DEA584?logo=rust&logoColor=black)](https://github.com/AdrienAvalon/ava/tree/ava-main/rust)
+[![OpenJarvis](https://img.shields.io/badge/bas%C3%A9%20sur-OpenJarvis-8b7cf6)](https://github.com/open-jarvis/OpenJarvis)
+[![Licence Apache 2.0](https://img.shields.io/badge/licence-Apache%202.0-2ea44f)](LICENSE)
+
 </div>
 
----
+## Commencer par la bonne branche
 
-<div align="center">
-  <img alt="OpenJarvis demo reel" src="assets/openjarvis_demo_reel.webp" width="75%">
-</div>
+**Le développement propre à Ava se trouve sur [`ava-main`](https://github.com/AdrienAvalon/ava/tree/ava-main).**
+La branche `main` est réservée au suivi d’OpenJarvis. GitHub présente `ava-main`,
+la branche propre au projet ; les liens vers les extensions ci-dessous la visent explicitement.
 
----
+## En bref
 
-> **[Documentation](https://open-jarvis.github.io/OpenJarvis/)**
->
-> **[Project Site](https://openjarvis.stanford.edu/)**
->
-> **[Paper](https://arxiv.org/abs/2605.17172)**
->
-> **[Leaderboard](https://open-jarvis.github.io/OpenJarvis/leaderboard/)**
->
-> **[Roadmap](https://open-jarvis.github.io/OpenJarvis/development/roadmap/)**
-
-## Why OpenJarvis?
-
-Personal AI agents are exploding in popularity, but nearly all of them still route intelligence through cloud APIs. Your "personal" AI continues to depend on someone else's server. At the same time, our [Intelligence Per Watt](https://www.intelligence-per-watt.ai/) research showed that local language models already handle 88.7% of single-turn chat and reasoning queries, with intelligence efficiency improving 5.3× from 2023 to 2025. The models and hardware are increasingly ready. What has been missing is the software stack to make local-first personal AI practical.
-
-OpenJarvis is that stack. It is a framework for local-first personal AI, built around three core ideas: shared primitives for building on-device agents; evaluations that treat energy, FLOPs, latency, and dollar cost as first-class constraints alongside accuracy; and a learning loop that improves models using local trace data. The goal is simple: make it possible to build personal AI agents that run locally by default, calling the cloud only when truly necessary. OpenJarvis aims to be both a research platform and a production foundation for local AI, in the spirit of PyTorch.
-
-## Installation
-
-Pick your platform and run one command. Each installer handles [uv](https://docs.astral.sh/uv/), the Python venv, Ollama, and a starter model — about 3 minutes on broadband.
-
-| Platform | One-liner |
+| Domaine | Ce que portent les extensions Ava |
 |---|---|
-| **macOS · Linux · WSL2** | `curl -fsSL https://open-jarvis.github.io/OpenJarvis/install.sh \| bash` |
-| **Native Windows** | `irm https://open-jarvis.github.io/OpenJarvis/install.ps1 \| iex` |
-| **Desktop GUI** | Download `.exe` / `.dmg` / `.deb` / `.rpm` / `.AppImage` from the [latest release](https://github.com/open-jarvis/OpenJarvis/releases) |
+| **Conversation en français** | Persona commune, contexte temporel et intégration du moteur conversationnel |
+| **Voix** | Adaptateurs de reconnaissance compatible Whisper et de synthèse française Kokoro |
+| **Identité** | Validation du principal et cloisonnement des conversations par identité vérifiée |
+| **Outils ciblés** | Adaptateurs pour lire l'état de l'infrastructure, consulter des journaux et proposer des évolutions |
+| **Exécution** | Amorçage du runtime depuis une release scellée, avec vérification de son environnement |
+| **Évaluation** | Tests de contrats, scénarios adversariaux et évaluations en shadow avant promotion |
 
-Then `jarvis` to start. The Rust extension and larger models continue downloading in the background; `jarvis doctor` shows status.
+Ces capacités décrivent le code du projet. Les services externes accessibles, les moteurs
+utilisés et les fonctionnalités activées dépendent de la configuration de l'installation.
+Auto-hébergé ne signifie pas que toutes les inférences sont locales : des adaptateurs
+appellent des API de modèles ou de reconnaissance vocale.
 
-Platform-specific notes (WSL2 setup, native-Windows scheduled-task service, desktop prerequisites, manual / contributor install): see the [installation docs](https://open-jarvis.github.io/OpenJarvis/getting-started/install/).
+## Pourquoi Ava
 
-## Quick Start
+Le projet réunit une expérience conversationnelle en français et des intégrations utiles
+dans un environnement personnel. Les adaptations vivent principalement dans
+[`ava_extensions/`](https://github.com/AdrienAvalon/ava/tree/ava-main/ava_extensions),
+pour garder lisible leur différence avec OpenJarvis et faciliter les synchronisations amont.
+
+Une réponse de modèle reste une proposition. Les accès aux outils, l'identité de
+l'interlocuteur et les règles de conservation sont établis par l'application.
+
+## Parcourir le projet
+
+Pour obtenir la branche de développement :
 
 ```bash
-jarvis                          # start chatting (default: chat-simple)
-jarvis init --preset <name>     # switch to a starter config
+git clone --branch ava-main https://github.com/AdrienAvalon/ava.git
+cd ava
 ```
 
-> Prefix `jarvis ...` with `uv run`, or `source .venv/bin/activate` first.
+Puis choisir son point d'entrée :
 
-| Preset | What it does |
+1. [L'organisation des extensions](https://github.com/AdrienAvalon/ava/blob/ava-main/ava_extensions/README.md).
+2. [Les adaptations d'OpenJarvis et leur justification](https://github.com/AdrienAvalon/ava/blob/ava-main/ava_extensions/patches/README.md).
+3. [Les tests propres à Ava](https://github.com/AdrienAvalon/ava/tree/ava-main/ava_extensions/tests).
+4. [La contribution au socle OpenJarvis](https://github.com/AdrienAvalon/ava/blob/ava-main/CONTRIBUTING.md).
+
+Le clonage donne accès aux sources. Une installation fonctionnelle demande également
+la configuration des moteurs, les dépendances vocales et les services choisis ; les
+installateurs génériques d'OpenJarvis n'installent pas à eux seuls l'environnement Ava.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    client["Client conversationnel"]
+    identity["Identité et conversation"]
+    jarvis["Socle OpenJarvis"]
+    extensions["Extensions Ava"]
+    models["Moteurs configurés"]
+    voice["Reconnaissance et synthèse vocales"]
+    tools["Services autorisés"]
+    client --> identity
+    identity --> jarvis
+    extensions --> jarvis
+    jarvis --> models
+    jarvis --> voice
+    extensions --> tools
+```
+
+| Pour comprendre… | Lire… |
 |---|---|
-| `morning-digest-mac` / `morning-digest-linux` / `morning-digest-minimal` | Spoken daily briefing from email, calendar, health, news |
-| `deep-research` | Multi-hop research across indexed docs with citations |
-| `code-assistant` | Agent with code execution, file I/O, and shell access |
-| `scheduled-monitor` | Stateful agent on a schedule with memory |
-| `chat-simple` | Lightweight conversation, no tools |
+| La frontière d'identité | [`ava_extensions/server/`](https://github.com/AdrienAvalon/ava/tree/ava-main/ava_extensions/server) |
+| Les adaptateurs vocaux | [`ava_extensions/backends/`](https://github.com/AdrienAvalon/ava/tree/ava-main/ava_extensions/backends) |
+| Les outils Ava | [`ava_extensions/skills/`](https://github.com/AdrienAvalon/ava/tree/ava-main/ava_extensions/skills) |
+| Le démarrage contrôlé | [`runtime_bootstrap.py`](https://github.com/AdrienAvalon/ava/blob/ava-main/ava_extensions/runtime_bootstrap.py) |
+| Les évaluations | [`ava_extensions/evals/`](https://github.com/AdrienAvalon/ava/tree/ava-main/ava_extensions/evals) |
 
-Example:
+## État et limites
 
-```bash
-jarvis init --preset morning-digest-mac
-jarvis connect gdrive          # one OAuth covers Gmail / Calendar / Tasks
-jarvis digest --fresh          # generate and play your first briefing
-```
+Ava reste un projet en développement, avec des intégrations propres à son environnement.
+Les capacités générales d'OpenJarvis ne sont pas toutes activées dans Ava.
 
-Per-preset deep dives: [morning digest](https://open-jarvis.github.io/OpenJarvis/user-guide/morning-digest/) · [deep research](https://open-jarvis.github.io/OpenJarvis/user-guide/deep-research/) · [code assistant](https://open-jarvis.github.io/OpenJarvis/user-guide/code-assistant/) · [scheduled monitor](https://open-jarvis.github.io/OpenJarvis/user-guide/scheduled-monitor/) · [chat simple](https://open-jarvis.github.io/OpenJarvis/user-guide/chat-simple/) · or the full [quickstart guide](https://open-jarvis.github.io/OpenJarvis/getting-started/quickstart/).
+- **Mémoire gouvernée : expérimentale.** Le ledger et ses vérifications restent en
+  shadow ; leur présence dans le code ne vaut pas validation d'une mémoire canonique.
+- **Apprentissage automatique : désactivé.** Le
+  [garde dédié](https://github.com/AdrienAvalon/ava/blob/ava-main/ava_extensions/patches/learning_guard.py)
+  maintient les optimiseurs amont hors du parcours d'exécution autorisé.
+- **Évaluations : des preuves à interpréter.** Un scénario réussi ou un consensus de
+  modèles ne suffit pas à autoriser une nouvelle capacité ni à promouvoir un souvenir.
+- **Intégrations : configuration nécessaire.** Les adaptateurs d'infrastructure ne
+  constituent pas une installation générique prête à connecter à n'importe quel système.
 
-### Skills
+## Qualité et contribution
 
-Skills teach agents how to better use tools and improve their reasoning. Every skill is a tool — agents discover them from a catalog and invoke them on demand.
+Les [tests des extensions](https://github.com/AdrienAvalon/ava/tree/ava-main/ava_extensions/tests)
+couvrent notamment l'identité, les conversations, les limites des outils, la voix et la
+mémoire expérimentale. Les [corpus d'évaluation](https://github.com/AdrienAvalon/ava/tree/ava-main/ava_extensions/evals)
+complètent ces tests. Leur présence documente la méthode ; les résultats dépendent de la
+révision et du périmètre exécutés.
 
-```bash
-# Install skills from public sources
-jarvis skill install hermes:arxiv
-jarvis skill sync hermes --category research
+Pour une contribution propre à Ava, partir de `ava-main`, limiter le changement à son
+périmètre et ajouter une preuve adaptée. Les modifications du socle doivent rester
+identifiables et conserver l'attribution amont.
 
-# Use skills with any agent
-jarvis ask "Use the code-explainer skill to explain this Python code: for i in range(5): print(i*2)"
+## OpenJarvis et licence
 
-# Optimize skills from your trace history
-jarvis optimize skills --policy dspy
+Ava est un fork de **[OpenJarvis](https://github.com/open-jarvis/OpenJarvis)**,
+un projet issu de Hazy Research et du Scaling Intelligence Lab à Stanford.
+Sa [documentation amont](https://open-jarvis.github.io/OpenJarvis/) décrit le framework
+et ses possibilités générales ; elle ne décrit pas la politique d'activation propre à Ava.
 
-# Benchmark the impact
-jarvis bench skills --max-samples 5 --seeds 42
-```
-
-Import from [Hermes Agent](https://github.com/NousResearch/hermes-agent) (~150 skills), [OpenClaw](https://github.com/openclaw/skills) (~13,700 community skills), or any GitHub repo. Skills follow the [agentskills.io](https://agentskills.io/specification) open standard.
-
-See the [Skills User Guide](https://open-jarvis.github.io/OpenJarvis/user-guide/skills/) and [Skills Tutorial](https://open-jarvis.github.io/OpenJarvis/tutorials/skills-workflow/) for details.
-
-### Built-in Agents
-
-OpenJarvis ships with eight built-in agents across three execution modes (on-demand, scheduled, continuous):
-
-| Agent | Type | What it does |
-|-------|------|-------------|
-| `morning_digest` | Scheduled | Daily briefing from email, calendar, health, news — with TTS audio |
-| `deep_research` | On-demand | Multi-hop research with citations across web and local docs |
-| `monitor_operative` | Continuous | Long-horizon monitoring with memory, compression, and retrieval |
-| `orchestrator` | On-demand | Multi-turn reasoning with automatic tool selection |
-| `native_react` | On-demand | ReAct (Thought-Action-Observation) loop agent |
-| `operative` | Continuous | Persistent autonomous agent with state management |
-| `native_openhands` | On-demand | CodeAct — generates and executes Python code |
-| `simple` | On-demand | Single-turn chat, no tools |
-
-See the [User Guide](https://open-jarvis.github.io/OpenJarvis/user-guide/morning-digest/) and [Tutorials](https://open-jarvis.github.io/OpenJarvis/tutorials/) for detailed setup instructions.
-
-Full documentation — including Docker deployment, cloud engines, development setup, and tutorials — at **[open-jarvis.github.io/OpenJarvis](https://open-jarvis.github.io/OpenJarvis/)**.
-
-## Community
-
-- **GitHub:** [github.com/open-jarvis/OpenJarvis](https://github.com/open-jarvis/OpenJarvis)
-- **Discord:** [discord.gg/CMVBmDQ5Fj](https://discord.gg/CMVBmDQ5Fj)
-- **X / Twitter:** [@OpenJarvisAI](https://x.com/OpenJarvisAI)
-- **Docs:** [open-jarvis.github.io/OpenJarvis](https://open-jarvis.github.io/OpenJarvis/)
-
-## Contributing
-
-We welcome contributions! See the [Contributing Guide](CONTRIBUTING.md) for incentives, contribution types, and the PR process.
-
-Quick start for contributors:
-
-```bash
-git clone https://github.com/open-jarvis/OpenJarvis.git
-cd OpenJarvis
-uv sync --extra dev
-uv run pre-commit install
-uv run pytest tests/ -v
-```
-
-Browse the [Roadmap](https://open-jarvis.github.io/OpenJarvis/development/roadmap/) for areas where help is needed. Comment **"take"** on any issue to get auto-assigned.
-
-## About
-
-OpenJarvis is part of [Intelligence Per Watt](https://www.intelligence-per-watt.ai/), a research initiative studying the intelligence efficiency of AI systems. The project is developed at [Hazy Research](https://hazyresearch.stanford.edu/) and the [Scaling Intelligence Lab](https://scalingintelligence.stanford.edu/) at [Stanford SAIL](https://ai.stanford.edu/).
-
-## Sponsors
-
-<p>
-  <a href="https://www.laude.org/">Laude Institute</a> &bull;
-  <a href="https://datascience.stanford.edu/marlowe">Stanford Marlowe</a> &bull;
-  <a href="https://cloud.google.com/">Google Cloud Platform</a> &bull;
-  <a href="https://lambda.ai/">Lambda Labs</a> &bull;
-  <a href="https://ollama.com/">Ollama</a> &bull;
-  <a href="https://research.ibm.com/">IBM Research</a> &bull;
-  <a href="https://hai.stanford.edu/">Stanford HAI</a>
-</p>
-
-## Citation
-```bibtex
-@misc{saadfalcon2026openjarvispersonalaipersonal,
-      title={OpenJarvis: Personal AI, On Personal Devices}, 
-      author={Jon Saad-Falcon and Avanika Narayan and Robby Manihani and Tanvir Bhathal and Herumb Shandilya and Hakki Orhun Akengin and Gabriel Bo and Andrew Park and Matthew Hart and Caia Costello and Chuan Li and Christopher Ré and Azalia Mirhoseini},
-      year={2026},
-      eprint={2605.17172},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2605.17172}, 
-}
-```
-
-## License
-
-[Apache 2.0](LICENSE)
+Le code est distribué sous [Apache 2.0](LICENSE). Les attributions, licences des composants
+et conditions propres aux modèles utilisés restent applicables.
