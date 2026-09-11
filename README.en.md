@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/assets/showcase.svg" alt="Ava" width="100%">
+
 # Ava
 
 **A French-speaking personal assistant with voice, tools and scoped access.**
@@ -9,10 +11,10 @@ targeted integrations, and work on identity and conversational memory.
 
 [Ava code](https://github.com/AdrienAvalon/ava/tree/ava-main) · [Extensions](https://github.com/AdrienAvalon/ava/tree/ava-main/ava_extensions) · [Français](README.md) · [English](README.en.md)
 
-[![Python](https://img.shields.io/badge/Python-extensions-3776AB?logo=python&logoColor=white)](https://github.com/AdrienAvalon/ava/tree/ava-main/ava_extensions)
-[![Rust](https://img.shields.io/badge/Rust-runtime-DEA584?logo=rust&logoColor=black)](https://github.com/AdrienAvalon/ava/tree/ava-main/rust)
-[![OpenJarvis](https://img.shields.io/badge/built%20on-OpenJarvis-8b7cf6)](https://github.com/open-jarvis/OpenJarvis)
-[![Apache 2.0 licence](https://img.shields.io/badge/licence-Apache%202.0-2ea44f)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-extensions-3776AB?logo=python&logoColor=white&style=flat-square)](https://github.com/AdrienAvalon/ava/tree/ava-main/ava_extensions)
+[![Rust](https://img.shields.io/badge/Rust-runtime-DEA584?logo=rust&logoColor=black&style=flat-square)](https://github.com/AdrienAvalon/ava/tree/ava-main/rust)
+[![OpenJarvis](https://img.shields.io/badge/built%20on-OpenJarvis-8b7cf6?style=flat-square)](https://github.com/open-jarvis/OpenJarvis)
+[![Apache 2.0 licence](https://img.shields.io/badge/licence-Apache%202.0-2ea44f?style=flat-square)](LICENSE)
 
 </div>
 
@@ -129,5 +131,7 @@ a project originating from Hazy Research and the Scaling Intelligence Lab at Sta
 Its [upstream documentation](https://open-jarvis.github.io/OpenJarvis/) describes the
 framework and its general capabilities, rather than Ava's activation policy.
 
-The code is distributed under [Apache 2.0](LICENSE). Component attributions and
-licences, and terms specific to the models used, still apply.
+The root license is [Apache 2.0](LICENSE), with attribution to the OpenJarvis authors.
+The [Tauri application manifest](frontend/src-tauri/Cargo.toml) separately declares MIT,
+as in the upstream project; this scope difference needs clarification before redistribution.
+Component licenses and model-specific terms remain applicable.

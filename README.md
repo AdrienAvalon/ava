@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/assets/showcase.svg" alt="Ava" width="100%">
+
 # Ava
 
 **Un assistant personnel en français, avec la voix, des outils et des accès délimités.**
@@ -9,10 +11,10 @@ intégrations ciblées et travail sur l'identité et la mémoire des échanges.
 
 [Code Ava](https://github.com/AdrienAvalon/ava/tree/ava-main) · [Extensions](https://github.com/AdrienAvalon/ava/tree/ava-main/ava_extensions) · [Français](README.md) · [English](README.en.md)
 
-[![Python](https://img.shields.io/badge/Python-extensions-3776AB?logo=python&logoColor=white)](https://github.com/AdrienAvalon/ava/tree/ava-main/ava_extensions)
-[![Rust](https://img.shields.io/badge/Rust-runtime-DEA584?logo=rust&logoColor=black)](https://github.com/AdrienAvalon/ava/tree/ava-main/rust)
-[![OpenJarvis](https://img.shields.io/badge/bas%C3%A9%20sur-OpenJarvis-8b7cf6)](https://github.com/open-jarvis/OpenJarvis)
-[![Licence Apache 2.0](https://img.shields.io/badge/licence-Apache%202.0-2ea44f)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-extensions-3776AB?logo=python&logoColor=white&style=flat-square)](https://github.com/AdrienAvalon/ava/tree/ava-main/ava_extensions)
+[![Rust](https://img.shields.io/badge/Rust-runtime-DEA584?logo=rust&logoColor=black&style=flat-square)](https://github.com/AdrienAvalon/ava/tree/ava-main/rust)
+[![OpenJarvis](https://img.shields.io/badge/bas%C3%A9%20sur-OpenJarvis-8b7cf6?style=flat-square)](https://github.com/open-jarvis/OpenJarvis)
+[![Licence Apache 2.0](https://img.shields.io/badge/licence-Apache%202.0-2ea44f?style=flat-square)](LICENSE)
 
 </div>
 
@@ -129,5 +131,7 @@ un projet issu de Hazy Research et du Scaling Intelligence Lab à Stanford.
 Sa [documentation amont](https://open-jarvis.github.io/OpenJarvis/) décrit le framework
 et ses possibilités générales ; elle ne décrit pas la politique d'activation propre à Ava.
 
-Le code est distribué sous [Apache 2.0](LICENSE). Les attributions, licences des composants
-et conditions propres aux modèles utilisés restent applicables.
+La licence racine est [Apache 2.0](LICENSE), avec l'attribution aux auteurs d'OpenJarvis.
+Le [manifeste de l'application Tauri](frontend/src-tauri/Cargo.toml) annonce séparément MIT,
+comme dans le projet amont ; cette différence de portée reste à clarifier avant sa redistribution.
+Les licences des composants et les conditions propres aux modèles restent applicables.

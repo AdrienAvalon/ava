@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="230" viewBox="0 0 1100 230" role="img" aria-labelledby="title desc">
+<title id="title">Ava</title><desc id="desc">Voice · Identity · Tools. Illustration éditoriale, sans donnée d’exploitation.</desc>
+<defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#0d1117"/><stop offset="1" stop-color="#17202f"/></linearGradient></defs>
+<rect width="1100" height="230" rx="18" fill="url(#bg)"/>
+<path d="M0 190H1100M880 0V230M935 0V230M990 0V230M1045 0V230" fill="none" stroke="#9d8df1" opacity=".09"/>
+<rect x="40" y="40" width="36" height="4" rx="2" fill="#9d8df1"/>
+<g font-family="DejaVu Sans,Arial,sans-serif"><text x="92" y="46" fill="#9d8df1" font-size="14" letter-spacing="3">AVALON NETWORK</text>
+<text x="40" y="121" fill="#f0f6fc" font-size="48" font-weight="700">Ava</text>
+<text x="42" y="163" fill="#becbd9" font-size="21">Voice · Identity · Tools</text></g>
+<g fill="none" stroke="#9d8df1" stroke-width="2"><rect x="908" y="60" width="52" height="52" rx="12"/><rect x="980" y="117" width="52" height="52" rx="12"/><path d="M934 112v32h46"/><circle cx="1006" cy="86" r="7"/><path d="M960 86h39M1006 93v24"/></g>
+</svg>
