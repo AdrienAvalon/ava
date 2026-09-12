@@ -172,6 +172,56 @@ def test_un_echange_REUSSI_n_est_pas_marque_en_erreur(tmp_path: Path) -> None:
     assert lignes[0]["result"] == "ca marche"
 
 
+@pytest.mark.parametrize("failure", ("agent", "filter", "deferred"))
+@pytest.mark.parametrize("with_store", (False, True))
+def test_private_or_deferred_failure_has_no_observability_bypass(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
+    with_store: bool,
+) -> None:
+    """A rejected request cannot be persisted or logged by the error wrapper."""
+    from openjarvis.agents._stubs import AgentResult
+    from openjarvis.core.events import EventBus, EventType
+    from openjarvis.traces.collector import TraceCollector
+    from openjarvis.traces.store import TraceStore
+
+    canary = "PRIVATE-OBSERVABILITY-FAILURE"
+
+    class Agent:
+        agent_id = "private-agent"
+
+        def run(self, *args: Any, **kwargs: Any) -> AgentResult:
+            if failure != "filter":
+                raise ValueError(canary)
+            return AgentResult(content=canary, turns=1, metadata={"messages": []})
+
+    def reject(*args: Any, **kwargs: Any) -> Any:
+        raise ValueError(canary)
+
+    bus = EventBus(record_history=True)
+    store = TraceStore(tmp_path / "private.db") if with_store else None
+    collector = TraceCollector(
+        Agent(), store=store, bus=bus, defer_persistence=failure == "deferred"
+    )
+    caplog.clear()
+    expected = ValueError if failure == "deferred" else RuntimeError
+    with pytest.raises(expected):
+        collector.run(canary, content_filter=None if failure == "deferred" else reject)
+
+    assert store is None or store.list_traces() == []
+    assert collector.last_trace is None
+    assert not any(
+        event.event_type == EventType.TRACE_COMPLETE for event in bus.history
+    )
+    assert canary not in caplog.text
+    assert not any(
+        record.name == traces_observabilite.__name__ for record in caplog.records
+    )
+    if store is not None:
+        store.close()
+
+
 def test_l_echec_n_ecrase_PAS_les_traces_precedentes(tmp_path: Path) -> None:
     """La succession reussite → echec doit donner deux lignes distinctes : c'est la
     PAIRE echec/succes qui porte l'information (« la formulation qui a marche est la

@@ -77,14 +77,11 @@ def _corriger_chemin_traces() -> bool:
 
 
 def _tracer_les_echecs() -> bool:
-    """Enregistre une trace meme quand l'agent leve.
+    """Enregistre les echecs ordinaires pour l'observabilite operationnelle.
 
-    ⚠ SANS CELA, LA BOUCLE D'APPRENTISSAGE EST AVEUGLE AU SEUL SIGNAL QUI COMPTE.
-      Le corpus ne contient aujourd'hui que des echanges REUSSIS : on peut y chercher
-      les questions mal repondues, mais pas celles auxquelles Ava n'a pas repondu du
-      tout. Les 8 HTTP 500 du 2026-08-03 en sont la demonstration — deux causes
-      distinctes (parametre deprecie, puis credit epuise) derriere le meme code, et
-      aucune trace pour les distinguer.
+    L'apprentissage automatique reste desactive. Ce journal ne promeut aucune
+    connaissance et ne contourne jamais une frontiere de publication : les appels
+    filtres ou a persistance differee ne passent pas par ce chemin de secours.
 
     ⚠ `TraceCollector.run` construit sa `Trace` APRES l'appel de l'agent (collector.py:84) :
       il n'y a donc aucune trace en cours a completer quand l'exception survient. Le
@@ -114,7 +111,14 @@ def _tracer_les_echecs() -> bool:
         try:
             return origine(self, entree, *args, **kwargs)
         except Exception as exc:
-            _consigner_echec(self, entree, debut, exc)
+            # A filtered or deferred run belongs to the request's publication
+            # boundary. Its failure (including a late cancellation) must not
+            # acquire a second persistence or logging path through this wrapper.
+            # Ordinary, unfiltered failures remain observable below.
+            if kwargs.get("content_filter") is None and not getattr(
+                self, "_defer_persistence", False
+            ):
+                _consigner_echec(self, entree, debut, exc)
             raise
 
     cls.run = run  # type: ignore[method-assign]

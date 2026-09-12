@@ -12,6 +12,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import zipfile
 from contextlib import contextmanager
@@ -280,7 +281,9 @@ def _install_synthetic_distribution(
 
 
 def _synthetic_python_runtime_source() -> tuple[bytes, bytes]:
-    executable = b"\x7fELFsynthetic-python-3.12.13\n"
+    runtime = release_module.sys.version_info
+    version = f"{runtime.major}.{runtime.minor}.{runtime.micro}"
+    executable = f"\x7fELFsynthetic-python-{version}\n".encode("ascii")
     stdlib = b"name = 'synthetic-posix'\n"
     stream = io.BytesIO()
     with tarfile.open(fileobj=stream, mode="w:gz") as archive:
@@ -321,7 +324,7 @@ def _synthetic_python_runtime_source() -> tuple[bytes, bytes]:
         "implementation": "cpython",
         "platform": "x86_64-unknown-linux-gnu",
         "schema": "ava.python-runtime-source/v1",
-        "version": "3.12.13",
+        "version": version,
     }
     return archive_payload, canonical_json_bytes(source_document) + b"\n"
 
@@ -784,6 +787,16 @@ def _causal_release_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> dict[str, Any]:
+    # These ELF bytes, paths and ownership represent the pinned release, not
+    # pytest's interpreter. Simulate its process identity in this module only;
+    # changing the global sys.version_info would contaminate unrelated tests.
+    # Keep the production recipe, wheelhouse and builder pins fully enforced.
+    major, minor, micro = map(
+        int, release_module._SEALED_RUNTIME_RECIPE["python_version"].split(".")
+    )
+    runtime_sys = SimpleNamespace(**vars(sys))
+    runtime_sys.version_info = SimpleNamespace(major=major, minor=minor, micro=micro)
+    monkeypatch.setattr(release_module, "sys", runtime_sys)
     repository = tmp_path / "repository"
     repository.mkdir()
     _git(repository, "init", "-q")
@@ -2826,6 +2839,37 @@ def test_runtime_wheelhouse_manifest_parser_and_exact_set_are_closed(
                 locked_wheels=locked_wheels,
                 wheelhouse_manifest=mutated,
             )
+
+
+def test_python_runtime_source_rejects_different_interpreter_patch() -> None:
+    _archive_payload, source_payload = _synthetic_python_runtime_source()
+    source = json.loads(source_payload)
+    assert source["version"] == ".".join(map(str, sys.version_info[:3]))
+    release_module._python_runtime_source_contract(source_payload)
+
+    source["version"] = (
+        f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro + 1}"
+    )
+    with pytest.raises(ContractError, match="identite source du runtime Python"):
+        release_module._python_runtime_source_contract(
+            canonical_json_bytes(source) + b"\n"
+        )
+
+
+def test_sealed_release_rejects_different_running_interpreter_patch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actual_version = sys.version_info
+    evidence = _causal_release_evidence(tmp_path, monkeypatch)
+    assert sys.version_info is actual_version
+    release_root = evidence["candidate_root"]
+    source_payload = evidence["candidate_source_path"].read_bytes()
+    _entries, source_contents = release_module._source_archive_map(source_payload)
+    runtime = release_module.sys.version_info
+    runtime.micro += 1
+    with pytest.raises(ContractError, match="identite source du runtime Python"):
+        release_module._python_runtime_evidence(release_root, source_contents)
 
 
 def test_python_runtime_archive_materializes_only_internal_regular_links() -> None:
